@@ -2,6 +2,20 @@
 
 All notable changes to TermCanvas will be documented in this file.
 
+## [0.39.7] - 2026-05-10
+
+### Added
+- **Pins can render rich HTML**: pin bodies now accept full HTML documents in addition to Markdown, preserving local attachments for embedded media while keeping preview/render surfaces sandboxed.
+- **Pin screenshots for visual agents**: `termcanvas pin render <id> --json` renders a pin's Markdown or HTML body to a stable PNG under `.termcanvas/pin-renders/`, so agents with image-reading capability can inspect visual pins directly from the generated file path.
+- **Independent pin HTML preview window**: pin details now expose an `Open preview` / `独立预览` action that opens rich pin content in a resizable 1280×900 standalone window for human inspection.
+
+### Changed
+- **Pin render cache is cleaned during rendering**: stale render snapshots and orphaned pin render directories are pruned opportunistically when a new pin render is requested.
+- **Agent pin instructions mention visual rendering**: injected pin guidance now teaches agents when to call `termcanvas pin render <id> --json` and how to use the returned image path.
+
+### Fixed
+- **Codex hook trust registration is documented and generated**: generated Codex hook setup now records the trusted command pattern and documents the registration behavior for future agents.
+
 ## [0.39.6] - 2026-05-08
 
 ### Added
