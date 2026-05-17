@@ -100,6 +100,51 @@ function getPathBasename(path: string): string {
   return path.endsWith("/") ? `${name}/` : name;
 }
 
+function collectAncestorDirectoryPaths(path: string): string[] {
+  const stripped = stripDirectorySlash(path);
+  if (!stripped) return [];
+  const segments = stripped.split("/");
+  const maxDepth = path.endsWith("/") ? segments.length : segments.length - 1;
+  const directories: string[] = [];
+  for (let depth = 1; depth <= maxDepth; depth += 1) {
+    directories.push(`${segments.slice(0, depth).join("/")}/`);
+  }
+  return directories;
+}
+
+function sortPathsDeepestFirst(paths: readonly string[]): string[] {
+  return [...paths].sort((a, b) => {
+    const depthDelta = b.split("/").length - a.split("/").length;
+    return depthDelta !== 0 ? depthDelta : b.length - a.length;
+  });
+}
+
+export function collectStaleAncestorDirectories(
+  previousPaths: readonly string[],
+  nextPaths: readonly string[],
+  preservedPaths: readonly string[],
+): string[] {
+  const nextPathSet = new Set(nextPaths);
+  const liveDirectoryPaths = new Set<string>();
+  for (const path of [...nextPaths, ...preservedPaths]) {
+    for (const directory of collectAncestorDirectoryPaths(path)) {
+      liveDirectoryPaths.add(directory);
+    }
+  }
+
+  const candidates = new Set<string>();
+  for (const path of previousPaths) {
+    if (nextPathSet.has(path)) continue;
+    for (const directory of collectAncestorDirectoryPaths(path)) {
+      candidates.add(directory);
+    }
+  }
+
+  return sortPathsDeepestFirst(
+    [...candidates].filter((directory) => !liveDirectoryPaths.has(directory)),
+  );
+}
+
 function resolveDropDestinationPath(
   sourcePath: string,
   targetDirectoryPath: string | null,
@@ -367,12 +412,24 @@ export function FilesContent({ worktreePath, onFileClick }: Props) {
 
     const oldSet = new Set(synced.paths);
     const newSet = new Set(paths);
+    const removedSet = new Set(synced.paths.filter((p) => !newSet.has(p)));
+    const staleAncestorDirs = collectStaleAncestorDirectories(
+      synced.paths,
+      paths,
+      ignoredPathsRef.current,
+    );
     const ops: FileTreeBatchOperation[] = [];
-    for (const p of synced.paths) {
-      if (!newSet.has(p)) ops.push({ path: p, type: "remove" });
+    for (const p of sortPathsDeepestFirst(synced.paths)) {
+      if (!newSet.has(p)) {
+        ops.push({ path: p, type: "remove", recursive: p.endsWith("/") });
+      }
     }
     for (const p of paths) {
       if (!oldSet.has(p)) ops.push({ path: p, type: "add" });
+    }
+    for (const p of staleAncestorDirs) {
+      if (removedSet.has(p)) continue;
+      ops.push({ path: p, type: "remove", recursive: true });
     }
     if (ops.length === 0) {
       trackedSyncRef.current = { model, wt: wtKey, paths };
@@ -433,8 +490,22 @@ export function FilesContent({ worktreePath, onFileClick }: Props) {
 
     if (toRemove.length) {
       const ops: FileTreeBatchOperation[] = [];
-      for (const p of toRemove) {
-        if (model.getItem(p) != null) ops.push({ path: p, type: "remove" });
+      const removedSet = new Set(toRemove);
+      const staleAncestorDirs = collectStaleAncestorDirectories(
+        synced?.paths ?? [],
+        ignoredPaths,
+        pathsRef.current,
+      );
+      for (const p of sortPathsDeepestFirst(toRemove)) {
+        if (model.getItem(p) != null) {
+          ops.push({ path: p, type: "remove", recursive: p.endsWith("/") });
+        }
+      }
+      for (const p of staleAncestorDirs) {
+        if (removedSet.has(p)) continue;
+        if (model.getItem(p) != null) {
+          ops.push({ path: p, type: "remove", recursive: true });
+        }
       }
       if (ops.length) {
         try {

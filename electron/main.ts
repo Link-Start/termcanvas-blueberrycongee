@@ -149,6 +149,7 @@ import {
   unstageHunk,
   getBlame,
 } from "./git-info";
+import { parseNulSeparatedGitPaths } from "./git-paths";
 import { createMenu } from "./menu";
 import { isSelectAllShortcutInput } from "./select-all-shortcut";
 import { isReloadShortcutInput } from "./reload-shortcut";
@@ -1712,7 +1713,7 @@ function setupIpc() {
       trackedOutput = await new Promise<string>((resolve, reject) => {
         execFile(
           "git",
-          ["ls-files", "--cached", "--others", "--exclude-standard"],
+          ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
           { cwd: dirPath, timeout: 10000, maxBuffer: 64 * 1024 * 1024 },
           (err, stdout) => (err ? reject(err) : resolve(stdout)),
         );
@@ -1753,7 +1754,7 @@ function setupIpc() {
 
     return {
       type: "git" as const,
-      paths: trackedOutput.split("\n").filter(Boolean),
+      paths: parseNulSeparatedGitPaths(trackedOutput),
     };
   });
 
@@ -1770,9 +1771,10 @@ function setupIpc() {
       });
     try {
       const [filesOutput, dirsOutput] = await Promise.all([
-        runGit(["ls-files", "--others", "--ignored", "--exclude-standard"]),
+        runGit(["ls-files", "-z", "--others", "--ignored", "--exclude-standard"]),
         runGit([
           "ls-files",
+          "-z",
           "--others",
           "--ignored",
           "--exclude-standard",
@@ -1780,7 +1782,10 @@ function setupIpc() {
         ]),
       ]);
       return [
-        ...new Set(`${dirsOutput}\n${filesOutput}`.split("\n").filter(Boolean)),
+        ...new Set([
+          ...parseNulSeparatedGitPaths(dirsOutput),
+          ...parseNulSeparatedGitPaths(filesOutput),
+        ]),
       ];
     } catch (err) {
       console.warn(`[fs:list-ignored-files] failed:`, err);

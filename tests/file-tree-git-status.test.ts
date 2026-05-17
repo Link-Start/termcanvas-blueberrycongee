@@ -5,6 +5,7 @@ import {
   applyFileTreeDrop,
   buildFileTreeMoveRequests,
   buildPierreGitStatus,
+  collectStaleAncestorDirectories,
 } from "../src/components/RightPanel/FilesContent";
 import type { GitStatusEntry } from "../src/types";
 
@@ -61,5 +62,27 @@ test("file tree drop builds absolute filesystem move requests", () => {
       { from: "/repo/src/app.ts", to: "/repo/packages/app.ts" },
       { from: "/repo/docs", to: "/repo/packages/docs" },
     ],
+  );
+});
+
+test("file tree sync prunes ancestor directories with no remaining paths", () => {
+  assert.deepEqual(
+    collectStaleAncestorDirectories(
+      ["concepts/README.md", "concepts/lang/basics.md", "README.md"],
+      ["README.md"],
+      [],
+    ),
+    ["concepts/lang/", "concepts/"],
+  );
+});
+
+test("file tree sync keeps ancestors that still contain tracked or ignored paths", () => {
+  assert.deepEqual(
+    collectStaleAncestorDirectories(
+      ["concepts/README.md", "projects/old.md"],
+      ["concepts/new.md"],
+      ["projects/cache.log"],
+    ),
+    [],
   );
 });
