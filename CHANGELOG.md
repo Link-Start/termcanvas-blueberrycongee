@@ -2,6 +2,14 @@
 
 All notable changes to TermCanvas will be documented in this file.
 
+## [0.39.9] - 2026-05-31
+
+### Changed
+- **TermCanvas no longer ships its own Computer Use stack**: removed the unfinished helper, MCP server, settings page, CLI commands, launch injection, and packaging path so Codex sessions use the bundled OpenAI Computer Use plugin instead.
+
+### Fixed
+- **Legacy Computer Use MCP entries are cleaned up on skill install**: TermCanvas now removes stale Claude and Codex MCP registrations from older builds, including orphaned Codex TOML `args` / `env` lines that could keep pointing agents at the retired TermCanvas server.
+
 ## [0.39.8] - 2026-05-18
 
 ### Fixed
