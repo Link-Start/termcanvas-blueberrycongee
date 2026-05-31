@@ -265,40 +265,69 @@ function removeClaudeComputerUseMcp(globalConfigFile: string): void {
   writeJsonAtomic(globalConfigFile, data);
 }
 
-// Strip every `[tableName]` block — header through the last body line before
-// the next section header (or EOF) — plus any orphan `tableName.<key>` dotted
-// keys at the file's top level. Walks line-by-line so multi-line table bodies
-// and array-of-tables siblings cannot be partially eaten the way the previous
-// regex-based implementation did.
-function removeTomlTable(content: string, tableName: string): string {
+const TERMCANVAS_COMPUTER_USE_SIGNATURE_RE =
+  /mcp[-/\\]+computer-use-server|TERMCANVAS_COMPUTER_USE_|computer-use-instructions\.md/;
+
+function isTermCanvasComputerUseConfig(lines: string[]): boolean {
+  return lines.some((line) => TERMCANVAS_COMPUTER_USE_SIGNATURE_RE.test(line));
+}
+
+// Strip a `[tableName]` block only when its content matches a known legacy
+// TermCanvas Computer Use signature. This keeps user-managed MCPs that happen
+// to use the generic `computer-use` server name.
+function removeTomlTableIf(
+  content: string,
+  tableName: string,
+  shouldRemove: (lines: string[]) => boolean,
+): string {
   if (!content) return content;
   const target = `[${tableName}]`;
-  const dottedPrefix = `${tableName}.`;
   const lines = content.split("\n");
   const out: string[] = [];
-  let inTarget = false;
+  let targetBlock: string[] | null = null;
+
+  const flushTargetBlock = () => {
+    if (!targetBlock) return;
+    if (!shouldRemove(targetBlock)) out.push(...targetBlock);
+    targetBlock = null;
+  };
+
   for (const line of lines) {
     const trimmed = line.trim();
-    if (inTarget) {
-      // Stay in the target table until any other section header appears.
-      if (trimmed.startsWith("[") && trimmed !== target) {
-        inTarget = false;
-        out.push(line);
-      }
-      // Otherwise the line belongs to the target table — drop it.
+    if (targetBlock && trimmed.startsWith("[")) {
+      flushTargetBlock();
+    }
+
+    if (!targetBlock && trimmed === target) {
+      targetBlock = [line];
       continue;
     }
-    if (trimmed === target) {
-      inTarget = true;
-      continue;
+
+    if (targetBlock) {
+      targetBlock.push(line);
+    } else {
+      out.push(line);
     }
-    // Drop orphan dotted keys for this exact table name.
-    if (trimmed.startsWith(dottedPrefix)) {
-      continue;
-    }
-    out.push(line);
   }
+
+  flushTargetBlock();
   return out.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function removeTomlDottedKeysIf(
+  content: string,
+  tableName: string,
+  shouldRemove: (lines: string[]) => boolean,
+): string {
+  if (!content) return content;
+  const keyPrefix = `${tableName}.`;
+  const lines = content.split("\n");
+  const dottedLines = lines.filter((line) => line.trim().startsWith(keyPrefix));
+  if (dottedLines.length === 0 || !shouldRemove(dottedLines)) return content;
+  return lines
+    .filter((line) => !line.trim().startsWith(keyPrefix))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
 }
 
 // Earlier versions of removeTomlTable used a regex with the `m` flag and a
@@ -340,9 +369,14 @@ function removeCodexComputerUseMcp(home: string): void {
 
   const nextContent =
     removeLegacyComputerUseOrphans(
-      removeTomlTable(
-        content,
+      removeTomlDottedKeysIf(
+        removeTomlTableIf(
+          content,
+          `mcp_servers.${CODEX_COMPUTER_USE_MCP_SERVER_NAME}`,
+          isTermCanvasComputerUseConfig,
+        ),
         `mcp_servers.${CODEX_COMPUTER_USE_MCP_SERVER_NAME}`,
+        isTermCanvasComputerUseConfig,
       ),
     ).trimEnd() + "\n";
   if (nextContent === content) return;

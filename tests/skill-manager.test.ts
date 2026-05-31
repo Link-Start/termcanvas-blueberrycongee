@@ -643,6 +643,94 @@ test("installSkillLinks preserves unrelated global MCP servers", () => {
   assert.doesNotMatch(codexConfig, /\[mcp_servers\.computer-use\]/);
 });
 
+test("installSkillLinks preserves non-TermCanvas Codex computer-use MCP table", () => {
+  const { home, sourceDir } = makeTempEnv();
+  const codexDir = path.join(home, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    [
+      "[mcp_servers.computer-use]",
+      'command = "node"',
+      'args = ["/custom/non-termcanvas-computer-use/index.js"]',
+      'env = { CUSTOM_COMPUTER_USE = "1" }',
+      "",
+      "[mcp_servers.mempalace]",
+      'command = "python3"',
+      'args = ["-m", "mempalace"]',
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+
+  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
+
+  const codexConfig = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
+  assert.match(codexConfig, /\[mcp_servers\.computer-use\]/);
+  assert.match(codexConfig, /\/custom\/non-termcanvas-computer-use\/index\.js/);
+  assert.match(codexConfig, /CUSTOM_COMPUTER_USE/);
+  assert.match(codexConfig, /\[mcp_servers\.mempalace\]/);
+  assert.doesNotMatch(codexConfig, /mcp-computer-use-server/);
+  assert.doesNotMatch(codexConfig, /TERMCANVAS_COMPUTER_USE_/);
+});
+
+test("installSkillLinks removes legacy Codex computer-use dotted keys", () => {
+  const { home, sourceDir } = makeTempEnv();
+  const codexDir = path.join(home, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  const stalePath =
+    "/Applications/TermCanvas.app/Contents/Resources/mcp-computer-use-server/index.js";
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    [
+      'model = "gpt-5"',
+      `mcp_servers.computer-use.command = "node"`,
+      `mcp_servers.computer-use.args = ["${stalePath}"]`,
+      'mcp_servers.computer-use.env = { TERMCANVAS_COMPUTER_USE_STATE_FILE = "/old/state.json" }',
+      "",
+      "[mcp_servers.mempalace]",
+      'command = "python3"',
+      'args = ["-m", "mempalace"]',
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+
+  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
+
+  const codexConfig = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
+  assert.doesNotMatch(codexConfig, /mcp_servers\.computer-use\./);
+  assert.doesNotMatch(codexConfig, /mcp-computer-use-server/);
+  assert.doesNotMatch(codexConfig, /TERMCANVAS_COMPUTER_USE_/);
+  assert.match(codexConfig, /\[mcp_servers\.mempalace\]/);
+});
+
+test("installSkillLinks preserves non-TermCanvas Codex computer-use dotted keys", () => {
+  const { home, sourceDir } = makeTempEnv();
+  const codexDir = path.join(home, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    [
+      'model = "gpt-5"',
+      `mcp_servers.computer-use.command = "node"`,
+      'mcp_servers.computer-use.args = ["/custom/non-termcanvas-computer-use/index.js"]',
+      'mcp_servers.computer-use.env = { CUSTOM_COMPUTER_USE = "1" }',
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+
+  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
+
+  const codexConfig = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
+  assert.match(codexConfig, /mcp_servers\.computer-use\.command = "node"/);
+  assert.match(codexConfig, /\/custom\/non-termcanvas-computer-use\/index\.js/);
+  assert.match(codexConfig, /CUSTOM_COMPUTER_USE/);
+  assert.doesNotMatch(codexConfig, /mcp-computer-use-server/);
+  assert.doesNotMatch(codexConfig, /TERMCANVAS_COMPUTER_USE_/);
+});
+
 test("uninstallSkillLinks removes global Computer Use MCP registration", () => {
   const { home, sourceDir } = makeTempEnv();
   fs.mkdirSync(home, { recursive: true });
