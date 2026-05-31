@@ -13,8 +13,8 @@ import {
 
 // Each section installed into a project's CLAUDE.md / AGENTS.md is owned by a
 // distinct module. The UI surfaces them as a single "instructions" check and
-// install: one prompt, one click, all sections covered. New sections (e.g. a
-// future Computer Use guide) plug in here without changing the UI contract.
+// install: one prompt, one click, all sections covered. New instruction
+// sections plug in here without changing the UI contract.
 export type ProjectInstructionFileResult =
   | InitInstructionResult
   | PinInstructionResult;

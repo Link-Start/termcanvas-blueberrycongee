@@ -306,7 +306,6 @@ export const en = {
   settings_features: "Features",
   settings_agent: "Agent",
   settings_shortcuts: "Shortcuts",
-  settings_computer_use: "Computer Use",
   settings_features_group_canvas: "Canvas surfaces",
   settings_features_group_workflow: "Workflow",
   settings_features_group_ambient: "Ambient",
@@ -315,32 +314,6 @@ export const en = {
   settings_shortcut_group_navigation: "Navigation",
   settings_shortcut_group_terminal: "Terminal",
   settings_shortcut_group_panels: "Panels & overlays",
-  computer_use_enable_label: "Computer Use",
-  computer_use_enable_desc: "Enable Mac desktop control for agents",
-  computer_use_helper_status: "Helper Status",
-  computer_use_running: "Running",
-  computer_use_stopped: "Stopped",
-  computer_use_error: "Error",
-  computer_use_accessibility: "Accessibility",
-  computer_use_screen_recording: "Screen Recording",
-  computer_use_granted: "Granted",
-  computer_use_not_granted: "Not Granted",
-  computer_use_open_settings: "Open System Settings",
-  computer_use_refresh_status: "Refresh Status",
-  computer_use_permission_repair_title: "Repair macOS permissions",
-  computer_use_permission_repair_desc:
-    "TermCanvas checks the helper directly. If System Settings already shows TermCanvas or computer-use-helper but this page still says Not Granted, remove the stale entries before adding them again.",
-  computer_use_permission_repair_step_open:
-    "Open both Accessibility and Screen Recording / Screen & System Audio Recording.",
-  computer_use_permission_repair_step_remove:
-    "If TermCanvas or computer-use-helper already exists, select it and remove it with the minus button.",
-  computer_use_permission_repair_step_add_app:
-    "Add and enable /Applications/TermCanvas.app.",
-  computer_use_permission_repair_step_add_helper:
-    "Add and enable /Applications/TermCanvas.app/Contents/Resources/computer-use-helper.",
-  computer_use_permission_repair_step_refresh:
-    "Return here and refresh status after macOS accepts the changes.",
-  computer_use_stop_btn: "Stop Computer Use",
   settings_section_agent_api: "API",
   settings_section_agent_cli: "CLI Tools",
   settings_section_system: "System",

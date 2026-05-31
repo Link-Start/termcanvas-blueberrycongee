@@ -170,7 +170,6 @@ import {
   readLatestCodexSessionId,
 } from "./session-discovery";
 import { AgentService, type AgentConfig } from "./agent-service";
-import { ComputerUseManager } from "./computer-use-manager";
 import { SessionScanner } from "./session-scanner.ts";
 import { mergeAndDedupeSessions } from "./session-list.ts";
 import { buildPinRenderHtml } from "./pin-render-utils";
@@ -308,7 +307,6 @@ const hookReceiver = new HookReceiver((event) => {
     });
   }
 });
-const computerUseManager = new ComputerUseManager();
 const taskStore = new PinStore(path.join(TERMCANVAS_DIR, "pins"));
 
 taskStore.on("pin:created", (payload: { pin: unknown; repo: string }) => {
@@ -326,7 +324,6 @@ const apiServer = new ApiServer({
   ptyManager,
   projectScanner,
   telemetryService,
-  computerUseManager,
   taskStore,
 });
 
@@ -2585,18 +2582,6 @@ app.whenReady().then(async () => {
   });
 });
 
-ipcMain.handle("computer-use:status", () => computerUseManager.getStatus());
-ipcMain.handle("computer-use:enable", () => computerUseManager.enable());
-ipcMain.handle("computer-use:disable", () => computerUseManager.disable());
-ipcMain.handle("computer-use:stop", () => computerUseManager.stop());
-ipcMain.handle("computer-use:open-permissions", () =>
-  computerUseManager.openPermissions(),
-);
-
-computerUseManager.onStateChange((state) => {
-  sendToWindow(mainWindow, "computer-use:state-changed", state);
-});
-
 let isQuitting = false;
 app.on("will-quit", (event) => {
   if (isQuitting) return;
@@ -2614,7 +2599,6 @@ app.on("will-quit", (event) => {
     hookReceiver.stop();
     stopAutoUpdater();
     apiServer.stop();
-    await computerUseManager.shutdown();
     cleanupPortFile();
     app.quit();
   })();

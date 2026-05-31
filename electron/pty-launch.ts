@@ -6,10 +6,6 @@ import {
   getTermCanvasDataDir,
   type TermCanvasInstance,
 } from "../shared/termcanvas-instance";
-import {
-  getComputerUseMcpConfigArgs,
-  isComputerUseMcpProvider,
-} from "../shared/computer-use-mcp";
 
 export interface PtyLaunchOptions {
   cwd: string;
@@ -432,52 +428,6 @@ const defaultDeps: LaunchResolverDeps = {
   },
 };
 
-function resolveMcpServerPath(
-  existsSync: (file: string) => boolean,
-): string | null {
-  const devPath = path.join(
-    process.cwd(),
-    "mcp",
-    "computer-use-server",
-    "dist",
-    "index.js",
-  );
-  if (existsSync(devPath)) return devPath;
-
-  if (process.resourcesPath) {
-    const prodPath = path.join(
-      process.resourcesPath,
-      "mcp-computer-use-server",
-      "index.js",
-    );
-    if (existsSync(prodPath)) return prodPath;
-  }
-
-  return null;
-}
-
-function resolveInstructionsPath(
-  existsSync: (file: string) => boolean,
-): string | null {
-  const devPath = path.join(
-    process.cwd(),
-    "skills",
-    "computer-use-instructions.md",
-  );
-  if (existsSync(devPath)) return devPath;
-
-  if (process.resourcesPath) {
-    const prodPath = path.join(
-      process.resourcesPath,
-      "skills",
-      "computer-use-instructions.md",
-    );
-    if (existsSync(prodPath)) return prodPath;
-  }
-
-  return null;
-}
-
 export class PtyLaunchError extends Error {
   readonly code: string;
   readonly command: string;
@@ -525,50 +475,7 @@ export async function buildLaunchSpec(
     }
   }
 
-  let launchArgs = options.args ?? [];
-
-  const computerUseAwareTypes = new Set([
-    "shell",
-    "claude",
-    "codex",
-    "kimi",
-    "gemini",
-    "opencode",
-    "wuu",
-  ]);
-  if (options.terminalType && computerUseAwareTypes.has(options.terminalType)) {
-    const cuStateFile = path.join(
-      deps.homeDir(),
-      ".termcanvas",
-      "computer-use",
-      "state.json",
-    );
-    const instructionsPath = resolveInstructionsPath(deps.existsSync);
-    shellEnv.TERMCANVAS_COMPUTER_USE_STATE_FILE = cuStateFile;
-    if (instructionsPath) {
-      shellEnv.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS = instructionsPath;
-    }
-    if (deps.existsSync(cuStateFile)) {
-      shellEnv.TERMCANVAS_COMPUTER_USE_ENABLED = "1";
-    }
-
-    if (isComputerUseMcpProvider(options.terminalType)) {
-      const mcpServerPath = resolveMcpServerPath(deps.existsSync);
-      if (mcpServerPath) {
-        launchArgs = [
-          ...getComputerUseMcpConfigArgs(
-            options.terminalType,
-            {
-              mcpServerPath,
-              stateFilePath: cuStateFile,
-              instructionsFilePath: instructionsPath ?? undefined,
-            },
-          ),
-          ...launchArgs,
-        ];
-      }
-    }
-  }
+  const launchArgs = options.args ?? [];
 
   if (options.extraPathEntries?.length) {
     const entries = shellEnv.PATH.split(deps.pathDelimiter);

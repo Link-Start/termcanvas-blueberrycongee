@@ -31,13 +31,6 @@ function makeTempEnv(skillNames = ["hydra", "code-review", "qa"]) {
     "#!/bin/bash\n",
   );
   fs.writeFileSync(path.join(scriptsDir, "termcanvas-hook.mjs"), "// hook\n");
-  fs.writeFileSync(
-    path.join(sourceDir, "computer-use-instructions.md"),
-    "# Computer Use\n",
-  );
-  const mcpServer = path.join(dir, "mcp", "computer-use-server", "dist", "index.js");
-  fs.mkdirSync(path.dirname(mcpServer), { recursive: true });
-  fs.writeFileSync(mcpServer, "// mcp server\n");
 
   return { dir, home, sourceDir };
 }
@@ -559,37 +552,57 @@ test("installSkillLinks keeps legacy codex_hooks for pre-0.129 Codex without fea
   assert.doesNotMatch(content, /^\s*hooks\s*=/m);
 });
 
-test("installSkillLinks registers Computer Use MCP globally for Claude and Codex", () => {
-  const { dir, home, sourceDir } = makeTempEnv();
-  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
-
-  const mcpServer = path.join(dir, "mcp", "computer-use-server", "dist", "index.js");
-  const instructions = path.join(sourceDir, "computer-use-instructions.md");
-  const stateFile = path.join(home, ".termcanvas", "computer-use", "state.json");
-  const portFile = path.join(home, ".termcanvas", "port");
-
-  const claude = readClaudeGlobalConfig(home);
-  assert.deepEqual(claude.mcpServers["termcanvas-computer-use"], {
-    type: "stdio",
-    command: "node",
-    args: [mcpServer],
-    env: {
-      TERMCANVAS_COMPUTER_USE_STATE_FILE: stateFile,
-      TERMCANVAS_PORT_FILE: portFile,
-      TERMCANVAS_COMPUTER_USE_INSTRUCTIONS: instructions,
-    },
-  });
-
-  const codexConfig = fs.readFileSync(
-    path.join(home, ".codex", "config.toml"),
+test("installSkillLinks removes legacy Computer Use MCP registrations", () => {
+  const { home, sourceDir } = makeTempEnv();
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".claude.json"),
+    JSON.stringify({
+      mcpServers: {
+        "termcanvas-computer-use": {
+          type: "stdio",
+          command: "node",
+          args: ["/stale/mcp-computer-use-server/index.js"],
+        },
+        mempalace: { type: "stdio", command: "python3", args: ["-m", "mempalace"] },
+      },
+    }),
     "utf-8",
   );
-  assert.match(codexConfig, /\[mcp_servers\.computer-use\]/);
-  assert.match(codexConfig, /command = "node"/);
-  assert.ok(codexConfig.includes(`args = [${JSON.stringify(mcpServer)}]`));
-  assert.match(codexConfig, /TERMCANVAS_COMPUTER_USE_STATE_FILE/);
-  assert.match(codexConfig, /TERMCANVAS_PORT_FILE/);
-  assert.match(codexConfig, /TERMCANVAS_COMPUTER_USE_INSTRUCTIONS/);
+  const codexDir = path.join(home, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    [
+      'model = "gpt-5"',
+      "",
+      "[mcp_servers.computer-use]",
+      'command = "node"',
+      'args = ["/stale/mcp-computer-use-server/index.js"]',
+      'env = { TERMCANVAS_COMPUTER_USE_STATE_FILE = "/old/state.json" }',
+      "",
+      "[mcp_servers.mempalace]",
+      'command = "python3"',
+      'args = ["-m", "mempalace"]',
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+
+  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
+
+  const claude = readClaudeGlobalConfig(home);
+  assert.equal("termcanvas-computer-use" in claude.mcpServers, false);
+  assert.deepEqual(claude.mcpServers.mempalace, {
+    type: "stdio",
+    command: "python3",
+    args: ["-m", "mempalace"],
+  });
+  const codexConfig = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
+  assert.doesNotMatch(codexConfig, /\[mcp_servers\.computer-use\]/);
+  assert.doesNotMatch(codexConfig, /TERMCANVAS_COMPUTER_USE_/);
+  assert.doesNotMatch(codexConfig, /mcp-computer-use-server/);
+  assert.match(codexConfig, /\[mcp_servers\.mempalace\]/);
 });
 
 test("installSkillLinks preserves unrelated global MCP servers", () => {
@@ -627,12 +640,38 @@ test("installSkillLinks preserves unrelated global MCP servers", () => {
   });
   const codexConfig = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
   assert.match(codexConfig, /\[mcp_servers\.mempalace\]/);
-  assert.match(codexConfig, /\[mcp_servers\.computer-use\]/);
+  assert.doesNotMatch(codexConfig, /\[mcp_servers\.computer-use\]/);
 });
 
 test("uninstallSkillLinks removes global Computer Use MCP registration", () => {
   const { home, sourceDir } = makeTempEnv();
-  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".claude.json"),
+    JSON.stringify({
+      mcpServers: {
+        "termcanvas-computer-use": {
+          type: "stdio",
+          command: "node",
+          args: ["/stale/mcp-computer-use-server/index.js"],
+        },
+      },
+    }),
+    "utf-8",
+  );
+  const codexDir = path.join(home, ".codex");
+  fs.mkdirSync(codexDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexDir, "config.toml"),
+    [
+      "[mcp_servers.computer-use]",
+      'command = "node"',
+      'args = ["/stale/mcp-computer-use-server/index.js"]',
+      'env = { TERMCANVAS_COMPUTER_USE_STATE_FILE = "/old/state.json" }',
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
 
   uninstallSkillLinks({ home, sourceDir });
 
@@ -651,7 +690,7 @@ test("installSkillLinks heals legacy orphan computer-use keys in codex config.to
   // `args = …` / `env = { … }` lines orphaned in whichever section they had
   // been written under. Repeated launches accumulated duplicates and Codex
   // refused to start with a TOML "duplicate key" error. Verify that a single
-  // install on a polluted file restores it to a clean state.
+  // install on a polluted file removes all legacy Computer Use data.
   const { home, sourceDir } = makeTempEnv();
   const codexDir = path.join(home, ".codex");
   fs.mkdirSync(codexDir, { recursive: true });
@@ -693,14 +732,14 @@ test("installSkillLinks heals legacy orphan computer-use keys in codex config.to
   ).length;
   assert.equal(
     headerCount,
-    1,
-    `expected exactly one [mcp_servers.computer-use] header, found ${headerCount}`,
+    0,
+    `expected no [mcp_servers.computer-use] headers, found ${headerCount}`,
   );
 
   const argsCount = (content.match(/^\s*args\s*=/gm) ?? []).length;
   const envCount = (content.match(/^\s*env\s*=/gm) ?? []).length;
-  assert.equal(argsCount, 1, "orphan args lines were not stripped");
-  assert.equal(envCount, 1, "orphan env lines were not stripped");
+  assert.equal(argsCount, 0, "orphan args lines were not stripped");
+  assert.equal(envCount, 0, "orphan env lines were not stripped");
 });
 
 test("ensureSkillLinks does not rewrite codex config.toml when already correct", () => {
@@ -723,11 +762,19 @@ test("ensureSkillLinks does not rewrite codex config.toml when already correct",
   );
 });
 
-test("ensureSkillLinks does not rewrite .claude.json when computer-use entry already correct", () => {
+test("ensureSkillLinks does not rewrite .claude.json without legacy Computer Use entry", () => {
   const { home, sourceDir } = makeTempEnv();
-  installSkillLinks({ home, sourceDir, appVersion: "0.18.0" });
-
+  fs.mkdirSync(home, { recursive: true });
   const claudeConfigFile = path.join(home, ".claude.json");
+  fs.writeFileSync(
+    claudeConfigFile,
+    JSON.stringify({
+      mcpServers: {
+        mempalace: { type: "stdio", command: "python3", args: ["-m", "mempalace"] },
+      },
+    }),
+    "utf-8",
+  );
   const beforeMtime = fs.statSync(claudeConfigFile).mtimeNs;
 
   ensureSkillLinks({ home, sourceDir, appVersion: "0.18.0" });

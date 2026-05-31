@@ -1,52 +1,12 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import {
-  getComputerUseMcpConfigArgs,
-  type ComputerUseMcpProvider,
-} from "../../shared/computer-use-mcp";
 
-const HELP_ARGS = new Set(["-h", "--help", "help", "-v", "--version", "version"]);
+type AgentShimProvider = "claude" | "codex";
 
 function moduleDir(): string {
   return path.dirname(fileURLToPath(import.meta.url));
-}
-
-function defaultStateFilePath(): string {
-  return path.join(os.homedir(), ".termcanvas", "computer-use", "state.json");
-}
-
-function resolveStateFilePath(): string | null {
-  const configured = process.env.TERMCANVAS_COMPUTER_USE_STATE_FILE?.trim();
-  const stateFilePath = configured || defaultStateFilePath();
-  return stateFilePath;
-}
-
-function resolveMcpServerPath(): string | null {
-  const configured = process.env.TERMCANVAS_COMPUTER_USE_MCP_SERVER?.trim();
-  if (configured && fs.existsSync(configured)) return configured;
-
-  const dir = moduleDir();
-  const candidates = [
-    path.resolve(dir, "..", "..", "mcp-computer-use-server", "index.js"),
-    path.resolve(dir, "..", "..", "mcp", "computer-use-server", "dist", "index.js"),
-    path.resolve(dir, "..", "..", "dist-computer-use", "mcp-computer-use-server", "index.js"),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
-}
-
-function resolveInstructionsPath(): string | null {
-  const configured = process.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS?.trim();
-  if (configured && fs.existsSync(configured)) return configured;
-
-  const dir = moduleDir();
-  const candidates = [
-    path.resolve(dir, "..", "..", "skills", "computer-use-instructions.md"),
-    path.resolve(dir, "..", "..", "..", "skills", "computer-use-instructions.md"),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
 }
 
 function commandCandidates(command: string): string[] {
@@ -87,42 +47,14 @@ function resolveRealCommand(command: string): string | null {
   return null;
 }
 
-function shouldInjectMcp(args: string[]): boolean {
-  return !args.some((arg) => HELP_ARGS.has(arg));
-}
-
-function getInjectedArgs(
-  provider: ComputerUseMcpProvider,
-  args: string[],
-): string[] {
-  const stateFilePath = resolveStateFilePath();
-  const mcpServerPath = resolveMcpServerPath();
-  if (!stateFilePath || !mcpServerPath || !shouldInjectMcp(args)) {
-    return args;
-  }
-  const instructionsFilePath = resolveInstructionsPath();
-  if (instructionsFilePath) {
-    process.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS = instructionsFilePath;
-  }
-
-  return [
-    ...getComputerUseMcpConfigArgs(provider, {
-      mcpServerPath,
-      stateFilePath,
-      instructionsFilePath: instructionsFilePath ?? undefined,
-    }),
-    ...args,
-  ];
-}
-
-export function runAgentShim(provider: ComputerUseMcpProvider): never {
+export function runAgentShim(provider: AgentShimProvider): never {
   const realCommand = resolveRealCommand(provider);
   if (!realCommand) {
     console.error(`TermCanvas could not find the real ${provider} executable in PATH.`);
     process.exit(127);
   }
 
-  const args = getInjectedArgs(provider, process.argv.slice(2));
+  const args = process.argv.slice(2);
   const result = spawnSync(realCommand, args, {
     stdio: "inherit",
     env: process.env,

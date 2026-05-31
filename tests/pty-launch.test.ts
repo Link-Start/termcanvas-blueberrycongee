@@ -300,21 +300,7 @@ test("buildLaunchSpec injects TermCanvas instance routing into the PTY environme
   }
 });
 
-test("buildLaunchSpec injects Computer Use MCP config into Codex argv", async () => {
-  const stateFile = "/Users/test/.termcanvas/computer-use/state.json";
-  const mcpServer = path.join(
-    process.cwd(),
-    "mcp",
-    "computer-use-server",
-    "dist",
-    "index.js",
-  );
-  const instructionsFile = path.join(
-    process.cwd(),
-    "skills",
-    "computer-use-instructions.md",
-  );
-
+test("buildLaunchSpec does not inject removed TermCanvas Computer Use config", async () => {
   const launch = await buildLaunchSpec(
     {
       cwd: "/repo",
@@ -323,175 +309,19 @@ test("buildLaunchSpec injects Computer Use MCP config into Codex argv", async ()
       terminalType: "codex",
     },
     createDeps({
-      existsSync: (file) =>
-        ["/repo", HOME_CLI_PATH, stateFile, mcpServer, instructionsFile].includes(file),
+      existsSync: (file) => ["/repo", HOME_CLI_PATH].includes(file),
       isExecutable: (file) => [HOME_CLI_PATH].includes(file),
     }),
   );
 
-  assert.deepEqual(launch.args.slice(0, 6), [
-    "-c",
-    'mcp_servers.computer-use.command="node"',
-    "-c",
-    `mcp_servers.computer-use.args=${JSON.stringify([mcpServer])}`,
-    "-c",
-    `mcp_servers.computer-use.env={ TERMCANVAS_COMPUTER_USE_STATE_FILE = ${JSON.stringify(stateFile)}, TERMCANVAS_COMPUTER_USE_INSTRUCTIONS = ${JSON.stringify(instructionsFile)} }`,
-  ]);
-  assert.deepEqual(launch.args.slice(6), ["resume", "session-42"]);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_ENABLED, "1");
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_STATE_FILE, stateFile);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS, instructionsFile);
+  assert.deepEqual(launch.args, ["resume", "session-42"]);
+  assert.equal("TERMCANVAS_COMPUTER_USE_ENABLED" in launch.env, false);
+  assert.equal("TERMCANVAS_COMPUTER_USE_STATE_FILE" in launch.env, false);
+  assert.equal("TERMCANVAS_COMPUTER_USE_INSTRUCTIONS" in launch.env, false);
   assert.equal("TERMCANVAS_CU_PORT" in launch.env, false);
   assert.equal("TERMCANVAS_CU_TOKEN" in launch.env, false);
   assert.equal("CODEX_MCP_SERVERS" in launch.env, false);
-});
-
-test("buildLaunchSpec injects Computer Use MCP config into Codex before helper is enabled", async () => {
-  const stateFile = "/Users/test/.termcanvas/computer-use/state.json";
-  const mcpServer = path.join(
-    process.cwd(),
-    "mcp",
-    "computer-use-server",
-    "dist",
-    "index.js",
-  );
-  const instructionsFile = path.join(
-    process.cwd(),
-    "skills",
-    "computer-use-instructions.md",
-  );
-
-  const launch = await buildLaunchSpec(
-    {
-      cwd: "/repo",
-      shell: "codex",
-      terminalType: "codex",
-    },
-    createDeps({
-      existsSync: (file) =>
-        ["/repo", HOME_CLI_PATH, mcpServer, instructionsFile].includes(file),
-      isExecutable: (file) => [HOME_CLI_PATH].includes(file),
-    }),
-  );
-
-  assert.deepEqual(launch.args.slice(0, 6), [
-    "-c",
-    'mcp_servers.computer-use.command="node"',
-    "-c",
-    `mcp_servers.computer-use.args=${JSON.stringify([mcpServer])}`,
-    "-c",
-    `mcp_servers.computer-use.env={ TERMCANVAS_COMPUTER_USE_STATE_FILE = ${JSON.stringify(stateFile)}, TERMCANVAS_COMPUTER_USE_INSTRUCTIONS = ${JSON.stringify(instructionsFile)} }`,
-  ]);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_STATE_FILE, stateFile);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS, instructionsFile);
-  assert.equal("TERMCANVAS_COMPUTER_USE_ENABLED" in launch.env, false);
-});
-
-test("buildLaunchSpec injects Computer Use MCP config into Claude argv", async () => {
-  const stateFile = "/Users/test/.termcanvas/computer-use/state.json";
-  const mcpServer = path.join(
-    process.cwd(),
-    "mcp",
-    "computer-use-server",
-    "dist",
-    "index.js",
-  );
-  const instructionsFile = path.join(
-    process.cwd(),
-    "skills",
-    "computer-use-instructions.md",
-  );
-
-  const launch = await buildLaunchSpec(
-    {
-      cwd: "/repo",
-      shell: "claude",
-      args: ["--resume", "session-42"],
-      terminalType: "claude",
-    },
-    createDeps({
-      existsSync: (file) =>
-        [
-          "/repo",
-          "/opt/homebrew/bin/claude",
-          stateFile,
-          mcpServer,
-          instructionsFile,
-        ].includes(file),
-      isExecutable: (file) => ["/opt/homebrew/bin/claude"].includes(file),
-    }),
-  );
-
-  assert.equal(launch.args[0], "--mcp-config");
-  assert.deepEqual(JSON.parse(launch.args[1]), {
-    mcpServers: {
-      "termcanvas-computer-use": {
-        command: "node",
-        args: [mcpServer],
-        env: {
-          TERMCANVAS_COMPUTER_USE_STATE_FILE: stateFile,
-          TERMCANVAS_COMPUTER_USE_INSTRUCTIONS: instructionsFile,
-        },
-      },
-    },
-  });
-  assert.deepEqual(launch.args.slice(2), ["--resume", "session-42"]);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS, instructionsFile);
-  assert.equal("CLAUDE_MCP_SERVERS" in launch.env, false);
-  assert.equal("TERMCANVAS_CU_TOKEN" in launch.env, false);
-});
-
-test("buildLaunchSpec exposes Computer Use state file to shell terminals without token", async () => {
-  const stateFile = "/Users/test/.termcanvas/computer-use/state.json";
-  const instructionsFile = path.join(
-    process.cwd(),
-    "skills",
-    "computer-use-instructions.md",
-  );
-
-  const launch = await buildLaunchSpec(
-    {
-      cwd: "/repo",
-      terminalType: "shell",
-    },
-    createDeps({
-      existsSync: (file) =>
-        ["/repo", "/bin/zsh", stateFile, instructionsFile].includes(file),
-      isExecutable: (file) => ["/bin/zsh"].includes(file),
-    }),
-  );
-
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_ENABLED, "1");
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_STATE_FILE, stateFile);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS, instructionsFile);
-  assert.equal("TERMCANVAS_CU_TOKEN" in launch.env, false);
-  assert.deepEqual(launch.args, ["-l"]);
-});
-
-test("buildLaunchSpec exposes Computer Use bootstrap env to shell terminals before helper is enabled", async () => {
-  const stateFile = "/Users/test/.termcanvas/computer-use/state.json";
-  const instructionsFile = path.join(
-    process.cwd(),
-    "skills",
-    "computer-use-instructions.md",
-  );
-
-  const launch = await buildLaunchSpec(
-    {
-      cwd: "/repo",
-      terminalType: "shell",
-    },
-    createDeps({
-      existsSync: (file) => ["/repo", "/bin/zsh", instructionsFile].includes(file),
-      isExecutable: (file) => ["/bin/zsh"].includes(file),
-    }),
-  );
-
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_STATE_FILE, stateFile);
-  assert.equal(launch.env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS, instructionsFile);
-  assert.equal("TERMCANVAS_COMPUTER_USE_ENABLED" in launch.env, false);
-  assert.equal("TERMCANVAS_CU_TOKEN" in launch.env, false);
-  assert.deepEqual(launch.args, ["-l"]);
+  assert.ok(!launch.args.some((arg) => arg.includes("computer-use")));
 });
 
 test("shell terminal extra PATH entries put agent shims after cliDir for launch prepending", () => {

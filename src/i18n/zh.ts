@@ -300,7 +300,6 @@ export const zh = {
   settings_features: "功能",
   settings_agent: "Agent",
   settings_shortcuts: "快捷键",
-  settings_computer_use: "电脑操控",
   settings_features_group_canvas: "画布功能",
   settings_features_group_workflow: "工作流",
   settings_features_group_ambient: "氛围效果",
@@ -309,32 +308,6 @@ export const zh = {
   settings_shortcut_group_navigation: "导航",
   settings_shortcut_group_terminal: "终端",
   settings_shortcut_group_panels: "面板与浮层",
-  computer_use_enable_label: "电脑操控",
-  computer_use_enable_desc: "为代理启用 Mac 桌面控制",
-  computer_use_helper_status: "助手状态",
-  computer_use_running: "运行中",
-  computer_use_stopped: "已停止",
-  computer_use_error: "错误",
-  computer_use_accessibility: "辅助功能",
-  computer_use_screen_recording: "屏幕录制",
-  computer_use_granted: "已授权",
-  computer_use_not_granted: "未授权",
-  computer_use_open_settings: "打开系统设置",
-  computer_use_refresh_status: "重新检测",
-  computer_use_permission_repair_title: "修复 macOS 权限",
-  computer_use_permission_repair_desc:
-    "TermCanvas 以 helper 的实际检测结果为准。如果系统设置里已经有 TermCanvas 或 computer-use-helper，但这里仍显示未授权，请先移除旧条目再重新添加。",
-  computer_use_permission_repair_step_open:
-    "打开“辅助功能”和“屏幕录制 / 录屏与系统音频”两个权限页。",
-  computer_use_permission_repair_step_remove:
-    "如果已有 TermCanvas 或 computer-use-helper，先选中它并点击减号移除。",
-  computer_use_permission_repair_step_add_app:
-    "添加并启用 /Applications/TermCanvas.app。",
-  computer_use_permission_repair_step_add_helper:
-    "添加并启用 /Applications/TermCanvas.app/Contents/Resources/computer-use-helper。",
-  computer_use_permission_repair_step_refresh:
-    "macOS 接受更改后，回到这里点击重新检测。",
-  computer_use_stop_btn: "停止电脑操控",
   settings_section_agent_api: "API",
   settings_section_agent_cli: "CLI 工具",
   settings_section_system: "系统",

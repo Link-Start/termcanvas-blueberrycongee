@@ -212,60 +212,6 @@ function ensurePluginEnabled(settingsFile: string, sourceDir: string): void {
   fs.renameSync(tmp, settingsFile);
 }
 
-interface ComputerUseMcpInstallConfig {
-  mcpServerPath: string;
-  stateFilePath: string;
-  instructionsFilePath?: string;
-  portFilePath: string;
-}
-
-function resolveComputerUseMcpConfig(
-  sourceDir: string,
-  home: string,
-): ComputerUseMcpInstallConfig | null {
-  const rootDir = path.dirname(sourceDir);
-  const candidates = [
-    path.join(rootDir, "mcp-computer-use-server", "index.js"),
-    path.join(rootDir, "mcp", "computer-use-server", "dist", "index.js"),
-    path.join(
-      rootDir,
-      "dist-computer-use",
-      "mcp-computer-use-server",
-      "index.js",
-    ),
-  ];
-  const mcpServerPath = candidates.find((candidate) =>
-    fs.existsSync(candidate),
-  );
-  if (!mcpServerPath) return null;
-
-  const instructionsFilePath = path.join(
-    sourceDir,
-    "computer-use-instructions.md",
-  );
-  return {
-    mcpServerPath,
-    stateFilePath: path.join(home, ".termcanvas", "computer-use", "state.json"),
-    instructionsFilePath: fs.existsSync(instructionsFilePath)
-      ? instructionsFilePath
-      : undefined,
-    portFilePath: path.join(home, ".termcanvas", "port"),
-  };
-}
-
-function computerUseMcpEnv(
-  config: ComputerUseMcpInstallConfig,
-): Record<string, string> {
-  const env: Record<string, string> = {
-    TERMCANVAS_COMPUTER_USE_STATE_FILE: config.stateFilePath,
-    TERMCANVAS_PORT_FILE: config.portFilePath,
-  };
-  if (config.instructionsFilePath) {
-    env.TERMCANVAS_COMPUTER_USE_INSTRUCTIONS = config.instructionsFilePath;
-  }
-  return env;
-}
-
 function readJsonObject(filePath: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
@@ -297,46 +243,6 @@ function writeJsonAtomic(
   fs.renameSync(tmp, filePath);
 }
 
-function ensureClaudeComputerUseMcp(
-  globalConfigFile: string,
-  config: ComputerUseMcpInstallConfig,
-): void {
-  const data = readJsonObject(globalConfigFile);
-  if (!data) {
-    console.warn(
-      "[SkillManager] .claude.json is corrupt, skipping Computer Use MCP registration",
-    );
-    return;
-  }
-
-  const existingServers =
-    typeof data.mcpServers === "object" &&
-    data.mcpServers !== null &&
-    !Array.isArray(data.mcpServers)
-      ? (data.mcpServers as Record<string, unknown>)
-      : {};
-
-  const newEntry = {
-    type: "stdio",
-    command: "node",
-    args: [config.mcpServerPath],
-    env: computerUseMcpEnv(config),
-  };
-  const existingEntry = existingServers[CLAUDE_COMPUTER_USE_MCP_SERVER_NAME];
-  if (
-    existingEntry &&
-    JSON.stringify(existingEntry) === JSON.stringify(newEntry)
-  ) {
-    return;
-  }
-
-  const mcpServers = { ...existingServers };
-  mcpServers[CLAUDE_COMPUTER_USE_MCP_SERVER_NAME] = newEntry;
-  data.mcpServers = mcpServers;
-
-  writeJsonAtomic(globalConfigFile, data);
-}
-
 function removeClaudeComputerUseMcp(globalConfigFile: string): void {
   const data = readJsonObject(globalConfigFile);
   if (!data) return;
@@ -357,20 +263,6 @@ function removeClaudeComputerUseMcp(globalConfigFile: string): void {
     data.mcpServers = mcpServers;
   }
   writeJsonAtomic(globalConfigFile, data);
-}
-
-function tomlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function tomlArray(values: string[]): string {
-  return `[${values.map(tomlString).join(", ")}]`;
-}
-
-function tomlInlineTable(values: Record<string, string>): string {
-  return `{ ${Object.entries(values)
-    .map(([key, value]) => `${key} = ${tomlString(value)}`)
-    .join(", ")} }`;
 }
 
 // Strip every `[tableName]` block — header through the last body line before
@@ -437,43 +329,6 @@ function removeLegacyComputerUseOrphans(content: string): string {
   return kept.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
-function ensureCodexComputerUseMcp(
-  home: string,
-  config: ComputerUseMcpInstallConfig,
-): void {
-  const configFile = path.join(getCodexConfigDir(home), "config.toml");
-
-  let content = "";
-  try {
-    content = fs.readFileSync(configFile, "utf-8");
-  } catch {}
-
-  const tableName = `mcp_servers.${CODEX_COMPUTER_USE_MCP_SERVER_NAME}`;
-  let cleaned = removeTomlTable(content, tableName);
-  cleaned = removeLegacyComputerUseOrphans(cleaned);
-  cleaned = cleaned.trimEnd();
-
-  const table = [
-    `[${tableName}]`,
-    `command = "node"`,
-    `args = ${tomlArray([config.mcpServerPath])}`,
-    `env = ${tomlInlineTable(computerUseMcpEnv(config))}`,
-    "",
-  ].join("\n");
-
-  const nextContent = cleaned ? `${cleaned}\n\n${table}` : table;
-
-  // Idempotent: skip the write when the on-disk content already matches.
-  // Without this every app launch would touch config.toml and (with the old
-  // regex bug) gradually pollute it with orphan args/env keys.
-  if (nextContent === content) return;
-
-  fs.mkdirSync(path.dirname(configFile), { recursive: true });
-  const tmp = configFile + ".tmp." + process.pid;
-  fs.writeFileSync(tmp, nextContent, "utf-8");
-  fs.renameSync(tmp, configFile);
-}
-
 function removeCodexComputerUseMcp(home: string): void {
   const configFile = path.join(getCodexConfigDir(home), "config.toml");
   let content = "";
@@ -484,24 +339,16 @@ function removeCodexComputerUseMcp(home: string): void {
   }
 
   const nextContent =
-    removeTomlTable(
-      content,
-      `mcp_servers.${CODEX_COMPUTER_USE_MCP_SERVER_NAME}`,
+    removeLegacyComputerUseOrphans(
+      removeTomlTable(
+        content,
+        `mcp_servers.${CODEX_COMPUTER_USE_MCP_SERVER_NAME}`,
+      ),
     ).trimEnd() + "\n";
   if (nextContent === content) return;
   const tmp = configFile + ".tmp." + process.pid;
   fs.writeFileSync(tmp, nextContent, "utf-8");
   fs.renameSync(tmp, configFile);
-}
-
-function ensureComputerUseMcpRegistration(
-  sourceDir: string,
-  home: string,
-): void {
-  const config = resolveComputerUseMcpConfig(sourceDir, home);
-  if (!config) return;
-  ensureClaudeComputerUseMcp(getClaudeGlobalConfigFile(home), config);
-  ensureCodexComputerUseMcp(home, config);
 }
 
 function removeComputerUseMcpRegistration(home: string): void {
@@ -1211,7 +1058,7 @@ export function installSkillLinks({
       path.join(sourceDir, "scripts", "termcanvas-hook.mjs"),
     );
     ensureCodexFeatureFlag(home);
-    ensureComputerUseMcpRegistration(sourceDir, home);
+    removeComputerUseMcpRegistration(home);
     installAllSkillLinks(sourceDir, home, appVersion);
     return true;
   } catch (err) {
@@ -1254,7 +1101,7 @@ export function ensureSkillLinks({
       path.join(sourceDir, "scripts", "termcanvas-hook.mjs"),
     );
     ensureCodexFeatureFlag(home);
-    ensureComputerUseMcpRegistration(sourceDir, home);
+    removeComputerUseMcpRegistration(home);
     installAllSkillLinks(sourceDir, home, appVersion);
 
     return true;

@@ -24,18 +24,11 @@ extraResources:
     to: skills
     filter:
       - "**/*"
-  - from: dist-computer-use
-    to: .
-    filter:
-      - "**/*"
-
 asarUnpack:
   - node_modules/node-pty/**/*
 
 mac:
   identity: "-"
-  signIgnore:
-    - ".*\\/computer-use-helper$"
   category: public.app-category.developer-tools
   icon: build/icon.icns
   target:

@@ -133,8 +133,6 @@ Groups:
   terminal       create | list | status | output | destroy | set-title
   workflow       Lead-driven Hydra workflow over HTTP (init / dispatch / watch …)
   telemetry      get | events
-  computer-use   status | enable | setup | disable | stop | list-apps
-                 | open-app | get-app-state | click | type | press-key | scroll | drag
   pin            add | list | show | update | rm
   diff           <worktree-path> [--summary]
   state          dump full canvas state as JSON

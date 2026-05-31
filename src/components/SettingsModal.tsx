@@ -26,7 +26,6 @@ import { FONT_REGISTRY } from "../terminal/fontRegistry";
 import { loadFont } from "../terminal/fontLoader";
 import { useNotificationStore } from "../stores/notificationStore";
 import { useUpdaterStore } from "../stores/updaterStore";
-import { useComputerUseStore } from "../stores/computerUseStore";
 
 const platform = window.termcanvas?.app.platform ?? "darwin";
 const isMac = platform === "darwin";
@@ -618,180 +617,12 @@ function ProviderDropdown({
   );
 }
 
-function ComputerUseSection() {
-  const t = useT();
-  const {
-    enabled,
-    helperRunning,
-    accessibilityGranted,
-    screenRecordingGranted,
-    error,
-    loading,
-    fetchStatus,
-    enable: cuEnable,
-    disable: cuDisable,
-    stop: cuStop,
-    openPermissions,
-  } = useComputerUseStore();
-
-  useEffect(() => {
-    fetchStatus();
-  }, []);
-
-  useEffect(() => {
-    if (!window.termcanvas?.computerUse?.onStateChanged) return;
-    const unsub = window.termcanvas.computerUse.onStateChanged((state) => {
-      useComputerUseStore.setState({
-        enabled: state.enabled,
-        helperRunning: state.helperRunning,
-        accessibilityGranted: state.accessibilityGranted,
-        screenRecordingGranted: state.screenRecordingGranted,
-        error: state.error,
-        loading: false,
-      });
-    });
-    return unsub;
-  }, []);
-
-  const statusDot = (granted: boolean | null) => {
-    if (granted === null) return "bg-[var(--text-muted)]";
-    return granted ? "bg-[var(--green)]" : "bg-[var(--amber)]";
-  };
-  const missingPermission =
-    accessibilityGranted === false || screenRecordingGranted === false;
-
-  return (
-    <div className="flex flex-col gap-6">
-      <SettingsRow
-        label={t.computer_use_enable_label}
-        description={t.computer_use_enable_desc}
-      >
-        <OnOffSegment
-          value={enabled}
-          onChange={(next) => void (next ? cuEnable() : cuDisable())}
-          disabled={{ on: loading || enabled, off: loading || !enabled }}
-        />
-      </SettingsRow>
-
-      <div className="rounded-md border border-[var(--border)]">
-        <div className="flex items-center justify-between px-3 py-2.5">
-          <span className="text-[12px] text-[var(--text-secondary)]">
-            {t.computer_use_helper_status}
-          </span>
-          <div className="flex items-center gap-2">
-            <span
-              className={`inline-flex h-1.5 w-1.5 rounded-full ${
-                error
-                  ? "bg-[var(--red)]"
-                  : helperRunning
-                    ? "bg-[var(--green)]"
-                    : "bg-[var(--text-muted)]"
-              }`}
-            />
-            <span className="text-[12px] text-[var(--text-primary)]">
-              {error
-                ? t.computer_use_error
-                : helperRunning
-                  ? t.computer_use_running
-                  : t.computer_use_stopped}
-            </span>
-          </div>
-        </div>
-        <div className="border-t border-[var(--border)] flex items-center justify-between px-3 py-2.5">
-          <span className="text-[12px] text-[var(--text-secondary)]">
-            {t.computer_use_accessibility}
-          </span>
-          <div className="flex items-center gap-2">
-            <span
-              className={`inline-flex h-1.5 w-1.5 rounded-full ${statusDot(accessibilityGranted)}`}
-            />
-            <span className="text-[12px] text-[var(--text-primary)]">
-              {accessibilityGranted
-                ? t.computer_use_granted
-                : t.computer_use_not_granted}
-            </span>
-          </div>
-        </div>
-        <div className="border-t border-[var(--border)] flex items-center justify-between px-3 py-2.5">
-          <span className="text-[12px] text-[var(--text-secondary)]">
-            {t.computer_use_screen_recording}
-          </span>
-          <div className="flex items-center gap-2">
-            <span
-              className={`inline-flex h-1.5 w-1.5 rounded-full ${statusDot(screenRecordingGranted)}`}
-            />
-            <span className="text-[12px] text-[var(--text-primary)]">
-              {screenRecordingGranted
-                ? t.computer_use_granted
-                : t.computer_use_not_granted}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {error && (
-        <div className="rounded-md border border-[var(--red)]/30 bg-[var(--red-soft)] px-3 py-2 text-[12px] text-[var(--red)]">
-          {error}
-        </div>
-      )}
-
-      {missingPermission && (
-        <div className="rounded-md border border-[var(--amber)]/35 bg-[var(--amber)]/10 px-4 py-3.5">
-          <div className="text-[12px] font-medium text-[var(--text-primary)] mb-1">
-            {t.computer_use_permission_repair_title}
-          </div>
-          <p className="text-[12px] leading-relaxed text-[var(--text-secondary)] mb-2">
-            {t.computer_use_permission_repair_desc}
-          </p>
-          <ol className="list-decimal space-y-1 pl-4 text-[12px] leading-relaxed text-[var(--text-secondary)]">
-            <li>{t.computer_use_permission_repair_step_open}</li>
-            <li>{t.computer_use_permission_repair_step_remove}</li>
-            <li>{t.computer_use_permission_repair_step_add_app}</li>
-            <li>{t.computer_use_permission_repair_step_add_helper}</li>
-            <li>{t.computer_use_permission_repair_step_refresh}</li>
-          </ol>
-          <div className="mt-3 flex flex-wrap gap-3">
-            <button
-              type="button"
-              className="text-[12px] text-[var(--accent)] hover:underline"
-              onClick={openPermissions}
-            >
-              {t.computer_use_open_settings}
-            </button>
-            <button
-              type="button"
-              className="text-[12px] text-[var(--accent)] hover:underline disabled:text-[var(--text-muted)] disabled:no-underline"
-              disabled={loading}
-              onClick={() => void fetchStatus()}
-            >
-              {t.computer_use_refresh_status}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {enabled && (
-        <div className="border-t border-[var(--border)] pt-5">
-          <button
-            type="button"
-            className="px-3 py-1.5 rounded-md text-[12px] bg-[var(--red-soft)] text-[var(--red)] hover:brightness-110 transition-all duration-quick"
-            onClick={() => void cuStop()}
-          >
-            {t.computer_use_stop_btn}
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
 const TAB_LABEL_KEYS: Record<Tab, string> = {
   general: "settings_general",
   appearance: "settings_appearance",
   features: "settings_features",
   agent: "settings_agent",
   shortcuts: "settings_shortcuts",
-  "computer-use": "settings_computer_use",
 };
 
 export function SettingsModal({ onClose }: Props) {
@@ -859,19 +690,14 @@ export function SettingsModal({ onClose }: Props) {
   >(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
 
-  // Tabs we render in the rail. Computer Use is macOS-only; non-mac
-  // platforms get a tighter list rather than a tab that surfaces a
-  // useless row.
   const tabs = useMemo<Tab[]>(() => {
-    const base: Tab[] = [
+    return [
       "general",
       "appearance",
       "features",
       "agent",
       "shortcuts",
     ];
-    if (isMac) base.push("computer-use");
-    return base;
   }, []);
 
   useEffect(() => {
@@ -1686,14 +1512,6 @@ export function SettingsModal({ onClose }: Props) {
               </section>
             )}
 
-            {tab === "computer-use" && (
-              <section>
-                <SectionHeader
-                  title={t.settings_computer_use ?? "Computer Use"}
-                />
-                <ComputerUseSection />
-              </section>
-            )}
           </div>
         </div>
       </div>
