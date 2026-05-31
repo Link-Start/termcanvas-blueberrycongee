@@ -2,6 +2,11 @@
 
 All notable changes to TermCanvas will be documented in this file.
 
+## [0.39.10] - 2026-06-01
+
+### Fixed
+- **Legacy Computer Use cleanup no longer removes user-managed Codex MCPs**: Codex `computer-use` MCP entries are now removed only when they contain TermCanvas legacy signatures, preserving custom or third-party MCP servers that use the same generic name.
+
 ## [0.39.9] - 2026-05-31
 
 ### Changed
