@@ -1,5 +1,6 @@
 import { execFile } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import {
   getTermCanvasDataDir,
@@ -40,6 +41,8 @@ export interface LaunchResolverDeps {
   pathSeparator: string;
   existsSync: (file: string) => boolean;
   isExecutable: (file: string) => boolean;
+  readFileSync: (file: string, encoding: BufferEncoding) => string;
+  homeDir: () => string;
   getShellEnv: () => Promise<Record<string, string | undefined>>;
 }
 
@@ -54,6 +57,14 @@ const LOGIN_SHELL_ENV_BLOCKED_PREFIXES = [
   "CODEX_",
   "P9K_",
 ] as const;
+
+const TERMCANVAS_RUNTIME_ENV_BLOCKLIST = new Set([
+  "TERMCANVAS_SOCKET",
+  "TERMCANVAS_TERMINAL_ID",
+  "TERMCANVAS_TERMINAL_TYPE",
+  "TERMCANVAS_INSTANCE",
+  "TERMCANVAS_PORT_FILE",
+]);
 
 function getEnvVarCaseInsensitive(
   env: Record<string, string | undefined>,
@@ -165,6 +176,10 @@ export function sanitizeEnv(
     if (typeof value === "string") {
       cleaned[key] = value;
     }
+  }
+
+  for (const key of TERMCANVAS_RUNTIME_ENV_BLOCKLIST) {
+    delete cleaned[key];
   }
 
   cleaned.PATH = mergePathValue(
@@ -356,6 +371,8 @@ const defaultDeps: LaunchResolverDeps = {
   pathDelimiter: path.delimiter,
   pathSeparator: path.sep,
   existsSync: (file) => fs.existsSync(file),
+  readFileSync: (file, encoding) => fs.readFileSync(file, encoding),
+  homeDir: () => os.homedir(),
   isExecutable: (file) => {
     try {
       fs.accessSync(file, fs.constants.X_OK);
@@ -458,6 +475,8 @@ export async function buildLaunchSpec(
     }
   }
 
+  const launchArgs = options.args ?? [];
+
   if (options.extraPathEntries?.length) {
     const entries = shellEnv.PATH.split(deps.pathDelimiter);
     for (const dir of options.extraPathEntries) {
@@ -489,7 +508,7 @@ export async function buildLaunchSpec(
       return {
         cwd: options.cwd,
         file: commandShell,
-        args: ["/d", "/s", "/c", executable, ...(options.args ?? [])],
+        args: ["/d", "/s", "/c", executable, ...launchArgs],
         env: shellEnv,
       };
     }
@@ -497,7 +516,7 @@ export async function buildLaunchSpec(
     return {
       cwd: options.cwd,
       file: executable,
-      args: options.args ?? [],
+      args: launchArgs,
       env: shellEnv,
     };
   }
@@ -506,7 +525,7 @@ export async function buildLaunchSpec(
   return {
     cwd: options.cwd,
     file: shell,
-    args: deps.platform === "win32" ? options.args ?? [] : ["-l", ...(options.args ?? [])],
+    args: deps.platform === "win32" ? launchArgs : ["-l", ...launchArgs],
     env: shellEnv,
   };
 }

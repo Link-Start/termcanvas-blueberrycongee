@@ -10,6 +10,7 @@ import {
   sanitizeLoginShellSeedEnv,
   type LaunchResolverDeps,
 } from "../electron/pty-launch.ts";
+import { getTerminalExtraPathEntries } from "../electron/agent-shims.ts";
 
 const HOME_CLI_PATH = path.posix.join("/opt/homebrew/bin", "codex");
 
@@ -32,6 +33,10 @@ function createDeps(overrides: Partial<LaunchResolverDeps> = {}): LaunchResolver
         HOME_CLI_PATH,
         "/Users/test/bin/custom",
       ].includes(file),
+    readFileSync: () => {
+      throw new Error("Unexpected readFileSync call");
+    },
+    homeDir: () => "/Users/test",
     getShellEnv: async () => ({
       HOME: "/Users/test",
       PATH: "/opt/homebrew/bin:/usr/bin:/bin",
@@ -61,6 +66,10 @@ function createWindowsDeps(
         "C:\\Users\\test\\AppData\\Local\\Microsoft\\WindowsApps\\codex.exe",
         "C:\\Users\\test\\AppData\\Roaming\\npm\\claude.cmd",
       ].includes(file),
+    readFileSync: () => {
+      throw new Error("Unexpected readFileSync call");
+    },
+    homeDir: () => "C:\\Users\\test",
     getShellEnv: async () => ({
       LOCALAPPDATA: "C:\\Users\\test\\AppData\\Local",
       APPDATA: "C:\\Users\\test\\AppData\\Roaming",
@@ -87,6 +96,28 @@ test("sanitizeEnv drops undefined values and injects a fallback PATH", () => {
   assert.equal(env.LANG, "en_US.UTF-8");
   assert.ok(!("SHELL" in env));
   assert.match(env.PATH, /\/usr\/bin/);
+});
+
+test("sanitizeEnv strips inherited TermCanvas runtime identity", () => {
+  const env = sanitizeEnv(
+    {
+      HOME: "/Users/test",
+      PATH: "/custom/bin",
+      TERMCANVAS_SOCKET: "/tmp/termcanvas-prod.sock",
+      TERMCANVAS_TERMINAL_ID: "prod-terminal",
+      TERMCANVAS_TERMINAL_TYPE: "codex",
+      TERMCANVAS_INSTANCE: "prod",
+      TERMCANVAS_PORT_FILE: "/Users/test/.termcanvas/port",
+    },
+    createDeps(),
+  );
+
+  assert.equal(env.HOME, "/Users/test");
+  assert.ok(!("TERMCANVAS_SOCKET" in env));
+  assert.ok(!("TERMCANVAS_TERMINAL_ID" in env));
+  assert.ok(!("TERMCANVAS_TERMINAL_TYPE" in env));
+  assert.ok(!("TERMCANVAS_INSTANCE" in env));
+  assert.ok(!("TERMCANVAS_PORT_FILE" in env));
 });
 
 test("sanitizeEnv reads Windows Path variables case-insensitively and appends common user bins", () => {
@@ -267,6 +298,55 @@ test("buildLaunchSpec injects TermCanvas instance routing into the PTY environme
       process.env.VITE_DEV_SERVER_URL = previousDevServerUrl;
     }
   }
+});
+
+test("buildLaunchSpec does not inject removed TermCanvas Computer Use config", async () => {
+  const launch = await buildLaunchSpec(
+    {
+      cwd: "/repo",
+      shell: "codex",
+      args: ["resume", "session-42"],
+      terminalType: "codex",
+    },
+    createDeps({
+      existsSync: (file) => ["/repo", HOME_CLI_PATH].includes(file),
+      isExecutable: (file) => [HOME_CLI_PATH].includes(file),
+    }),
+  );
+
+  assert.deepEqual(launch.args, ["resume", "session-42"]);
+  assert.equal("TERMCANVAS_COMPUTER_USE_ENABLED" in launch.env, false);
+  assert.equal("TERMCANVAS_COMPUTER_USE_STATE_FILE" in launch.env, false);
+  assert.equal("TERMCANVAS_COMPUTER_USE_INSTRUCTIONS" in launch.env, false);
+  assert.equal("TERMCANVAS_CU_PORT" in launch.env, false);
+  assert.equal("TERMCANVAS_CU_TOKEN" in launch.env, false);
+  assert.equal("CODEX_MCP_SERVERS" in launch.env, false);
+  assert.ok(!launch.args.some((arg) => arg.includes("computer-use")));
+});
+
+test("shell terminal extra PATH entries put agent shims after cliDir for launch prepending", () => {
+  const entries = getTerminalExtraPathEntries(
+    "/Applications/TermCanvas.app/Contents/Resources/cli",
+    "shell",
+    (file) => file.endsWith("/agent-shims"),
+  );
+
+  assert.deepEqual(entries, [
+    "/Applications/TermCanvas.app/Contents/Resources/cli",
+    "/Applications/TermCanvas.app/Contents/Resources/cli/agent-shims",
+  ]);
+});
+
+test("managed agent terminals do not receive shell agent shim PATH entries", () => {
+  const entries = getTerminalExtraPathEntries(
+    "/Applications/TermCanvas.app/Contents/Resources/cli",
+    "codex",
+    () => true,
+  );
+
+  assert.deepEqual(entries, [
+    "/Applications/TermCanvas.app/Contents/Resources/cli",
+  ]);
 });
 
 test("buildLaunchSpec does not duplicate extraPathEntries already in PATH", async () => {

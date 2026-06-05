@@ -1,5 +1,10 @@
 import { create } from "zustand";
-import type { UsageSummary, CloudUsageSummary } from "../types";
+import type {
+  UsageSummary,
+  CloudUsageSummary,
+  UsageRangeSummary,
+  CloudUsageRangeSummary,
+} from "../types";
 
 export interface HeatmapEntry {
   tokens: number;
@@ -16,6 +21,11 @@ interface UsageStore {
   /** When a fetch is in-flight, stores the latest requested date so it's fetched next */
   pendingDate: string | null;
   fetch: (dateStr?: string) => Promise<void>;
+  rangeSummary: UsageRangeSummary | null;
+  rangeLoading: boolean;
+  rangeCache: Record<string, UsageRangeSummary>;
+  rangeFetchedAt: Record<string, number>;
+  fetchRange: (startDate: string, endDate: string) => Promise<void>;
 
   heatmapData: Record<string, HeatmapEntry>;
   heatmapLoading: boolean;
@@ -24,10 +34,13 @@ interface UsageStore {
   fetchHeatmap: () => Promise<void>;
 
   cloudSummary: CloudUsageSummary | null;
+  cloudRangeSummary: CloudUsageRangeSummary | null;
   cloudHeatmapData: Record<string, { tokens: number; cost: number }> | null;
   cloudSummaryFetchedAt: number;
+  cloudRangeFetchedAt: number;
   cloudHeatmapFetchedAt: number;
   fetchCloud: (dateStr?: string) => Promise<void>;
+  fetchCloudRange: (startDate: string, endDate: string) => Promise<void>;
   fetchCloudHeatmap: () => Promise<void>;
 }
 
@@ -52,6 +65,10 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
   summaryCache: {},
   summaryFetchedAt: {},
   pendingDate: null,
+  rangeSummary: null,
+  rangeLoading: false,
+  rangeCache: {},
+  rangeFetchedAt: {},
 
   fetch: async (dateStr?: string) => {
     const target = dateStr ?? get().date;
@@ -99,6 +116,37 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
     }
   },
 
+  fetchRange: async (startDate: string, endDate: string) => {
+    const key = `${startDate}:${endDate}`;
+    const cached = get().rangeCache[key];
+    const fetchedAt = get().rangeFetchedAt[key] ?? 0;
+    if (cached && Date.now() - fetchedAt < HEATMAP_STALE_MS) {
+      set({ rangeSummary: cached });
+      return;
+    }
+
+    if (!window.termcanvas?.usage?.queryRange) {
+      set({ rangeSummary: null });
+      return;
+    }
+
+    set({ rangeLoading: true });
+    try {
+      const rangeSummary = await window.termcanvas.usage.queryRange(
+        startDate,
+        endDate,
+      );
+      set((state) => ({
+        rangeSummary,
+        rangeLoading: false,
+        rangeCache: { ...state.rangeCache, [key]: rangeSummary },
+        rangeFetchedAt: { ...state.rangeFetchedAt, [key]: Date.now() },
+      }));
+    } catch {
+      set({ rangeLoading: false });
+    }
+  },
+
   heatmapData: {},
   heatmapLoading: false,
   heatmapError: false,
@@ -129,8 +177,10 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
   },
 
   cloudSummary: null,
+  cloudRangeSummary: null,
   cloudHeatmapData: null,
   cloudSummaryFetchedAt: 0,
+  cloudRangeFetchedAt: 0,
   cloudHeatmapFetchedAt: 0,
 
   fetchCloud: async (dateStr?: string) => {
@@ -142,17 +192,41 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
     ) {
       return;
     }
-    // @ts-expect-error -- queryCloud will be added by the preload agent
     if (!window.termcanvas?.usage?.queryCloud) {
       set({ cloudSummary: null });
       return;
     }
     try {
-      // @ts-expect-error -- queryCloud will be added by the preload agent
       const data = await window.termcanvas.usage.queryCloud(target);
       set({ cloudSummary: data ?? null, cloudSummaryFetchedAt: Date.now() });
     } catch {
       set({ cloudSummary: null });
+    }
+  },
+
+  fetchCloudRange: async (startDate: string, endDate: string) => {
+    if (
+      get().cloudRangeSummary?.startDate === startDate &&
+      get().cloudRangeSummary?.endDate === endDate &&
+      Date.now() - get().cloudRangeFetchedAt < CLOUD_SUMMARY_STALE_MS
+    ) {
+      return;
+    }
+    if (!window.termcanvas?.usage?.queryRangeCloud) {
+      set({ cloudRangeSummary: null });
+      return;
+    }
+    try {
+      const data = await window.termcanvas.usage.queryRangeCloud(
+        startDate,
+        endDate,
+      );
+      set({
+        cloudRangeSummary: data ?? null,
+        cloudRangeFetchedAt: Date.now(),
+      });
+    } catch {
+      set({ cloudRangeSummary: null });
     }
   },
 
@@ -163,13 +237,11 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
     ) {
       return;
     }
-    // @ts-expect-error -- heatmapCloud will be added by the preload agent
     if (!window.termcanvas?.usage?.heatmapCloud) {
       set({ cloudHeatmapData: null });
       return;
     }
     try {
-      // @ts-expect-error -- heatmapCloud will be added by the preload agent
       const data = await window.termcanvas.usage.heatmapCloud();
       set({ cloudHeatmapData: data ?? null, cloudHeatmapFetchedAt: Date.now() });
     } catch {

@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   checkTurnComplete,
   parseSessionTelemetryLine,
+  resolveSessionFile,
   toClaudeProjectKey,
 } from "../electron/session-watcher.ts";
 
@@ -18,6 +20,61 @@ function withTempFile(content: string, fn: (filePath: string) => void) {
     fn(filePath);
   } finally {
     fs.rmSync(dir, { recursive: true });
+  }
+}
+
+function withTempHome(fn: (homeDir: string) => void): void {
+  const homeDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "session-watcher-home-"),
+  );
+  const previousHome = process.env.HOME;
+  process.env.HOME = homeDir;
+  try {
+    fn(homeDir);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+}
+
+function writeStateDbThread(
+  homeDir: string,
+  input: {
+    sessionId: string;
+    cwd: string;
+    rolloutPath: string;
+  },
+): void {
+  const dbPath = path.join(homeDir, ".codex", "state_5.sqlite");
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        cwd TEXT NOT NULL,
+        archived INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    db.prepare(`
+      INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd, archived)
+      VALUES (?, ?, ?, ?, ?, 0)
+    `).run(
+      input.sessionId,
+      input.rolloutPath,
+      1775339237,
+      1775339238,
+      input.cwd,
+    );
+  } finally {
+    db.close();
   }
 }
 
@@ -85,6 +142,33 @@ test("codex: detects task_complete event", () => {
   withTempFile(jsonl, (filePath) => {
     const result = checkTurnComplete(filePath, "codex");
     assert.equal(result.completed, true);
+  });
+});
+
+test("codex resolveSessionFile prefers rollout_path from state db before the file exists", () => {
+  withTempHome((homeDir) => {
+    const sessionId = "db-session";
+    const rolloutPath = path.join(
+      homeDir,
+      ".codex",
+      "sessions",
+      "2026",
+      "04",
+      "20",
+      `rollout-2026-04-20T03-00-00-${sessionId}.jsonl`,
+    );
+
+    writeStateDbThread(homeDir, {
+      sessionId,
+      cwd: "/tmp/project-db",
+      rolloutPath,
+    });
+
+    assert.equal(fs.existsSync(rolloutPath), false);
+    assert.equal(
+      resolveSessionFile(sessionId, "codex", "/tmp/project-db"),
+      rolloutPath,
+    );
   });
 });
 
@@ -260,4 +344,184 @@ test("codex telemetry parser captures exec_command_end lifecycle and status", ()
   assert.equal(events[0].lifecycle, "end");
   assert.equal(events[0].event_subtype, "completed");
   assert.equal(events[0].turn_state, "in_turn");
+});
+
+test("wuu: detects completion when the latest relevant line is a plain assistant reply", () => {
+  const jsonl = [
+    JSON.stringify({ role: "user", content: "你是谁", at: "2026-04-11T10:00:00Z" }),
+    JSON.stringify({
+      role: "assistant",
+      content: "我是 Wuu。",
+      at: "2026-04-11T10:00:01Z",
+    }),
+    JSON.stringify({ role: "meta", content: "token_usage", at: "2026-04-11T10:00:01Z" }),
+  ].join("\n");
+
+  withTempFile(jsonl, (filePath) => {
+    const result = checkTurnComplete(filePath, "wuu");
+    assert.equal(result.completed, true);
+  });
+});
+
+test("wuu: does not report completion while a tool result is the latest relevant event", () => {
+  const jsonl = [
+    JSON.stringify({ role: "user", content: "list files", at: "2026-04-11T10:00:00Z" }),
+    JSON.stringify({
+      role: "assistant",
+      content: "",
+      at: "2026-04-11T10:00:01Z",
+      tool_calls: [{ id: "call-1", name: "list_files" }],
+    }),
+    JSON.stringify({
+      role: "tool",
+      content: "{\"entries\":[]}",
+      at: "2026-04-11T10:00:02Z",
+      tool_call_id: "call-1",
+      name: "list_files",
+    }),
+  ].join("\n");
+
+  withTempFile(jsonl, (filePath) => {
+    const result = checkTurnComplete(filePath, "wuu");
+    assert.equal(result.completed, false);
+  });
+});
+
+test("wuu telemetry parser tracks tool lifecycle and final assistant completion", () => {
+  const toolStart = parseSessionTelemetryLine(
+    JSON.stringify({
+      role: "assistant",
+      content: "",
+      at: "2026-04-11T10:00:01Z",
+      tool_calls: [{ id: "call-1", name: "list_files" }],
+    }),
+    "wuu",
+  );
+  const toolEnd = parseSessionTelemetryLine(
+    JSON.stringify({
+      role: "tool",
+      content: "{\"entries\":[]}",
+      at: "2026-04-11T10:00:02Z",
+      tool_call_id: "call-1",
+      name: "list_files",
+    }),
+    "wuu",
+  );
+  const assistantReply = parseSessionTelemetryLine(
+    JSON.stringify({
+      role: "assistant",
+      content: "Done.",
+      at: "2026-04-11T10:00:03Z",
+    }),
+    "wuu",
+  );
+
+  assert.deepEqual(toolStart, [
+    {
+      at: "2026-04-11T10:00:01Z",
+      event_type: "tool_use",
+      role: "assistant",
+      tool_name: "list_files",
+      call_id: "call-1",
+      lifecycle: "start",
+      turn_state: "tool_running",
+      meaningful_progress: true,
+    },
+  ]);
+  assert.deepEqual(toolEnd, [
+    {
+      at: "2026-04-11T10:00:02Z",
+      event_type: "tool_result",
+      role: "tool",
+      tool_name: "list_files",
+      call_id: "call-1",
+      lifecycle: "end",
+      turn_state: "in_turn",
+      meaningful_progress: true,
+    },
+  ]);
+  assert.deepEqual(assistantReply, [
+    {
+      at: "2026-04-11T10:00:03Z",
+      event_type: "assistant_message",
+      role: "assistant",
+      turn_state: "turn_complete",
+      meaningful_progress: true,
+    },
+  ]);
+});
+
+test("kimi: detects completion when assistant has no tool_calls", () => {
+  const jsonl = [
+    JSON.stringify({ role: "user", content: "hello" }),
+    JSON.stringify({ role: "assistant", content: "hi there" }),
+  ].join("\n");
+
+  withTempFile(jsonl, (filePath) => {
+    const result = checkTurnComplete(filePath, "kimi");
+    assert.equal(result.completed, true);
+  });
+});
+
+test("kimi: not completed when assistant has pending tool_calls", () => {
+  const jsonl = [
+    JSON.stringify({ role: "user", content: "hello" }),
+    JSON.stringify({
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "call-1", type: "function", function: { name: "read_file" } }],
+    }),
+  ].join("\n");
+
+  withTempFile(jsonl, (filePath) => {
+    const result = checkTurnComplete(filePath, "kimi");
+    assert.equal(result.completed, false);
+  });
+});
+
+test("kimi: not completed when last message is user", () => {
+  const jsonl = [
+    JSON.stringify({ role: "assistant", content: "hi" }),
+    JSON.stringify({ role: "user", content: "hello" }),
+  ].join("\n");
+
+  withTempFile(jsonl, (filePath) => {
+    const result = checkTurnComplete(filePath, "kimi");
+    assert.equal(result.completed, false);
+  });
+});
+
+test("kimi telemetry parser tracks tool lifecycle and assistant completion", () => {
+  const lines = [
+    JSON.stringify({ role: "user", content: "run test", timestamp: "2026-04-11T10:00:00Z" }),
+    JSON.stringify({
+      role: "assistant",
+      content: "I'll run that",
+      tool_calls: [{ id: "call-1", type: "function", function: { name: "exec" } }],
+      timestamp: "2026-04-11T10:00:01Z",
+    }),
+    JSON.stringify({ role: "tool", content: "ok", tool_call_id: "call-1", timestamp: "2026-04-11T10:00:02Z" }),
+    JSON.stringify({ role: "assistant", content: "Done", timestamp: "2026-04-11T10:00:03Z" }),
+  ];
+
+  const events = lines.flatMap((line) => parseSessionTelemetryLine(line, "kimi"));
+  assert.equal(events.length, 5);
+
+  const [userMsg, toolStart, toolEnd, assistantReply] = [
+    events.filter((e) => e.event_type === "user_message"),
+    events.filter((e) => e.event_type === "tool_use"),
+    events.filter((e) => e.event_type === "tool_result"),
+    events.filter((e) => e.event_type === "assistant_message"),
+  ];
+
+  assert.equal(userMsg.length, 1);
+  assert.equal(toolStart.length, 1);
+  assert.equal(toolEnd.length, 1);
+  assert.equal(assistantReply.length, 2); // one after tool_start, one final
+
+  assert.equal(toolStart[0]?.lifecycle, "start");
+  assert.equal(toolStart[0]?.tool_name, "exec");
+  assert.equal(toolEnd[0]?.lifecycle, "end");
+  assert.equal(toolEnd[0]?.call_id, "call-1");
+  assert.equal(assistantReply[1]?.turn_state, "turn_complete");
 });

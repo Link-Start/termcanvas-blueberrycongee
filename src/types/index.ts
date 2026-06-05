@@ -1,9 +1,31 @@
 import type { SceneDocument } from "./scene";
 import type {
   TelemetryEventPage,
+  TelemetryProvider,
   TerminalTelemetrySnapshot,
   WorkflowTelemetrySnapshot,
 } from "../../shared/telemetry";
+import type {
+  RenderDiagnosticEventInput,
+  RenderDiagnosticsLogInfo,
+} from "../../shared/render-diagnostics";
+import type { SessionHistoryChangedEvent } from "../../shared/sessions";
+import type {
+  Pin,
+  PinLink,
+  PinStatus,
+  CreatePinInput,
+  UpdatePinInput,
+} from "../../shared/pin";
+
+export type { Pin, PinLink, PinStatus, CreatePinInput, UpdatePinInput };
+
+type SessionTelemetryProvider = Exclude<TelemetryProvider, "unknown">;
+
+export type PinEvent =
+  | { type: "pin:created"; pin: Pin; repo: string }
+  | { type: "pin:updated"; pin: Pin; repo: string }
+  | { type: "pin:removed"; id: string; repo: string };
 
 export * from "./scene";
 
@@ -14,6 +36,7 @@ export type TerminalType =
   | "kimi"
   | "gemini"
   | "opencode"
+  | "wuu"
   | "lazygit"
   | "tmux";
 
@@ -52,6 +75,13 @@ export interface ComposerSubmitRequest {
   worktreePath: string;
   text: string;
   images: ComposerImageAttachment[];
+  /**
+   * When false, paste the text and stage any images but DO NOT send the
+   * Enter key — leaves the prompt in the agent's input buffer for the user
+   * to review/edit/submit themselves. Defaults to true to preserve the
+   * existing composer:submit behavior; pin drag-and-drop opts out.
+   */
+  submit?: boolean;
 }
 
 export type ComposerSubmitIssueStage =
@@ -96,7 +126,11 @@ export interface TerminalData {
   focused: boolean;
   ptyId: number | null;
   status: TerminalStatus;
-  span: { cols: number; rows: number };
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  tags: string[];
   origin?: TerminalOrigin;
   parentTerminalId?: string;
   scrollback?: string;
@@ -135,8 +169,7 @@ export interface WorktreeData {
   id: string;
   name: string;
   path: string;
-  position: Position;
-  collapsed: boolean;
+  isPrimary?: boolean;
   terminals: TerminalData[];
 }
 
@@ -144,15 +177,28 @@ export interface PersistedWorktreeData extends Omit<WorktreeData, "terminals"> {
   terminals: PersistedTerminalData[];
 }
 
+/**
+ * A named viewport position the user can jump back to. Slots 1..9
+ * are addressed by string-keyed map so the persisted JSON is stable
+ * across saves (numeric object keys round-trip as strings anyway).
+ */
+export interface SpatialWaypoint {
+  x: number;
+  y: number;
+  scale: number;
+  savedAt: number;
+}
+
+export type SpatialWaypointSlot = "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+
+export type SpatialWaypointMap = Partial<Record<SpatialWaypointSlot, SpatialWaypoint>>;
+
 export interface ProjectData {
   id: string;
   name: string;
   path: string;
-  position: Position;
-  collapsed: boolean;
-  zIndex: number;
-  autoCompact?: boolean;
   worktrees: WorktreeData[];
+  waypoints?: SpatialWaypointMap;
 }
 
 export interface PersistedProjectData extends Omit<ProjectData, "worktrees"> {
@@ -192,6 +238,11 @@ export interface UsageBucket {
 export interface ProjectUsage {
   path: string;
   name: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate5m: number;
+  cacheCreate1h: number;
   cost: number;
   calls: number;
 }
@@ -248,6 +299,36 @@ export interface UsageSummary {
   buckets: UsageBucket[];
   projects: ProjectUsage[];
   models: ModelUsage[];
+}
+
+export interface UsageRangeDay {
+  date: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate5m: number;
+  cacheCreate1h: number;
+  cost: number;
+  calls: number;
+}
+
+export interface UsageRangeSummary {
+  startDate: string;
+  endDate: string;
+  days: UsageRangeDay[];
+  sessions: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCacheRead: number;
+  totalCacheCreate5m: number;
+  totalCacheCreate1h: number;
+  totalCost: number;
+  projects: ProjectUsage[];
+  models: ModelUsage[];
+}
+
+export interface CloudUsageRangeSummary extends UsageRangeSummary {
+  devices: DeviceUsage[];
 }
 
 export interface QuotaData {
@@ -337,6 +418,49 @@ export interface GitStatusEntry {
   originalPath?: string;
 }
 
+export interface GitStashEntry {
+  index: number;
+  message: string;
+  hash: string;
+  date: string;
+}
+
+export interface GitTagInfo {
+  name: string;
+  hash: string;
+  isAnnotated: boolean;
+  message: string;
+  date: string;
+}
+
+export interface GitRemoteInfo {
+  name: string;
+  fetchUrl: string;
+  pushUrl: string;
+}
+
+export interface GitBlameEntry {
+  hash: string;
+  author: string;
+  date: string;
+  lineStart: number;
+  lineCount: number;
+  content: string;
+}
+
+export interface GitFileDiff {
+  hunks: string[];
+  isNew: boolean;
+  isDeleted: boolean;
+  isBinary: boolean;
+}
+
+export type GitMergeState =
+  | { type: "none" }
+  | { type: "merge" }
+  | { type: "rebase"; current: string; total: string }
+  | { type: "cherry-pick" };
+
 export type AgentStreamEvent =
   | { type: "stream_start" }
   | { type: "stream_end" }
@@ -392,9 +516,7 @@ export interface TermCanvasAPI {
     notifyThemeChanged: (ptyId: number) => void;
     onOutput: (callback: (ptyId: number, data: string) => void) => () => void;
     onExit: (callback: (ptyId: number, exitCode: number) => void) => () => void;
-    detectCli: (
-      ptyId: number,
-    ) => Promise<{
+    detectCli: (ptyId: number) => Promise<{
       cliType: TerminalType;
       pid?: number;
       sessionName?: string;
@@ -420,6 +542,14 @@ export interface TermCanvasAPI {
       filePath: string;
       confidence: "strong" | "medium" | "weak";
     } | null>;
+    findWuu: (
+      cwd: string,
+      startedAt?: string,
+    ) => Promise<{
+      sessionId: string;
+      filePath: string;
+      confidence: "medium" | "weak";
+    } | null>;
     getPermissionMode: (
       sessionId: string,
       cwd: string,
@@ -430,7 +560,22 @@ export interface TermCanvasAPI {
       cwd: string,
     ) => Promise<boolean>;
     getClaudeByPid: (pid: number) => Promise<string | null>;
-    getKimiLatest: (cwd: string) => Promise<string | null>;
+    findKimi: (
+      cwd: string,
+      startedAt?: string,
+    ) => Promise<{
+      sessionId: string;
+      filePath: string;
+      confidence: "medium" | "weak";
+    } | null>;
+    findOpenCode: (
+      cwd: string,
+      startedAt?: string,
+    ) => Promise<{
+      sessionId: string;
+      filePath: string;
+      confidence: "medium" | "weak";
+    } | null>;
     watch: (
       type: string,
       sessionId: string,
@@ -442,7 +587,7 @@ export interface TermCanvasAPI {
   telemetry: {
     attachSession: (input: {
       terminalId: string;
-      provider: "claude" | "codex";
+      provider: SessionTelemetryProvider;
       sessionId: string;
       cwd: string;
       confidence: "strong" | "medium" | "weak";
@@ -451,7 +596,7 @@ export interface TermCanvasAPI {
     updateTerminal: (input: {
       terminalId: string;
       worktreePath?: string;
-      provider?: "claude" | "codex" | "unknown";
+      provider?: TelemetryProvider;
       ptyId?: number | null;
       shellPid?: number | null;
     }) => Promise<TerminalTelemetrySnapshot>;
@@ -474,19 +619,28 @@ export interface TermCanvasAPI {
       }) => void,
     ) => () => void;
   };
+  diagnostics: {
+    recordRenderEvent: (input: RenderDiagnosticEventInput) => Promise<void>;
+    getRenderLogInfo: () => Promise<RenderDiagnosticsLogInfo>;
+  };
+  lifecycle: {
+    onVisible: (
+      callback: (payload: { reason: string; timestamp: number }) => void,
+    ) => () => void;
+  };
   project: {
     selectDirectory: () => Promise<string | null>;
     scan: (dirPath: string) => Promise<{
       name: string;
       path: string;
-      worktrees: { path: string; branch: string; isMain: boolean }[];
+      worktrees: { path: string; branch: string; isPrimary: boolean }[];
     } | null>;
     listChildGitRepos: (
       dirPath: string,
     ) => Promise<{ name: string; path: string }[]>;
     rescanWorktrees: (
       dirPath: string,
-    ) => Promise<{ path: string; branch: string; isMain: boolean }[]>;
+    ) => Promise<{ path: string; branch: string; isPrimary: boolean }[]>;
     createWorktree: (
       repoPath: string,
       branch: string,
@@ -494,20 +648,24 @@ export interface TermCanvasAPI {
       | {
           ok: true;
           path: string;
-          worktrees: { path: string; branch: string; isMain: boolean }[];
+          worktrees: { path: string; branch: string; isPrimary: boolean }[];
         }
       | { ok: false; error: string }
     >;
     removeWorktree: (
       repoPath: string,
       worktreePath: string,
+      force?: boolean,
     ) => Promise<
       | {
           ok: true;
-          worktrees: { path: string; branch: string; isMain: boolean }[];
+          worktrees: { path: string; branch: string; isPrimary: boolean }[];
         }
       | { ok: false; error: string }
     >;
+    deleteFolder: (
+      projectPath: string,
+    ) => Promise<{ ok: true } | { ok: false; error: string }>;
     enableHydra: (dirPath: string) => Promise<ProjectEnableHydraResult>;
     checkHydra: (
       dirPath: string,
@@ -548,15 +706,164 @@ export interface TermCanvasAPI {
     commit: (worktreePath: string, message: string) => Promise<string>;
     push: (worktreePath: string) => Promise<string>;
     pull: (worktreePath: string) => Promise<string>;
+    amend: (worktreePath: string, message: string) => Promise<string>;
+    fetch: (worktreePath: string, remote?: string) => Promise<string>;
+    // Stash
+    stashList: (worktreePath: string) => Promise<GitStashEntry[]>;
+    stashCreate: (
+      worktreePath: string,
+      message: string,
+      includeUntracked: boolean,
+    ) => Promise<void>;
+    stashApply: (worktreePath: string, index: number) => Promise<void>;
+    stashPop: (worktreePath: string, index: number) => Promise<void>;
+    stashDrop: (worktreePath: string, index: number) => Promise<void>;
+    // Branch management
+    branchCreate: (
+      worktreePath: string,
+      name: string,
+      startPoint?: string,
+    ) => Promise<void>;
+    branchDelete: (
+      worktreePath: string,
+      name: string,
+      force: boolean,
+    ) => Promise<void>;
+    branchRename: (
+      worktreePath: string,
+      oldName: string,
+      newName: string,
+    ) => Promise<void>;
+    // Tags
+    tagList: (worktreePath: string) => Promise<GitTagInfo[]>;
+    tagCreate: (
+      worktreePath: string,
+      name: string,
+      ref: string,
+      message?: string,
+    ) => Promise<void>;
+    tagDelete: (worktreePath: string, name: string) => Promise<void>;
+    // Remotes
+    remoteList: (worktreePath: string) => Promise<GitRemoteInfo[]>;
+    remoteAdd: (
+      worktreePath: string,
+      name: string,
+      url: string,
+    ) => Promise<void>;
+    remoteRemove: (worktreePath: string, name: string) => Promise<void>;
+    remoteRename: (
+      worktreePath: string,
+      oldName: string,
+      newName: string,
+    ) => Promise<void>;
+    // Merge / Rebase / Cherry-pick
+    merge: (worktreePath: string, ref: string) => Promise<string>;
+    mergeAbort: (worktreePath: string) => Promise<void>;
+    rebase: (worktreePath: string, ref: string) => Promise<string>;
+    rebaseAbort: (worktreePath: string) => Promise<void>;
+    rebaseContinue: (worktreePath: string) => Promise<string>;
+    cherryPick: (worktreePath: string, hash: string) => Promise<string>;
+    cherryPickAbort: (worktreePath: string) => Promise<void>;
+    mergeState: (worktreePath: string) => Promise<GitMergeState>;
+    // File diff & partial staging
+    fileDiff: (
+      worktreePath: string,
+      filePath: string,
+      staged: boolean,
+    ) => Promise<GitFileDiff>;
+    stageHunk: (
+      worktreePath: string,
+      filePath: string,
+      hunkHeader: string,
+    ) => Promise<void>;
+    unstageHunk: (
+      worktreePath: string,
+      filePath: string,
+      hunkHeader: string,
+    ) => Promise<void>;
+    // Blame
+    blame: (worktreePath: string, filePath: string) => Promise<GitBlameEntry[]>;
+    // Events
     onChanged: (callback: (worktreePath: string) => void) => () => void;
     onLogChanged: (callback: (worktreePath: string) => void) => () => void;
     onPresenceChanged: (
       callback: (worktreePath: string, payload: { isGitRepo: boolean }) => void,
     ) => () => void;
   };
+  search: {
+    fileContents: (
+      query: string,
+      worktreePath?: string,
+    ) => Promise<Array<{ filePath: string; line: number; preview: string }>>;
+    sessionContents: (
+      query: string,
+    ) => Promise<
+      Array<{
+        sessionId: string;
+        filePath: string;
+        lineNumber: number;
+        preview: string;
+      }>
+    >;
+    listSessions: (projectDirs: string[]) => Promise<
+      Array<{
+        sessionId: string;
+        provider: "claude" | "codex" | "kimi";
+        projectDir: string;
+        filePath: string;
+        firstPrompt: string;
+        startedAt: string;
+        lastActivityAt: string;
+        estimatedMessageCount: number;
+        fileSize: number;
+      }>
+    >;
+    listSessionsPage: (
+      projectDirs: string[],
+      options: { limit: number; offset?: number },
+    ) => Promise<{
+      entries: Array<{
+        sessionId: string;
+        provider: "claude" | "codex" | "kimi";
+        projectDir: string;
+        filePath: string;
+        firstPrompt: string;
+        startedAt: string;
+        lastActivityAt: string;
+        estimatedMessageCount: number;
+        fileSize: number;
+      }>;
+      total: number;
+    }>;
+  };
   state: {
     load: () => Promise<PersistedCanvasState | null>;
     save: (state: unknown) => Promise<void>;
+  };
+  snapshots: {
+    list: () => Promise<
+      Array<{
+        id: string;
+        savedAt: number;
+        terminalCount: number;
+        projectCount: number;
+        label?: string;
+      }>
+    >;
+    read: (id: string) => Promise<unknown | null>;
+    append: (args: {
+      savedAt: number;
+      terminalCount: number;
+      projectCount: number;
+      label?: string;
+      body: unknown;
+    }) => Promise<{
+      id: string;
+      savedAt: number;
+      terminalCount: number;
+      projectCount: number;
+      label?: string;
+    }>;
   };
   workspace: {
     save: (data: string) => Promise<string | null>;
@@ -568,6 +875,13 @@ export interface TermCanvasAPI {
     listDir: (
       dirPath: string,
     ) => Promise<{ name: string; isDirectory: boolean }[]>;
+    listAllFiles: (
+      dirPath: string,
+    ) => Promise<{
+      type: "git" | "dir";
+      paths: string[];
+    }>;
+    listIgnoredFiles: (dirPath: string) => Promise<string[]>;
     readFile: (
       filePath: string,
     ) => Promise<
@@ -586,6 +900,7 @@ export interface TermCanvasAPI {
     }>;
     getFilePath: (file: File) => string;
     rename: (oldPath: string, newName: string) => Promise<void>;
+    move: (oldPath: string, newPath: string) => Promise<void>;
     delete: (targetPath: string) => Promise<void>;
     mkdir: (dirPath: string, name: string) => Promise<void>;
     createFile: (dirPath: string, name: string) => Promise<void>;
@@ -652,7 +967,7 @@ export interface TermCanvasAPI {
   };
   cli: {
     isRegistered: () => Promise<boolean>;
-    register: () => Promise<boolean>;
+    register: () => Promise<{ ok: boolean; skillInstalled: boolean }>;
     unregister: () => Promise<boolean>;
     validateCommand: (
       command: string,
@@ -667,7 +982,17 @@ export interface TermCanvasAPI {
   };
   usage: {
     query: (dateStr: string) => Promise<UsageSummary>;
+    queryRange: (
+      startDate: string,
+      endDate: string,
+    ) => Promise<UsageRangeSummary>;
+    queryCloud?: (dateStr: string) => Promise<CloudUsageSummary | null>;
+    queryRangeCloud?: (
+      startDate: string,
+      endDate: string,
+    ) => Promise<CloudUsageRangeSummary | null>;
     heatmap: () => Promise<Record<string, { tokens: number; cost: number }>>;
+    heatmapCloud?: () => Promise<Record<string, { tokens: number; cost: number }> | null>;
   };
   quota: {
     fetch: () => Promise<QuotaFetchResult>;
@@ -746,9 +1071,8 @@ export interface TermCanvasAPI {
   app: {
     homePath: string;
     platform: "darwin" | "win32" | "linux";
-    onBeforeClose: (callback: () => void) => () => void;
     requestClose: () => void;
-    confirmClose: (options?: { installUpdate?: boolean }) => void;
+    setQuitOnLastWindowClosed: (value: boolean) => void;
   };
   hooks: {
     getSocketPath: () => Promise<string | null>;
@@ -787,15 +1111,48 @@ export interface TermCanvasAPI {
         sessions: import("../../shared/sessions").SessionInfo[],
       ) => void,
     ) => () => void;
+    onHistoryChanged: (
+      callback: (payload: SessionHistoryChangedEvent) => void,
+    ) => () => void;
     loadReplay: (
       filePath: string,
     ) => Promise<import("../../shared/sessions").ReplayTimeline>;
+    forkSession: (
+      sourceFilePath: string,
+      turnIndex: number,
+      targetProvider?: "claude" | "codex",
+    ) => Promise<{ newSessionId: string; newFilePath: string }>;
   };
   menu: {
     onOpenFolder: (callback: (dirPath: string) => void) => () => void;
+    onSelectAll: (callback: () => void) => () => void;
+  };
+  pins: {
+    list: (repo: string) => Promise<Pin[]>;
+    create: (input: CreatePinInput) => Promise<Pin>;
+    update: (repo: string, id: string, patch: UpdatePinInput) => Promise<Pin>;
+    remove: (repo: string, id: string) => Promise<void>;
+    openPreview: (repo: string, id: string) => Promise<void>;
+    saveAttachment: (
+      repo: string,
+      id: string,
+      fileName: string,
+      data: ArrayBuffer,
+    ) => Promise<{ relativePath: string; absolutePath: string }>;
+    dispatchToTerminal: (
+      repo: string,
+      pinId: string,
+      target: {
+        terminalId: string;
+        ptyId: number;
+        terminalType: ComposerSupportedTerminalType;
+        worktreePath: string;
+      },
+    ) => Promise<ComposerSubmitResult>;
+    subscribe: (handler: (event: PinEvent) => void) => () => void;
   };
   updater: {
-    check: () => Promise<unknown>;
+    check: () => Promise<import("../../shared/updater-types").UpdateCheckOutcome>;
     install: () => void;
     getVersion: () => Promise<string>;
     onUpdateAvailable: (
@@ -808,6 +1165,9 @@ export interface TermCanvasAPI {
       callback: (info: UpdateEventInfo) => void,
     ) => () => void;
     onError: (callback: (error: { message: string }) => void) => () => void;
+    onLocationWarning?: (
+      callback: (info: { bundlePath: string }) => void,
+    ) => () => void;
   };
 }
 

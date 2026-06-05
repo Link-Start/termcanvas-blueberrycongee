@@ -7,7 +7,7 @@ interface MessageListProps {
   messages: BubbleMessage[];
 }
 
-function MessageBubble({ message }: { message: BubbleMessage }) {
+function MessageRow({ message }: { message: BubbleMessage }) {
   const isUser = message.role === "user";
   const isToolRelated = message.type === "tool_call" || message.type === "tool_result";
   const isStatus = message.type === "status";
@@ -15,20 +15,61 @@ function MessageBubble({ message }: { message: BubbleMessage }) {
   if (isStatus) {
     return (
       <div className="flex justify-center py-1">
-        <span className="text-[11px] text-[var(--text-faint)]">{message.content}</span>
+        <span className="tc-caption" style={{ color: "var(--text-faint)" }}>
+          {message.content}
+        </span>
       </div>
     );
   }
 
+  /* Tool messages: deeper indent, muted mono — same vocabulary as
+     the in-tile ToolCard so the two surfaces feel native. No
+     bordered container. */
+  if (isToolRelated) {
+    return (
+      <div className="pl-6 pr-1 py-0.5">
+        <span
+          className="tc-mono whitespace-pre-wrap break-words"
+          style={{
+            fontSize: "var(--text-xs)",
+            color: "var(--text-muted)",
+            lineHeight: "var(--leading-snug)",
+          }}
+        >
+          {message.content}
+        </span>
+      </div>
+    );
+  }
+
+  /* User: right-aligned neutral bubble using --bubble-bg, never the
+     accent fill — matches the SessionReplayView convention. */
+  if (isUser) {
+    return (
+      <div className="flex justify-end tc-enter-fade-up-quick">
+        <div
+          className="tc-body-sm rounded-xl px-3 py-1.5 whitespace-pre-wrap max-w-[85%]"
+          style={{
+            background: "var(--bubble-bg)",
+            color: "var(--text-primary)",
+          }}
+        >
+          {message.content}
+        </div>
+      </div>
+    );
+  }
+
+  /* Assistant: indented prose, no chrome. The indent is the speaker
+     mark; no eyebrow, no avatar, no role badge. */
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div className="pl-3 pr-1 tc-enter-fade-quick">
       <div
-        className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
-          isUser
-            ? "bg-[var(--accent)] text-white"
-            : "bg-[var(--bg)] border border-[var(--border)] text-[var(--text-primary)]"
-        }`}
-        style={isToolRelated ? { fontFamily: '"Geist Mono", monospace', fontSize: 12 } : undefined}
+        className="tc-body-sm whitespace-pre-wrap break-words"
+        style={{
+          color: "var(--text-primary)",
+          lineHeight: "var(--leading-relaxed)",
+        }}
       >
         {message.content}
       </div>
@@ -56,17 +97,18 @@ export function MessageList({ messages }: MessageListProps) {
       {messages.length === 0 ? (
         <div className="flex items-center justify-center h-full px-6">
           {!apiKeyReady ? null : agentApiKey ? (
-            <p className="text-[11px] text-[var(--text-faint)] text-center leading-relaxed">
+            <p className="tc-label text-center" style={{ color: "var(--text-faint)" }}>
               Send a message to start an agent task
             </p>
           ) : (
             <div className="flex flex-col items-center gap-2">
-              <p className="text-[11px] text-[var(--text-faint)] text-center leading-relaxed">
+              <p className="tc-label text-center" style={{ color: "var(--text-faint)" }}>
                 Configure an API key to get started
               </p>
               <button
-                className="text-[11px] text-[var(--accent)] hover:underline"
-                onClick={() => openSettings("general")}
+                className="tc-ui hover:underline"
+                style={{ color: "var(--accent)" }}
+                onClick={() => openSettings("agent")}
               >
                 Open Settings
               </button>
@@ -74,9 +116,9 @@ export function MessageList({ messages }: MessageListProps) {
           )}
         </div>
       ) : (
-        <div className="flex flex-col gap-2 p-3 pb-4">
+        <div className="flex flex-col gap-1.5 px-3 py-3">
           {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
+            <MessageRow key={msg.id} message={msg} />
           ))}
         </div>
       )}

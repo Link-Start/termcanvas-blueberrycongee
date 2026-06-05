@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { useCanvasStore } from "./canvasStore";
+import { usePinStore } from "./pinStore";
 import { getCanvasLeftInset, getCanvasRightInset } from "../canvas/viewportBounds";
 
 const TARGET_AREA = 640 * 480;
@@ -38,10 +39,18 @@ export const useTileDimensionsStore = create<TileDimensionsState>(() => ({
 }));
 
 export function recomputeTileDimensions() {
-  const { leftPanelCollapsed, leftPanelWidth, rightPanelCollapsed } =
-    useCanvasStore.getState();
-  const leftOffset = getCanvasLeftInset(leftPanelCollapsed, leftPanelWidth);
-  const rightOffset = getCanvasRightInset(rightPanelCollapsed);
+  const {
+    leftPanelCollapsed,
+    leftPanelWidth,
+    rightPanelCollapsed,
+    rightPanelWidth,
+  } = useCanvasStore.getState();
+  const leftOffset = getCanvasLeftInset(
+    leftPanelCollapsed,
+    leftPanelWidth,
+    usePinStore.getState().openProjectPath !== null,
+  );
+  const rightOffset = getCanvasRightInset(rightPanelCollapsed, rightPanelWidth);
   const dims = computeTileDimensions(
     window.innerWidth,
     window.innerHeight,
@@ -66,7 +75,18 @@ useCanvasStore.subscribe((state, prev) => {
   if (
     state.leftPanelCollapsed !== prev.leftPanelCollapsed ||
     state.leftPanelWidth !== prev.leftPanelWidth ||
-    state.rightPanelCollapsed !== prev.rightPanelCollapsed
+    state.rightPanelCollapsed !== prev.rightPanelCollapsed ||
+    state.rightPanelWidth !== prev.rightPanelWidth
+  ) {
+    recomputeTileDimensions();
+  }
+});
+
+usePinStore.subscribe((state, prev) => {
+  if (!trackSidebar) return;
+  if (
+    (state.openProjectPath !== null) !==
+    (prev.openProjectPath !== null)
   ) {
     recomputeTileDimensions();
   }

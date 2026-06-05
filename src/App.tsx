@@ -1,52 +1,79 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect } from "react";
 import { CanvasRoot } from "./canvas/CanvasRoot";
 import { addProjectFromDirectoryPath } from "./canvas/sceneCommands";
 import { Toolbar } from "./toolbar/Toolbar";
+import { BottomToolbar } from "./toolbar/BottomToolbar";
 import { NotificationToast } from "./components/NotificationToast";
-import { Hub } from "./components/Hub";
 import { LeftPanel } from "./components/LeftPanel";
-import { initUpdaterListeners, useUpdaterStore } from "./stores/updaterStore";
+import { RightPanel } from "./components/RightPanel";
+import { FileEditorDrawer } from "./components/FileEditorDrawer";
+import { PinDetailDrawer } from "./components/PinDetailDrawer";
+import { initUpdaterListeners } from "./stores/updaterStore";
 import { ComposerBar } from "./components/ComposerBar";
+import { HandoffDragChip } from "./components/HandoffDragChip";
 import { usePreferencesStore, hydrateApiKey } from "./stores/preferencesStore";
 import { DrawingPanel } from "./toolbar/DrawingPanel";
 import { ShortcutHints } from "./components/ShortcutHints";
+import { DiscoveryCue } from "./components/DiscoveryCue";
+import { StatusDigest } from "./components/StatusDigest";
 import { CompletionGlow } from "./components/CompletionGlow";
-import { RightPanel } from "./components/RightPanel";
 import { initSessionStoreIPC } from "./stores/sessionStore";
-import { StashBox } from "./components/StashBox";
-import { WelcomePopup } from "./components/WelcomePopup";
+import { SearchModal } from "./components/SearchModal";
+import { CommandPalette } from "./components/CommandPalette/CommandPalette";
+import { UsageOverlay } from "./components/UsageOverlay";
+import { SessionsOverlay } from "./components/SessionsOverlay";
 import {
   closeTerminalInScene,
   createTerminalInScene,
   updateTerminalCustomTitleInScene,
 } from "./actions/terminalSceneActions";
-import {
-  useProjectStore,
-  generateId,
-} from "./stores/projectStore";
+import { useProjectStore, generateId } from "./stores/projectStore";
 import { addScannedProjectAndFocus } from "./projects/projectCreation";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { usePinPreloader } from "./hooks/usePinPreloader";
 import { useT } from "./i18n/useT";
 import { loadAllDownloadedFonts } from "./terminal/fontLoader";
 import { startAutoSummaryWatcher } from "./terminal/summaryScheduler";
-import { shouldRunAutoSaveBackstop, useWorkspaceStore } from "./stores/workspaceStore";
+import {
+  shouldRunAutoSaveBackstop,
+  useWorkspaceStore,
+} from "./stores/workspaceStore";
 import {
   readWorkspaceSnapshot,
   restoreWorkspaceSnapshot,
   snapshotState,
-  snapshotStateWithRefresh,
   type SkipRestoreSnapshot,
 } from "./snapshotState";
+import { appendSnapshotToHistory } from "./snapshotHistory";
+import { SnapshotHistoryModal } from "./components/SnapshotHistoryModal";
+import { useSnapshotHistoryStore } from "./stores/snapshotHistoryStore";
+import { Hub } from "./components/Hub";
+import { CanvasManagerModal } from "./components/CanvasManagerModal";
 import { updateWindowTitle } from "./titleHelper";
-import { useNotificationStore } from "./stores/notificationStore";
 import { resolveTerminalWithRuntimeState } from "./stores/terminalRuntimeStateStore";
 import { logSlowRendererPath } from "./utils/devPerf";
-import { getCloseAction } from "./closeFlow";
+import { selectAllTerminalRuntime } from "./terminal/terminalRuntimeStore";
+import { performContextualSelectAll } from "./utils/contextualSelectAll";
 
 function isSkipRestoreSnapshot(
   snapshot: ReturnType<typeof readWorkspaceSnapshot>,
 ): snapshot is SkipRestoreSnapshot {
   return !!snapshot && "skipRestore" in snapshot;
+}
+
+function selectFocusedTerminalBuffer(): boolean {
+  const { projects } = useProjectStore.getState();
+  for (const project of projects) {
+    for (const worktree of project.worktrees) {
+      for (const terminal of worktree.terminals) {
+        if (terminal.focused) {
+          return selectAllTerminalRuntime(terminal.id);
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 function useWorktreeWatcher() {
@@ -148,6 +175,10 @@ function useAutoSave() {
           ...state,
           lastSavedAt: Date.now(),
         }));
+        // Throttled history capture rides on the autosave heartbeat — see
+        // MIN_HISTORY_INTERVAL_MS in snapshotHistory.ts. Awaiting the autosave
+        // first guarantees state.json and the history slot agree.
+        void appendSnapshotToHistory();
       } catch (err) {
         console.error("[useAutoSave] failed to save recovery snapshot:", err);
       } finally {
@@ -194,10 +225,7 @@ function useWorkspaceOpen() {
   useEffect(() => {
     const handler = (e: Event) => {
       const { dirty } = useWorkspaceStore.getState();
-      if (
-        dirty &&
-        !window.confirm("Unsaved changes will be lost. Continue?")
-      ) {
+      if (dirty && !window.confirm("Unsaved changes will be lost. Continue?")) {
         return;
       }
 
@@ -211,7 +239,10 @@ function useWorkspaceOpen() {
         useWorkspaceStore.getState().setWorkspacePath(null);
         useWorkspaceStore.getState().markClean();
       } catch (err) {
-        console.error("[useWorkspaceOpen] failed to parse workspace file:", err);
+        console.error(
+          "[useWorkspaceOpen] failed to parse workspace file:",
+          err,
+        );
       }
     };
     window.addEventListener("termcanvas:open-workspace", handler);
@@ -220,156 +251,22 @@ function useWorkspaceOpen() {
   }, []);
 }
 
-function useCloseHandler() {
-  const [showCloseDialog, setShowCloseDialog] = useState(false);
-  const t = useT();
-  const consumeRestartOnClose = useCallback(
-    () => useUpdaterStore.getState().consumeRestartOnClose(),
-    [],
-  );
-  const cancelRestartOnClose = useCallback(
-    () => useUpdaterStore.getState().cancelRestartOnClose(),
-    [],
-  );
-
-  useEffect(() => {
-    if (!window.termcanvas) return;
-
-    const unsubscribe = window.termcanvas.app.onBeforeClose(() => {
-      const { dirty } = useWorkspaceStore.getState();
-      const action = getCloseAction({
-        dirty,
-        installUpdateRequested:
-          useUpdaterStore.getState().installOnCloseRequested,
-      });
-
-      if (action === "silent-close") {
-        void (async () => {
-          const startedAt = performance.now();
-          try {
-            await window.termcanvas.state.save(await snapshotStateWithRefresh());
-          } catch (err) {
-            console.error("[CloseHandler] failed to save recovery snapshot:", err);
-          } finally {
-            logSlowRendererPath("App.closeRecoverySnapshot", startedAt, {
-              thresholdMs: 20,
-            });
-            window.termcanvas.app.confirmClose({
-              installUpdate: consumeRestartOnClose(),
-            });
-          }
-        })();
-        return;
-      }
-
-      setShowCloseDialog(true);
-    });
-
-    return unsubscribe;
-  }, [consumeRestartOnClose]);
-
-  const handleSave = useCallback(async () => {
-    try {
-      const snap = await snapshotStateWithRefresh();
-      const { workspacePath } = useWorkspaceStore.getState();
-
-      if (workspacePath) {
-        await window.termcanvas.workspace.saveToPath(workspacePath, snap);
-      } else {
-        const savedPath = await window.termcanvas.workspace.save(snap);
-        if (!savedPath) {
-          return;
-        }
-        useWorkspaceStore.getState().setWorkspacePath(savedPath);
-      }
-      await window.termcanvas.state.save(snap);
-      useWorkspaceStore.getState().markClean();
-      window.termcanvas.app.confirmClose({
-        installUpdate: consumeRestartOnClose(),
-      });
-    } catch (err) {
-      console.error("[CloseHandler] save failed:", err);
-      useNotificationStore
-        .getState()
-        .notify("error", t.save_error(String(err)));
-    }
-  }, [consumeRestartOnClose, t]);
-
-  const handleDiscard = useCallback(async () => {
-    await window.termcanvas.state.save({ skipRestore: true });
-    window.termcanvas.app.confirmClose({
-      installUpdate: consumeRestartOnClose(),
-    });
-  }, [consumeRestartOnClose]);
-
-  const handleCancel = useCallback(() => {
-    cancelRestartOnClose();
-    setShowCloseDialog(false);
-  }, [cancelRestartOnClose]);
-
-  return { showCloseDialog, handleSave, handleDiscard, handleCancel };
-}
-
-function CloseDialog({
-  onSave,
-  onDiscard,
-  onCancel,
-}: {
-  onSave: () => void;
-  onDiscard: () => void;
-  onCancel: () => void;
-}) {
-  const t = useT();
-  return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60">
-      <div className="bg-[var(--surface)] border border-[var(--border)] rounded-lg p-6 max-w-sm w-full mx-4">
-        <h2 className="text-[15px] font-medium text-[var(--text-primary)] mb-2">
-          {t.save_workspace_title}
-        </h2>
-        <p className="text-[13px] text-[var(--text-secondary)] mb-6">
-          {t.save_workspace_desc}
-        </p>
-        <div className="flex gap-2 justify-end">
-          <button
-            className="px-3 py-1.5 rounded-md text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border)] transition-colors duration-150"
-            onClick={onCancel}
-          >
-            {t.cancel}
-          </button>
-          <button
-            className="px-3 py-1.5 rounded-md text-[13px] text-[var(--red)] hover:bg-[var(--surface-hover)] transition-colors duration-150"
-            onClick={onDiscard}
-          >
-            {t.dont_save}
-          </button>
-          <button
-            className="px-3 py-1.5 rounded-md text-[13px] text-white bg-[var(--accent)] hover:brightness-110 transition-all duration-150"
-            onClick={onSave}
-          >
-            {t.save}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 export function App() {
   useWorktreeWatcher();
+  usePinPreloader();
   useStatePersistence();
   useAutoSave();
   useWorkspaceOpen();
   useKeyboardShortcuts();
   const t = useT();
   const composerEnabled = usePreferencesStore((s) => s.composerEnabled);
+  const globalSearchEnabled = usePreferencesStore((s) => s.globalSearchEnabled);
   const drawingEnabled = usePreferencesStore((s) => s.drawingEnabled);
   const summaryEnabled = usePreferencesStore((s) => s.summaryEnabled);
-  const { showCloseDialog, handleSave, handleDiscard, handleCancel } =
-    useCloseHandler();
-
-  const [showWelcome, setShowWelcome] = useState(() => {
-    return !localStorage.getItem("termcanvas-welcome-seen");
-  });
+  const completionGlowEnabled = usePreferencesStore(
+    (s) => s.completionGlowEnabled,
+  );
 
   useEffect(() => {
     if (!summaryEnabled) return;
@@ -377,7 +274,12 @@ export function App() {
   }, [summaryEnabled]);
 
   useEffect(() => initUpdaterListeners(), []);
-  useEffect(() => { void hydrateApiKey(); }, []);
+  useEffect(() => {
+    void useSnapshotHistoryStore.getState().refresh();
+  }, []);
+  useEffect(() => {
+    void hydrateApiKey();
+  }, []);
   useEffect(() => {
     if (!window.termcanvas?.sessions) return;
     return initSessionStoreIPC();
@@ -385,9 +287,22 @@ export function App() {
 
   useEffect(() => {
     if (!window.termcanvas?.menu) return;
-    return window.termcanvas.menu.onOpenFolder(async (dirPath: string) => {
-      await addProjectFromDirectoryPath(dirPath, t);
+    const removeOpenFolderListener = window.termcanvas.menu.onOpenFolder(
+      async (dirPath: string) => {
+        await addProjectFromDirectoryPath(dirPath, t);
+      },
+    );
+    const removeSelectAllListener = window.termcanvas.menu.onSelectAll(() => {
+      performContextualSelectAll(
+        document.activeElement,
+        selectFocusedTerminalBuffer,
+      );
     });
+
+    return () => {
+      removeOpenFolderListener();
+      removeSelectAllListener();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [t]);
 
@@ -426,7 +341,8 @@ export function App() {
                     type: liveTerminal.type,
                     status: liveTerminal.status,
                     ptyId: liveTerminal.ptyId,
-                    span: liveTerminal.span,
+                    width: liveTerminal.width,
+                    height: liveTerminal.height,
                     parentTerminalId: liveTerminal.parentTerminalId,
                   };
                 }),
@@ -446,7 +362,14 @@ export function App() {
         return true;
       },
 
-      addTerminal: (projectId: string, worktreeId: string, type: string, prompt?: string, autoApprove?: boolean, parentTerminalId?: string | null) => {
+      addTerminal: (
+        projectId: string,
+        worktreeId: string,
+        type: string,
+        prompt?: string,
+        autoApprove?: boolean,
+        parentTerminalId?: string | null,
+      ) => {
         const terminal = createTerminalInScene({
           projectId,
           worktreeId,
@@ -489,7 +412,8 @@ export function App() {
                   type: liveTerminal.type,
                   status: liveTerminal.status,
                   ptyId: liveTerminal.ptyId,
-                  span: liveTerminal.span,
+                  width: liveTerminal.width,
+                  height: liveTerminal.height,
                   parentTerminalId: liveTerminal.parentTerminalId,
                   projectId: p.id,
                   worktreeId: w.id,
@@ -530,32 +454,28 @@ export function App() {
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-[var(--bg)] text-[var(--text-primary)]">
-      <Toolbar onShowTutorial={() => setShowWelcome(true)} />
-      <Hub />
+      <Toolbar />
       <LeftPanel />
-      <CanvasRoot />
-      {drawingEnabled && <DrawingPanel />}
-      <CompletionGlow />
-      <ShortcutHints />
       <RightPanel />
-      <StashBox />
+      <CanvasRoot />
+      <BottomToolbar />
+      {drawingEnabled && <DrawingPanel />}
+      {completionGlowEnabled && <CompletionGlow />}
+      <ShortcutHints />
+      <DiscoveryCue />
+      <StatusDigest />
       {composerEnabled && <ComposerBar />}
+      <HandoffDragChip />
       <NotificationToast />
-      {showCloseDialog && (
-        <CloseDialog
-          onSave={handleSave}
-          onDiscard={handleDiscard}
-          onCancel={handleCancel}
-        />
-      )}
-      {showWelcome && (
-        <WelcomePopup
-          onClose={() => {
-            localStorage.setItem("termcanvas-welcome-seen", "1");
-            setShowWelcome(false);
-          }}
-        />
-      )}
+      {globalSearchEnabled && <SearchModal />}
+      <CommandPalette />
+      <SnapshotHistoryModal />
+      <UsageOverlay />
+      <SessionsOverlay />
+      <FileEditorDrawer />
+      <PinDetailDrawer />
+      <Hub />
+      <CanvasManagerModal />
     </div>
   );
 }

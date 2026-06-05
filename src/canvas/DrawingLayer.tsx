@@ -4,7 +4,6 @@ import {
   addAnnotationToScene,
   setAnnotationToolInScene,
   setDraftAnnotationInScene,
-  updateAnnotationInScene,
 } from "../actions/annotationSceneActions";
 import {
   activateAnnotationInScene,
@@ -13,7 +12,6 @@ import {
 import {
   getDrawingElementBounds,
   resolveDrawingElementForRender,
-  translateDrawingElement,
 } from "./annotationGeometry";
 import {
   useDrawingStore,
@@ -22,6 +20,7 @@ import {
   type StrokePoint,
 } from "../stores/drawingStore";
 import { useCanvasStore } from "../stores/canvasStore";
+import { usePinStore } from "../stores/pinStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useSelectionStore } from "../stores/selectionStore";
 import {
@@ -29,6 +28,23 @@ import {
   getCanvasRightInset,
   screenPointToCanvasPoint,
 } from "./viewportBounds";
+import { useSidebarDragStore } from "../stores/sidebarDragStore";
+import {
+  PANEL_TRANSITION_DURATION_MS,
+  PANEL_TRANSITION_EASING_CSS,
+} from "../utils/panelAnimation";
+
+export function getDrawingLayerViewportSize(
+  leftInset: number,
+  rightInset: number,
+  innerWidth: number,
+  innerHeight: number,
+): { width: number; height: number } {
+  return {
+    width: Math.max(0, innerWidth - leftInset - rightInset),
+    height: Math.max(0, innerHeight),
+  };
+}
 
 function getSvgPathFromStroke(stroke: number[][]) {
   if (stroke.length === 0) return "";
@@ -198,6 +214,11 @@ export function DrawingLayer() {
   const leftPanelCollapsed = useCanvasStore((state) => state.leftPanelCollapsed);
   const leftPanelWidth = useCanvasStore((state) => state.leftPanelWidth);
   const rightPanelCollapsed = useCanvasStore((state) => state.rightPanelCollapsed);
+  const rightPanelWidth = useCanvasStore((state) => state.rightPanelWidth);
+  const taskDrawerOpen = usePinStore(
+    (state) => state.openProjectPath !== null,
+  );
+  const sidebarDragging = useSidebarDragStore((state) => state.active);
   const projects = useProjectStore((state) => state.projects);
   const selectedItems = useSelectionStore((state) => state.selectedItems);
   const selectedAnnotationIds = useMemo(
@@ -220,6 +241,7 @@ export function DrawingLayer() {
         useCanvasStore.getState().viewport,
         useCanvasStore.getState().leftPanelCollapsed,
         useCanvasStore.getState().leftPanelWidth,
+        usePinStore.getState().openProjectPath !== null,
       ),
     [],
   );
@@ -353,31 +375,8 @@ export function DrawingLayer() {
       event.preventDefault();
       event.stopPropagation();
       activateAnnotationInScene(element.id);
-
-      const start = toCanvas(event);
-      const initialElement = element;
-
-      const handleMove = (moveEvent: MouseEvent) => {
-        const current = toCanvas(moveEvent);
-        updateAnnotationInScene(
-          initialElement.id,
-          translateDrawingElement(
-            initialElement,
-            current.x - start.x,
-            current.y - start.y,
-          ),
-        );
-      };
-
-      const handleUp = () => {
-        window.removeEventListener("mousemove", handleMove);
-        window.removeEventListener("mouseup", handleUp);
-      };
-
-      window.addEventListener("mousemove", handleMove);
-      window.addEventListener("mouseup", handleUp);
     },
-    [toCanvas, tool],
+    [tool],
   );
 
   useEffect(() => {
@@ -405,18 +404,33 @@ export function DrawingLayer() {
   }, [selectedAnnotationIds, tool]);
 
   const isDrawing = tool !== "select";
-  const leftInset = getCanvasLeftInset(leftPanelCollapsed, leftPanelWidth);
-  const rightInset = getCanvasRightInset(rightPanelCollapsed);
+  const leftInset = getCanvasLeftInset(
+    leftPanelCollapsed,
+    leftPanelWidth,
+    taskDrawerOpen,
+  );
+  const rightInset = getCanvasRightInset(rightPanelCollapsed, rightPanelWidth);
+  const { width, height } = getDrawingLayerViewportSize(
+    leftInset,
+    rightInset,
+    window.innerWidth,
+    window.innerHeight,
+  );
 
   return (
     <svg
       className="fixed top-0 bottom-0"
       style={{
         left: leftInset,
-        right: rightInset,
+        width,
+        height,
+        display: "block",
         pointerEvents: isDrawing ? "auto" : "none",
         cursor: isDrawing ? "crosshair" : "default",
         zIndex: isDrawing ? 30 : 20,
+        transition: sidebarDragging
+          ? undefined
+          : `left ${PANEL_TRANSITION_DURATION_MS}ms ${PANEL_TRANSITION_EASING_CSS}, width ${PANEL_TRANSITION_DURATION_MS}ms ${PANEL_TRANSITION_EASING_CSS}`,
       }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
@@ -431,7 +445,7 @@ export function DrawingLayer() {
             <g
               key={element.id}
               style={{
-                cursor: tool === "select" ? "move" : undefined,
+                cursor: tool === "select" ? "pointer" : undefined,
                 pointerEvents: tool === "select" ? "auto" : "none",
               }}
               onMouseDown={(event) => handleElementMouseDown(element, event)}

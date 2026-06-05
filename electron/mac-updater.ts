@@ -3,30 +3,63 @@ import {
   createWriteStream,
   mkdirSync,
   rmSync,
+  renameSync,
   readdirSync,
   existsSync,
   createReadStream,
   writeFileSync,
   readFileSync,
+  copyFileSync,
+  openSync,
+  closeSync,
   accessSync,
   constants,
 } from "fs";
 import { join, resolve, dirname } from "path";
 import { createHash } from "crypto";
+import { gunzipSync } from "zlib";
 import { spawn, execFile } from "child_process";
 import type { BrowserWindow } from "electron";
 import { sendToWindow } from "./window-events";
+import type { UpdateCheckOutcome } from "../shared/updater-types";
 
 const GITHUB_OWNER = "blueberrycongee";
 const GITHUB_REPO = "termcanvas";
 const MAX_DOWNLOAD_RETRIES = 3;
 const INITIAL_RETRY_DELAY_MS = 2000;
 const INSTALL_WAIT_TIMEOUT_S = 30;
+const RANGE_REQUEST_COOLDOWN_INTERVAL = 100;
+const RANGE_REQUEST_COOLDOWN_MS = 1000;
 
 interface ReleaseFile {
   url: string;
   sha512: string;
   size: number;
+}
+
+// ── Blockmap types (matches builder-util-runtime/blockMapApi) ──
+
+interface BlockMapFile {
+  name: string;
+  offset: number;
+  checksums: string[];
+  sizes: number[];
+}
+
+interface BlockMap {
+  version: "1" | "2";
+  files: BlockMapFile[];
+}
+
+const enum OperationKind {
+  COPY = 0,
+  DOWNLOAD = 1,
+}
+
+interface Operation {
+  kind: OperationKind;
+  start: number;
+  end: number;
 }
 
 interface ReleaseInfo {
@@ -183,6 +216,239 @@ function extractZip(zipPath: string, destDir: string): Promise<void> {
   });
 }
 
+// ── Blockmap differential download helpers ──
+
+function getCacheDir(): string {
+  return join(app.getPath("userData"), "update-cache");
+}
+
+function getCachedZipPath(): string {
+  return join(getCacheDir(), "update.zip");
+}
+
+function getCachedBlockMapPath(): string {
+  return join(getCacheDir(), "current.blockmap");
+}
+
+function fetchBuffer(url: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const request = net.request(url);
+    const chunks: Buffer[] = [];
+    request.on("response", (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`HTTP ${response.statusCode} from ${url}`));
+        return;
+      }
+      response.on("data", (chunk) => chunks.push(chunk as Buffer));
+      response.on("end", () => resolve(Buffer.concat(chunks)));
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function fetchBlockMap(url: string): Promise<BlockMap> {
+  const data = await fetchBuffer(url);
+  if (data.length === 0) throw new Error(`Empty blockmap from ${url}`);
+  return JSON.parse(gunzipSync(data).toString()) as BlockMap;
+}
+
+/**
+ * Download a byte range from a URL. Handles GitHub's 302 redirect to S3.
+ * Returns the resolved CDN URL so callers can skip redirects on subsequent requests.
+ */
+function downloadRange(
+  url: string,
+  start: number,
+  end: number,
+): Promise<{ data: Buffer; resolvedUrl: string }> {
+  return new Promise((resolve, reject) => {
+    const request = net.request({ url, redirect: "manual" });
+    request.setHeader("Range", `bytes=${start}-${end - 1}`);
+
+    let resolvedUrl = url;
+
+    request.on("redirect", (_status, _method, redirectUrl) => {
+      resolvedUrl = redirectUrl;
+      request.followRedirect();
+    });
+
+    request.on("response", (response) => {
+      if (response.statusCode >= 400) {
+        reject(new Error(`HTTP ${response.statusCode} on range request`));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk) => chunks.push(chunk as Buffer));
+      response.on("end", () =>
+        resolve({ data: Buffer.concat(chunks), resolvedUrl }),
+      );
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+/**
+ * Port of electron-updater's downloadPlanBuilder.computeOperations.
+ * Compares old and new blockmaps block-by-block, returning a list of
+ * COPY (reuse from old file) and DOWNLOAD (fetch from new file) operations.
+ */
+function computeOperations(
+  oldBlockMap: BlockMap,
+  newBlockMap: BlockMap,
+): Operation[] {
+  if (oldBlockMap.version !== newBlockMap.version) {
+    throw new Error(
+      `Blockmap version mismatch (${oldBlockMap.version} vs ${newBlockMap.version})`,
+    );
+  }
+
+  const newFile = newBlockMap.files[0];
+  const oldFile = oldBlockMap.files.find((f) => f.name === newFile.name);
+  if (!oldFile) throw new Error(`No file "${newFile.name}" in old blockmap`);
+
+  // Build checksum → offset/size maps for old file
+  const checksumToOldOffset = new Map<string, number>();
+  const checksumToOldSize = new Map<string, number>();
+  let offset = oldFile.offset;
+  for (let i = 0; i < oldFile.checksums.length; i++) {
+    const cs = oldFile.checksums[i];
+    if (!checksumToOldOffset.has(cs)) {
+      checksumToOldOffset.set(cs, offset);
+      checksumToOldSize.set(cs, oldFile.sizes[i]);
+    }
+    offset += oldFile.sizes[i];
+  }
+
+  // Walk new file blocks, decide COPY or DOWNLOAD
+  const operations: Operation[] = [];
+  let last: Operation | null = null;
+  let newOffset = newFile.offset;
+
+  for (let i = 0; i < newFile.checksums.length; i++) {
+    const blockSize = newFile.sizes[i];
+    const checksum = newFile.checksums[i];
+    let oldOff = checksumToOldOffset.get(checksum);
+
+    // Checksum match but size mismatch → treat as changed
+    if (oldOff != null && checksumToOldSize.get(checksum) !== blockSize) {
+      oldOff = undefined;
+    }
+
+    if (oldOff === undefined) {
+      // DOWNLOAD from new file
+      if (last?.kind === OperationKind.DOWNLOAD && last.end === newOffset) {
+        last.end += blockSize;
+      } else {
+        last = { kind: OperationKind.DOWNLOAD, start: newOffset, end: newOffset + blockSize };
+        operations.push(last);
+      }
+    } else {
+      // COPY from old file
+      if (last?.kind === OperationKind.COPY && last.end === oldOff) {
+        last.end += blockSize;
+      } else {
+        last = { kind: OperationKind.COPY, start: oldOff, end: oldOff + blockSize };
+        operations.push(last);
+      }
+    }
+
+    newOffset += blockSize;
+  }
+
+  return operations;
+}
+
+/**
+ * Reconstruct a new ZIP by copying unchanged blocks from the old ZIP
+ * and downloading only changed blocks via HTTP Range requests.
+ */
+async function downloadDifferential(
+  oldZipPath: string,
+  oldBlockMap: BlockMap,
+  newBlockMap: BlockMap,
+  newFileUrl: string,
+  newFileSize: number,
+  onProgress: (percent: number) => void,
+  destPath: string,
+): Promise<void> {
+  const operations = computeOperations(oldBlockMap, newBlockMap);
+
+  let downloadSize = 0;
+  let copySize = 0;
+  for (const op of operations) {
+    const len = op.end - op.start;
+    if (op.kind === OperationKind.DOWNLOAD) downloadSize += len;
+    else copySize += len;
+  }
+
+  if (downloadSize + copySize !== newFileSize) {
+    throw new Error(
+      `Size mismatch: download=${downloadSize} + copy=${copySize} != expected=${newFileSize}`,
+    );
+  }
+
+  const oldFd = openSync(oldZipPath, "r");
+  const outStream = createWriteStream(destPath);
+  let downloaded = 0;
+  let resolvedUrl = newFileUrl;
+  let rangeCount = 0;
+
+  try {
+    for (const op of operations) {
+      if (op.kind === OperationKind.COPY) {
+        // Read from old ZIP and write to output
+        await new Promise<void>((res, rej) => {
+          const readStream = createReadStream("", {
+            fd: oldFd,
+            autoClose: false,
+            start: op.start,
+            end: op.end - 1,
+          });
+          readStream.on("error", rej);
+          readStream.pipe(outStream, { end: false });
+          readStream.once("end", res);
+        });
+      } else {
+        // Download range from remote
+        const result = await downloadRange(resolvedUrl, op.start, op.end);
+        resolvedUrl = result.resolvedUrl;
+
+        await new Promise<void>((res, rej) => {
+          const ok = outStream.write(result.data, (err) => {
+            if (err) rej(err);
+            else res();
+          });
+          if (!ok) {
+            outStream.once("drain", () => res());
+          }
+        });
+
+        downloaded += result.data.length;
+        onProgress(
+          downloadSize > 0
+            ? Math.min(100, (downloaded / downloadSize) * 100)
+            : 100,
+        );
+
+        // Rate limit: pause after every N range requests
+        if (++rangeCount % RANGE_REQUEST_COOLDOWN_INTERVAL === 0) {
+          await new Promise((r) => setTimeout(r, RANGE_REQUEST_COOLDOWN_MS));
+        }
+      }
+    }
+
+    await new Promise<void>((res, rej) => {
+      outStream.end((err: Error | null) => (err ? rej(err) : res()));
+    });
+  } finally {
+    closeSync(oldFd);
+  }
+}
+
 function getStagingDir(): string {
   return join(app.getPath("userData"), "pending-update");
 }
@@ -221,6 +487,7 @@ export class MacCustomUpdater {
   private pendingUpdate: PendingUpdate | null = null;
   private downloading = false;
   private installing = false;
+  private locationWarningSent = false;
 
   constructor(window: BrowserWindow) {
     this.window = window;
@@ -241,28 +508,42 @@ export class MacCustomUpdater {
     });
   }
 
-  async checkForUpdates(): Promise<void> {
-    if (this.downloading) return;
-
-    if (this.pendingUpdate) {
-      sendToWindow(this.window, "updater:update-downloaded", {
-        version: this.pendingUpdate.version,
-        releaseNotes: this.pendingUpdate.releaseNotes,
-        releaseDate: this.pendingUpdate.releaseDate,
-      });
-      return;
-    }
+  async checkForUpdates(): Promise<UpdateCheckOutcome> {
+    if (this.downloading) return "skipped";
 
     // Skip updates when the .app is on a read-only volume (e.g. mounted DMG)
-    if (!isAppLocationWritable()) return;
+    // or in a TCC-restricted location like ~/Downloads. Notify the UI once so
+    // the user knows why auto-update is silently unavailable.
+    if (!isAppLocationWritable()) {
+      if (!this.locationWarningSent) {
+        this.locationWarningSent = true;
+        sendToWindow(this.window, "updater:location-warning", {
+          bundlePath: getAppBundlePath(),
+        });
+      }
+      return "skipped";
+    }
 
     try {
       const ymlUrl = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest/download/latest-mac.yml`;
       const yml = await fetchText(ymlUrl);
       const release = parseLatestYml(yml);
 
-      if (!release.version) return;
-      if (!isNewerVersion(release.version, app.getVersion())) return;
+      if (!release.version) return "skipped";
+      if (!isNewerVersion(release.version, app.getVersion())) return "up-to-date";
+
+      // If a pending update already matches the latest, just re-notify the UI
+      if (
+        this.pendingUpdate &&
+        this.pendingUpdate.version === release.version
+      ) {
+        sendToWindow(this.window, "updater:update-downloaded", {
+          version: this.pendingUpdate.version,
+          releaseNotes: this.pendingUpdate.releaseNotes,
+          releaseDate: this.pendingUpdate.releaseDate,
+        });
+        return "newer";
+      }
 
       let releaseNotes = "";
       try {
@@ -282,10 +563,22 @@ export class MacCustomUpdater {
       });
 
       await this.downloadUpdate(release, releaseNotes);
+      return "newer";
     } catch (error) {
+      // If we already have a valid pending update (e.g. offline), surface it
+      // instead of showing an error so users can still install it
+      if (this.pendingUpdate) {
+        sendToWindow(this.window, "updater:update-downloaded", {
+          version: this.pendingUpdate.version,
+          releaseNotes: this.pendingUpdate.releaseNotes,
+          releaseDate: this.pendingUpdate.releaseDate,
+        });
+        return "newer";
+      }
       sendToWindow(this.window, "updater:error", {
         message: error instanceof Error ? error.message : String(error),
       });
+      return "skipped";
     }
   }
 
@@ -301,6 +594,7 @@ export class MacCustomUpdater {
     releaseNotes: string,
   ): Promise<void> {
     this.downloading = true;
+    const tempDir = getStagingDir() + "-tmp";
     try {
       const isArm64 = process.arch === "arm64";
       const zipFile = release.files.find(
@@ -314,30 +608,72 @@ export class MacCustomUpdater {
       }
 
       const downloadUrl = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/v${release.version}/${zipFile.url}`;
-      const stagingDir = getStagingDir();
-      const zipPath = join(stagingDir, zipFile.url);
+      const blockmapUrl = `${downloadUrl}.blockmap`;
 
-      if (existsSync(stagingDir)) {
-        rmSync(stagingDir, { recursive: true, force: true });
+      // Download into a temp dir so the existing pending update survives
+      // if this download fails (network error, hash mismatch, etc.)
+      if (existsSync(tempDir)) {
+        rmSync(tempDir, { recursive: true, force: true });
       }
-      mkdirSync(stagingDir, { recursive: true });
+      mkdirSync(tempDir, { recursive: true });
 
-      await downloadWithRetry(
-        downloadUrl,
-        zipPath,
-        zipFile.size,
-        (percent) => {
-          sendToWindow(this.window, "updater:download-progress", { percent });
-        },
-      );
+      const zipPath = join(tempDir, zipFile.url);
+      let usedDifferential = false;
+
+      // Try differential download if we have a cached ZIP + blockmap
+      const cachedZip = getCachedZipPath();
+      const cachedBlockMap = getCachedBlockMapPath();
+      if (existsSync(cachedZip) && existsSync(cachedBlockMap)) {
+        try {
+          const oldBlockMap = JSON.parse(
+            gunzipSync(readFileSync(cachedBlockMap)).toString(),
+          ) as BlockMap;
+          const newBlockMapBuf = await fetchBuffer(blockmapUrl);
+          const newBlockMap = JSON.parse(
+            gunzipSync(newBlockMapBuf).toString(),
+          ) as BlockMap;
+
+          await downloadDifferential(
+            cachedZip,
+            oldBlockMap,
+            newBlockMap,
+            downloadUrl,
+            zipFile.size,
+            (percent) => {
+              sendToWindow(this.window, "updater:download-progress", {
+                percent,
+              });
+            },
+            zipPath,
+          );
+
+          usedDifferential = true;
+        } catch {
+          // Differential failed — fall through to full download
+          if (existsSync(zipPath)) rmSync(zipPath, { force: true });
+        }
+      }
+
+      if (!usedDifferential) {
+        await downloadWithRetry(
+          downloadUrl,
+          zipPath,
+          zipFile.size,
+          (percent) => {
+            sendToWindow(this.window, "updater:download-progress", { percent });
+          },
+        );
+      }
 
       const hash = await computeSha512(zipPath);
       if (hash !== zipFile.sha512) {
-        rmSync(stagingDir, { recursive: true, force: true });
         throw new Error("SHA-512 verification failed — update is corrupted");
       }
 
-      const extractDir = join(stagingDir, "extracted");
+      // Cache the verified ZIP + its blockmap for next differential update
+      await this.updateCache(zipPath, blockmapUrl);
+
+      const extractDir = join(tempDir, "extracted");
       await extractZip(zipPath, extractDir);
 
       const appName = readdirSync(extractDir).find((f) => f.endsWith(".app"));
@@ -347,9 +683,16 @@ export class MacCustomUpdater {
 
       rmSync(zipPath, { force: true });
 
+      // Download succeeded — replace the old staging dir atomically
+      const stagingDir = getStagingDir();
+      if (existsSync(stagingDir)) {
+        rmSync(stagingDir, { recursive: true, force: true });
+      }
+      renameSync(tempDir, stagingDir);
+
       this.pendingUpdate = {
         version: release.version,
-        appPath: join(extractDir, appName),
+        appPath: join(stagingDir, "extracted", appName),
         releaseNotes,
         releaseDate: release.releaseDate,
       };
@@ -362,11 +705,38 @@ export class MacCustomUpdater {
         releaseDate: release.releaseDate,
       });
     } catch (error) {
+      // Clean up temp dir on failure; existing pending update is untouched
+      if (existsSync(tempDir)) {
+        try {
+          rmSync(tempDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
       sendToWindow(this.window, "updater:error", {
         message: error instanceof Error ? error.message : String(error),
       });
     } finally {
       this.downloading = false;
+    }
+  }
+
+  /**
+   * Cache the verified ZIP and its blockmap so the next update can use
+   * differential downloads. Runs best-effort — failures don't block the update.
+   */
+  private async updateCache(
+    zipPath: string,
+    blockmapUrl: string,
+  ): Promise<void> {
+    try {
+      const cacheDir = getCacheDir();
+      mkdirSync(cacheDir, { recursive: true });
+      copyFileSync(zipPath, getCachedZipPath());
+      const blockmapData = await fetchBuffer(blockmapUrl);
+      writeFileSync(getCachedBlockMapPath(), blockmapData);
+    } catch {
+      // Non-critical — next update will fall back to full download
     }
   }
 

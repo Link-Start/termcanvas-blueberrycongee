@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import electron from "vite-plugin-electron";
 import renderer from "vite-plugin-electron-renderer";
+import fs from "fs";
 import path from "path";
 import { build as esbuild, context as esbuildCtx, type Plugin as EsbuildPlugin } from "esbuild";
 import { ensureCliLauncher } from "./electron/cli-launchers";
@@ -115,6 +116,37 @@ function buildBrowse(): Plugin {
   };
 }
 
+function buildAgentShims(): Plugin {
+  const shimNames = ["codex", "claude"] as const;
+  const buildOptions = shimNames.map((name) => {
+    const outfile = `dist-cli/agent-shims/${name}.js`;
+    return {
+      entryPoints: [`cli/agent-shims/${name}.ts`],
+      outfile,
+      format: "esm" as const,
+      platform: "node" as const,
+      bundle: true,
+      banner: { js: "#!/usr/bin/env node" },
+      plugins: [cliSymlinkPlugin(outfile)],
+    };
+  });
+
+  return {
+    name: "build-agent-shims",
+    async buildStart() {
+      fs.mkdirSync("dist-cli/agent-shims", { recursive: true });
+      if (this.meta.watchMode) {
+        for (const opts of buildOptions) {
+          const ctx = await esbuildCtx(opts);
+          await ctx.watch();
+        }
+      } else {
+        await Promise.all(buildOptions.map((opts) => esbuild(opts)));
+      }
+    },
+  };
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -123,6 +155,7 @@ export default defineConfig({
     buildCli(),
     buildHydra(),
     buildBrowse(),
+    buildAgentShims(),
     electron([
       {
         entry: "electron/main.ts",
@@ -151,7 +184,30 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  // Pre-bundling @wterm/* would move the modules into .vite/deps, breaking
+  // the `new URL("../wasm/...", import.meta.url)` lookup the ghostty core
+  // uses to find its WASM blob. Keep them as-is so the relative URL stays
+  // valid against node_modules.
+  optimizeDeps: {
+    exclude: ["@wterm/core", "@wterm/dom", "@wterm/ghostty", "@wterm/react"],
+  },
   base: "./",
+  // Hydra writes worktrees, dispatch state, and result.json under
+  // .hydra/ + .worktrees/ at runtime. The dev server's chokidar
+  // watcher would otherwise see those writes, decide a "source file"
+  // changed, and trigger a full renderer reload (visible as a
+  // Cmd+R-style flash whenever a child Claude is dispatched). The
+  // .gitignore covers git but not Vite — explicit ignore here.
+  server: {
+    watch: {
+      ignored: [
+        "**/.hydra/**",
+        "**/.worktrees/**",
+        "**/.hydra-result-*.md",
+        "**/.hydra-task-*.md",
+      ],
+    },
+  },
   build: {
     outDir: "dist",
   },

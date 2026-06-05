@@ -1,4 +1,12 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
+import type {
+  RenderDiagnosticEventInput,
+  RenderDiagnosticsLogInfo,
+} from "../shared/render-diagnostics";
+import type { SessionHistoryChangedEvent } from "../shared/sessions";
+import type { TelemetryProvider } from "../shared/telemetry";
+
+type SessionTelemetryProvider = Exclude<TelemetryProvider, "unknown">;
 
 contextBridge.exposeInMainWorld("termcanvas", {
   terminal: {
@@ -60,6 +68,12 @@ contextBridge.exposeInMainWorld("termcanvas", {
         filePath: string;
         confidence: "strong" | "medium" | "weak";
       } | null>,
+    findWuu: (cwd: string, startedAt?: string) =>
+      ipcRenderer.invoke("session:find-wuu", cwd, startedAt) as Promise<{
+        sessionId: string;
+        filePath: string;
+        confidence: "medium" | "weak";
+      } | null>,
     getPermissionMode: (sessionId: string, cwd: string) =>
       ipcRenderer.invoke(
         "session:get-permission-mode",
@@ -77,10 +91,18 @@ contextBridge.exposeInMainWorld("termcanvas", {
       ipcRenderer.invoke("session:get-claude-by-pid", pid) as Promise<
         string | null
       >,
-    getKimiLatest: (cwd: string) =>
-      ipcRenderer.invoke("session:get-kimi-latest", cwd) as Promise<
-        string | null
-      >,
+    findKimi: (cwd: string, startedAt?: string) =>
+      ipcRenderer.invoke("session:find-kimi", cwd, startedAt) as Promise<{
+        sessionId: string;
+        filePath: string;
+        confidence: "medium" | "weak";
+      } | null>,
+    findOpenCode: (cwd: string, startedAt?: string) =>
+      ipcRenderer.invoke("session:find-opencode", cwd, startedAt) as Promise<{
+        sessionId: string;
+        filePath: string;
+        confidence: "medium" | "weak";
+      } | null>,
     watch: (type: string, sessionId: string, cwd: string) =>
       ipcRenderer.invoke("session:watch", type, sessionId, cwd) as Promise<{
         ok: boolean;
@@ -99,7 +121,7 @@ contextBridge.exposeInMainWorld("termcanvas", {
   telemetry: {
     attachSession: (input: {
       terminalId: string;
-      provider: "claude" | "codex";
+      provider: SessionTelemetryProvider;
       sessionId: string;
       cwd: string;
       confidence: "strong" | "medium" | "weak";
@@ -116,7 +138,7 @@ contextBridge.exposeInMainWorld("termcanvas", {
     updateTerminal: (input: {
       terminalId: string;
       worktreePath?: string;
-      provider?: "claude" | "codex" | "unknown";
+      provider?: TelemetryProvider;
       ptyId?: number | null;
       shellPid?: number | null;
     }) => ipcRenderer.invoke("telemetry:update-terminal", input),
@@ -144,6 +166,29 @@ contextBridge.exposeInMainWorld("termcanvas", {
         ipcRenderer.removeListener("telemetry:snapshot-changed", listener);
     },
   },
+  diagnostics: {
+    recordRenderEvent: (input: RenderDiagnosticEventInput) =>
+      ipcRenderer.invoke(
+        "diagnostics:record-render-event",
+        input,
+      ) as Promise<void>,
+    getRenderLogInfo: () =>
+      ipcRenderer.invoke(
+        "diagnostics:get-render-log-info",
+      ) as Promise<RenderDiagnosticsLogInfo>,
+  },
+  lifecycle: {
+    onVisible: (
+      callback: (payload: { reason: string; timestamp: number }) => void,
+    ) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: { reason: string; timestamp: number },
+      ) => callback(payload);
+      ipcRenderer.on("tc:lifecycle:visible", listener);
+      return () => ipcRenderer.removeListener("tc:lifecycle:visible", listener);
+    },
+  },
   project: {
     selectDirectory: () => ipcRenderer.invoke("project:select-directory"),
     scan: (dirPath: string) => ipcRenderer.invoke("project:scan", dirPath),
@@ -162,21 +207,26 @@ contextBridge.exposeInMainWorld("termcanvas", {
         | {
             ok: true;
             path: string;
-            worktrees: { path: string; branch: string; isMain: boolean }[];
+            worktrees: { path: string; branch: string; isPrimary: boolean }[];
           }
         | { ok: false; error: string }
       >,
-    removeWorktree: (repoPath: string, worktreePath: string) =>
+    removeWorktree: (repoPath: string, worktreePath: string, force?: boolean) =>
       ipcRenderer.invoke(
         "project:remove-worktree",
         repoPath,
         worktreePath,
+        force,
       ) as Promise<
         | {
             ok: true;
-            worktrees: { path: string; branch: string; isMain: boolean }[];
+            worktrees: { path: string; branch: string; isPrimary: boolean }[];
           }
         | { ok: false; error: string }
+      >,
+    deleteFolder: (projectPath: string) =>
+      ipcRenderer.invoke("project:delete-folder", projectPath) as Promise<
+        { ok: true } | { ok: false; error: string }
       >,
     enableHydra: (dirPath: string) =>
       ipcRenderer.invoke("project:enable-hydra", dirPath),
@@ -244,6 +294,163 @@ contextBridge.exposeInMainWorld("termcanvas", {
       ipcRenderer.invoke("git:push", worktreePath) as Promise<string>,
     pull: (worktreePath: string) =>
       ipcRenderer.invoke("git:pull", worktreePath) as Promise<string>,
+    amend: (worktreePath: string, message: string) =>
+      ipcRenderer.invoke("git:amend", worktreePath, message) as Promise<string>,
+    fetch: (worktreePath: string, remote?: string) =>
+      ipcRenderer.invoke("git:fetch", worktreePath, remote) as Promise<string>,
+    // Stash
+    stashList: (worktreePath: string) =>
+      ipcRenderer.invoke("git:stash-list", worktreePath) as Promise<
+        import("../src/types").GitStashEntry[]
+      >,
+    stashCreate: (
+      worktreePath: string,
+      message: string,
+      includeUntracked: boolean,
+    ) =>
+      ipcRenderer.invoke(
+        "git:stash-create",
+        worktreePath,
+        message,
+        includeUntracked,
+      ) as Promise<void>,
+    stashApply: (worktreePath: string, index: number) =>
+      ipcRenderer.invoke(
+        "git:stash-apply",
+        worktreePath,
+        index,
+      ) as Promise<void>,
+    stashPop: (worktreePath: string, index: number) =>
+      ipcRenderer.invoke("git:stash-pop", worktreePath, index) as Promise<void>,
+    stashDrop: (worktreePath: string, index: number) =>
+      ipcRenderer.invoke(
+        "git:stash-drop",
+        worktreePath,
+        index,
+      ) as Promise<void>,
+    // Branch management
+    branchCreate: (worktreePath: string, name: string, startPoint?: string) =>
+      ipcRenderer.invoke(
+        "git:branch-create",
+        worktreePath,
+        name,
+        startPoint,
+      ) as Promise<void>,
+    branchDelete: (worktreePath: string, name: string, force: boolean) =>
+      ipcRenderer.invoke(
+        "git:branch-delete",
+        worktreePath,
+        name,
+        force,
+      ) as Promise<void>,
+    branchRename: (worktreePath: string, oldName: string, newName: string) =>
+      ipcRenderer.invoke(
+        "git:branch-rename",
+        worktreePath,
+        oldName,
+        newName,
+      ) as Promise<void>,
+    // Tags
+    tagList: (worktreePath: string) =>
+      ipcRenderer.invoke("git:tag-list", worktreePath) as Promise<
+        import("../src/types").GitTagInfo[]
+      >,
+    tagCreate: (
+      worktreePath: string,
+      name: string,
+      ref: string,
+      message?: string,
+    ) =>
+      ipcRenderer.invoke(
+        "git:tag-create",
+        worktreePath,
+        name,
+        ref,
+        message,
+      ) as Promise<void>,
+    tagDelete: (worktreePath: string, name: string) =>
+      ipcRenderer.invoke("git:tag-delete", worktreePath, name) as Promise<void>,
+    // Remotes
+    remoteList: (worktreePath: string) =>
+      ipcRenderer.invoke("git:remote-list", worktreePath) as Promise<
+        import("../src/types").GitRemoteInfo[]
+      >,
+    remoteAdd: (worktreePath: string, name: string, url: string) =>
+      ipcRenderer.invoke(
+        "git:remote-add",
+        worktreePath,
+        name,
+        url,
+      ) as Promise<void>,
+    remoteRemove: (worktreePath: string, name: string) =>
+      ipcRenderer.invoke(
+        "git:remote-remove",
+        worktreePath,
+        name,
+      ) as Promise<void>,
+    remoteRename: (worktreePath: string, oldName: string, newName: string) =>
+      ipcRenderer.invoke(
+        "git:remote-rename",
+        worktreePath,
+        oldName,
+        newName,
+      ) as Promise<void>,
+    // Merge / Rebase / Cherry-pick
+    merge: (worktreePath: string, ref: string) =>
+      ipcRenderer.invoke("git:merge", worktreePath, ref) as Promise<string>,
+    mergeAbort: (worktreePath: string) =>
+      ipcRenderer.invoke("git:merge-abort", worktreePath) as Promise<void>,
+    rebase: (worktreePath: string, ref: string) =>
+      ipcRenderer.invoke("git:rebase", worktreePath, ref) as Promise<string>,
+    rebaseAbort: (worktreePath: string) =>
+      ipcRenderer.invoke("git:rebase-abort", worktreePath) as Promise<void>,
+    rebaseContinue: (worktreePath: string) =>
+      ipcRenderer.invoke(
+        "git:rebase-continue",
+        worktreePath,
+      ) as Promise<string>,
+    cherryPick: (worktreePath: string, hash: string) =>
+      ipcRenderer.invoke(
+        "git:cherry-pick",
+        worktreePath,
+        hash,
+      ) as Promise<string>,
+    cherryPickAbort: (worktreePath: string) =>
+      ipcRenderer.invoke(
+        "git:cherry-pick-abort",
+        worktreePath,
+      ) as Promise<void>,
+    mergeState: (worktreePath: string) =>
+      ipcRenderer.invoke("git:merge-state", worktreePath) as Promise<
+        import("../src/types").GitMergeState
+      >,
+    // File diff & partial staging
+    fileDiff: (worktreePath: string, filePath: string, staged: boolean) =>
+      ipcRenderer.invoke(
+        "git:file-diff",
+        worktreePath,
+        filePath,
+        staged,
+      ) as Promise<import("../src/types").GitFileDiff>,
+    stageHunk: (worktreePath: string, filePath: string, hunkHeader: string) =>
+      ipcRenderer.invoke(
+        "git:stage-hunk",
+        worktreePath,
+        filePath,
+        hunkHeader,
+      ) as Promise<void>,
+    unstageHunk: (worktreePath: string, filePath: string, hunkHeader: string) =>
+      ipcRenderer.invoke(
+        "git:unstage-hunk",
+        worktreePath,
+        filePath,
+        hunkHeader,
+      ) as Promise<void>,
+    // Blame
+    blame: (worktreePath: string, filePath: string) =>
+      ipcRenderer.invoke("git:blame", worktreePath, filePath) as Promise<
+        import("../src/types").GitBlameEntry[]
+      >,
     onChanged: (callback: (worktreePath: string) => void) => {
       const listener = (
         _event: Electron.IpcRendererEvent,
@@ -272,9 +479,85 @@ contextBridge.exposeInMainWorld("termcanvas", {
       return () => ipcRenderer.removeListener("git:presence-changed", listener);
     },
   },
+  search: {
+    fileContents: (query: string, worktreePath?: string) =>
+      ipcRenderer.invoke(
+        "search:file-contents",
+        query,
+        worktreePath,
+      ) as Promise<Array<{ filePath: string; line: number; preview: string }>>,
+    sessionContents: (query: string) =>
+      ipcRenderer.invoke("search:session-contents", query) as Promise<
+        Array<{
+          sessionId: string;
+          filePath: string;
+          lineNumber: number;
+          preview: string;
+        }>
+      >,
+    /**
+     * List past sessions belonging to any of the given project
+     * directories. Backed by an mtime-keyed cache on the main
+     * process, so repeated calls for the same project paths only
+     * re-parse files that actually changed.
+     */
+    listSessions: (projectDirs: string[]) =>
+      ipcRenderer.invoke("search:sessions:list", projectDirs) as Promise<
+        Array<{
+          sessionId: string;
+          provider: "claude" | "codex";
+          projectDir: string;
+          filePath: string;
+          firstPrompt: string;
+          startedAt: string;
+          lastActivityAt: string;
+          estimatedMessageCount: number;
+          fileSize: number;
+        }>
+      >,
+    /**
+     * Paginated variant — only parses the slice the caller is about
+     * to render, which is what the history browse UI wants. Cmd+K
+     * still uses `listSessions` because fuzzy matching needs every
+     * title at once.
+     */
+    listSessionsPage: (
+      projectDirs: string[],
+      options: { limit: number; offset?: number },
+    ) =>
+      ipcRenderer.invoke(
+        "search:sessions:list-page",
+        projectDirs,
+        options,
+      ) as Promise<{
+        entries: Array<{
+          sessionId: string;
+          provider: "claude" | "codex";
+          projectDir: string;
+          filePath: string;
+          firstPrompt: string;
+          startedAt: string;
+          lastActivityAt: string;
+          estimatedMessageCount: number;
+          fileSize: number;
+        }>;
+        total: number;
+      }>,
+  },
   state: {
     load: () => ipcRenderer.invoke("state:load"),
     save: (state: unknown) => ipcRenderer.invoke("state:save", state),
+  },
+  snapshots: {
+    list: () => ipcRenderer.invoke("snapshots:list"),
+    read: (id: string) => ipcRenderer.invoke("snapshots:read", id),
+    append: (args: {
+      savedAt: number;
+      terminalCount: number;
+      projectCount: number;
+      label?: string;
+      body: unknown;
+    }) => ipcRenderer.invoke("snapshots:append", args),
   },
   workspace: {
     save: (data: string) =>
@@ -294,6 +577,15 @@ contextBridge.exposeInMainWorld("termcanvas", {
       ipcRenderer.invoke("fs:list-dir", dirPath) as Promise<
         { name: string; isDirectory: boolean }[]
       >,
+    listAllFiles: (dirPath: string) =>
+      ipcRenderer.invoke("fs:list-all-files", dirPath) as Promise<{
+        type: "git" | "dir";
+        paths: string[];
+      }>,
+    listIgnoredFiles: (dirPath: string) =>
+      ipcRenderer.invoke("fs:list-ignored-files", dirPath) as Promise<
+        string[]
+      >,
     readFile: (filePath: string) =>
       ipcRenderer.invoke("fs:read-file", filePath) as Promise<
         { type: string; content: string } | { error: string; size?: string }
@@ -310,6 +602,8 @@ contextBridge.exposeInMainWorld("termcanvas", {
     getFilePath: (file: File) => webUtils.getPathForFile(file),
     rename: (oldPath: string, newName: string) =>
       ipcRenderer.invoke("fs:rename", oldPath, newName) as Promise<void>,
+    move: (oldPath: string, newPath: string) =>
+      ipcRenderer.invoke("fs:move", oldPath, newPath) as Promise<void>,
     delete: (targetPath: string) =>
       ipcRenderer.invoke("fs:delete", targetPath) as Promise<void>,
     mkdir: (dirPath: string, name: string) =>
@@ -348,7 +642,11 @@ contextBridge.exposeInMainWorld("termcanvas", {
   cli: {
     isRegistered: () =>
       ipcRenderer.invoke("cli:is-registered") as Promise<boolean>,
-    register: () => ipcRenderer.invoke("cli:register") as Promise<boolean>,
+    register: () =>
+      ipcRenderer.invoke("cli:register") as Promise<{
+        ok: boolean;
+        skillInstalled: boolean;
+      }>,
     unregister: () => ipcRenderer.invoke("cli:unregister") as Promise<boolean>,
     validateCommand: (command: string, args?: string[]) =>
       ipcRenderer.invoke("cli:validate-command", command, args) as Promise<
@@ -375,9 +673,13 @@ contextBridge.exposeInMainWorld("termcanvas", {
   },
   usage: {
     query: (dateStr: string) => ipcRenderer.invoke("usage:query", dateStr),
+    queryRange: (startDate: string, endDate: string) =>
+      ipcRenderer.invoke("usage:query-range", startDate, endDate),
     heatmap: () => ipcRenderer.invoke("usage:heatmap"),
     queryCloud: (dateStr: string) =>
       ipcRenderer.invoke("usage:query-cloud", dateStr),
+    queryRangeCloud: (startDate: string, endDate: string) =>
+      ipcRenderer.invoke("usage:query-range-cloud", startDate, endDate),
     heatmapCloud: () => ipcRenderer.invoke("usage:heatmap-cloud"),
   },
   quota: {
@@ -524,14 +826,9 @@ contextBridge.exposeInMainWorld("termcanvas", {
   app: {
     homePath: process.env.HOME ?? process.env.USERPROFILE ?? "",
     platform: process.platform as "darwin" | "win32" | "linux",
-    onBeforeClose: (callback: () => void) => {
-      const listener = () => callback();
-      ipcRenderer.on("app:before-close", listener);
-      return () => ipcRenderer.removeListener("app:before-close", listener);
-    },
     requestClose: () => ipcRenderer.send("app:request-close"),
-    confirmClose: (options?: { installUpdate?: boolean }) =>
-      ipcRenderer.send("app:close-confirmed", options),
+    setQuitOnLastWindowClosed: (value: boolean) =>
+      ipcRenderer.send("app:set-quit-on-last-window-closed", value),
   },
   updater: {
     check: () => ipcRenderer.invoke("updater:check"),
@@ -584,6 +881,15 @@ contextBridge.exposeInMainWorld("termcanvas", {
       ) => callback(error);
       ipcRenderer.on("updater:error", listener);
       return () => ipcRenderer.removeListener("updater:error", listener);
+    },
+    onLocationWarning: (callback: (info: { bundlePath: string }) => void) => {
+      const listener = (
+        _e: Electron.IpcRendererEvent,
+        info: { bundlePath: string },
+      ) => callback(info);
+      ipcRenderer.on("updater:location-warning", listener);
+      return () =>
+        ipcRenderer.removeListener("updater:location-warning", listener);
     },
   },
   hooks: {
@@ -660,8 +966,30 @@ contextBridge.exposeInMainWorld("termcanvas", {
       return () =>
         ipcRenderer.removeListener("sessions:list-changed", listener);
     },
+    onHistoryChanged: (
+      callback: (payload: SessionHistoryChangedEvent) => void,
+    ) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: SessionHistoryChangedEvent,
+      ) => callback(payload);
+      ipcRenderer.on("session-history:changed", listener);
+      return () =>
+        ipcRenderer.removeListener("session-history:changed", listener);
+    },
     loadReplay: (filePath: string) =>
       ipcRenderer.invoke("sessions:load-replay", filePath),
+    forkSession: (
+      sourceFilePath: string,
+      turnIndex: number,
+      targetProvider?: "claude" | "codex",
+    ) =>
+      ipcRenderer.invoke(
+        "sessions:fork",
+        sourceFilePath,
+        turnIndex,
+        targetProvider,
+      ),
   },
   menu: {
     onOpenFolder: (callback: (dirPath: string) => void) => {
@@ -669,6 +997,66 @@ contextBridge.exposeInMainWorld("termcanvas", {
         callback(dirPath);
       ipcRenderer.on("menu:open-folder", listener);
       return () => ipcRenderer.removeListener("menu:open-folder", listener);
+    },
+    onSelectAll: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on("menu:select-all", listener);
+      return () => ipcRenderer.removeListener("menu:select-all", listener);
+    },
+  },
+  pins: {
+    list: (repo: string) =>
+      ipcRenderer.invoke("pin:list", repo) as Promise<import("../shared/pin.js").Pin[]>,
+    create: (input: import("../shared/pin.js").CreatePinInput) =>
+      ipcRenderer.invoke("pin:create", input) as Promise<import("../shared/pin.js").Pin>,
+    update: (
+      repo: string,
+      id: string,
+      patch: import("../shared/pin.js").UpdatePinInput,
+    ) =>
+      ipcRenderer.invoke("pin:update", repo, id, patch) as Promise<import("../shared/pin.js").Pin>,
+    remove: (repo: string, id: string) =>
+      ipcRenderer.invoke("pin:remove", repo, id) as Promise<void>,
+    openPreview: (repo: string, id: string) =>
+      ipcRenderer.invoke("pin:open-preview", repo, id) as Promise<void>,
+    saveAttachment: (
+      repo: string,
+      id: string,
+      fileName: string,
+      data: ArrayBuffer,
+    ) =>
+      ipcRenderer.invoke(
+        "pin:save-attachment",
+        repo,
+        id,
+        fileName,
+        data,
+      ) as Promise<{ relativePath: string; absolutePath: string }>,
+    dispatchToTerminal: (
+      repo: string,
+      pinId: string,
+      target: {
+        terminalId: string;
+        ptyId: number;
+        terminalType: string;
+        worktreePath: string;
+      },
+    ) =>
+      ipcRenderer.invoke(
+        "pin:dispatch-to-terminal",
+        repo,
+        pinId,
+        target,
+      ) as Promise<import("../src/types").ComposerSubmitResult>,
+    subscribe: (
+      handler: (event: { type: string; [key: string]: unknown }) => void,
+    ) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: { type: string; [key: string]: unknown },
+      ) => handler(payload);
+      ipcRenderer.on("pin:event", listener);
+      return () => ipcRenderer.removeListener("pin:event", listener);
     },
   },
 });

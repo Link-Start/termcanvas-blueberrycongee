@@ -40,6 +40,7 @@ test("agent terminals beyond claude/codex are composer-supported", () => {
   assert.equal(isComposerSupportedTerminal("kimi"), true);
   assert.equal(isComposerSupportedTerminal("gemini"), true);
   assert.equal(isComposerSupportedTerminal("opencode"), true);
+  assert.equal(isComposerSupportedTerminal("wuu"), true);
 });
 
 test("getTerminalLaunchOptions reuses centralized launch config", () => {
@@ -99,8 +100,9 @@ test("getTerminalLaunchOptions includes autoApprove args when resuming codex ses
   ]);
 });
 
-test("getTerminalPromptArgs defaults to a positional prompt", () => {
+test("getTerminalPromptArgs terminates Claude options before the prompt", () => {
   assert.deepEqual(getTerminalPromptArgs("claude", "Explore the repo"), [
+    "--",
     "Explore the repo",
   ]);
 });

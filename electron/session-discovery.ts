@@ -2,7 +2,8 @@ import fs from "fs";
 import { createRequire } from "node:module";
 import os from "os";
 import path from "path";
-import { resolveSessionFile } from "./session-watcher";
+import { findBestOpenCodeSession } from "./opencode-session.ts";
+import { resolveSessionFile } from "./session-watcher.ts";
 
 export interface FoundSession {
   sessionId: string;
@@ -13,6 +14,11 @@ export interface FoundSession {
 interface CodexSessionIndexEntry {
   id?: string;
   updated_at?: string;
+}
+
+interface WuuSessionIndexEntry {
+  id?: string;
+  created_at?: string;
 }
 
 interface RecentCodexSessionFile {
@@ -482,16 +488,163 @@ export function findBestCodexSession(
     return { sessionId, filePath, confidence };
   }
 
-  const latestSessionId = readLatestCodexSessionId(homeDir);
-  if (!latestSessionId) {
+  // Do not fall back to the globally latest Codex session here. Auto-attach
+  // only has cwd + launch time as identity; if those don't yield a match,
+  // binding some other terminal's newest session is worse than timing out.
+  return null;
+}
+
+function getWuuSessionsDir(cwd: string): string {
+  return path.join(cwd, ".wuu", "sessions");
+}
+
+function parseWuuSessionStartedAtMs(sessionId: string): number | null {
+  const match = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/.exec(sessionId);
+  if (!match) {
     return null;
   }
 
-  return {
-    sessionId: latestSessionId,
-    filePath: recentFileMap.get(latestSessionId)?.filePath ?? "",
-    confidence: "weak",
-  };
+  const startedAt = new Date(
+    Number.parseInt(match[1] ?? "", 10),
+    Number.parseInt(match[2] ?? "", 10) - 1,
+    Number.parseInt(match[3] ?? "", 10),
+    Number.parseInt(match[4] ?? "", 10),
+    Number.parseInt(match[5] ?? "", 10),
+    Number.parseInt(match[6] ?? "", 10),
+  ).getTime();
+
+  return Number.isFinite(startedAt) ? startedAt : null;
+}
+
+function readWuuSessionIndex(sessDir: string): Array<{
+  sessionId: string;
+  createdAtMs: number | null;
+}> {
+  const indexPath = path.join(sessDir, "index.jsonl");
+  if (!fs.existsSync(indexPath)) {
+    return [];
+  }
+
+  const entries: Array<{ sessionId: string; createdAtMs: number | null }> = [];
+  const seen = new Set<string>();
+
+  for (const line of readJsonlTailLines(indexPath, 64)) {
+    let parsed: WuuSessionIndexEntry;
+    try {
+      parsed = JSON.parse(line) as WuuSessionIndexEntry;
+    } catch {
+      continue;
+    }
+
+    if (typeof parsed.id !== "string" || parsed.id.length === 0 || seen.has(parsed.id)) {
+      continue;
+    }
+
+    seen.add(parsed.id);
+    entries.push({
+      sessionId: parsed.id,
+      createdAtMs:
+        typeof parsed.created_at === "string"
+          ? new Date(parsed.created_at).getTime()
+          : null,
+    });
+  }
+
+  return entries;
+}
+
+function listRecentWuuSessionFiles(sessDir: string): Array<{
+  sessionId: string;
+  filePath: string;
+  anchorMs: number;
+}> {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(sessDir);
+  } catch {
+    return [];
+  }
+
+  return entries
+    .filter((entry) => entry.endsWith(".jsonl") && entry !== "index.jsonl")
+    .map((entry) => {
+      const filePath = path.join(sessDir, entry);
+      try {
+        const stat = fs.statSync(filePath);
+        return {
+          sessionId: path.basename(entry, ".jsonl"),
+          filePath,
+          anchorMs:
+            parseWuuSessionStartedAtMs(path.basename(entry, ".jsonl")) ?? stat.mtimeMs,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (entry): entry is { sessionId: string; filePath: string; anchorMs: number } =>
+        entry !== null,
+    )
+    .sort((left, right) => right.anchorMs - left.anchorMs)
+    .slice(0, 32);
+}
+
+export function findBestWuuSession(
+  cwd: string,
+  startedAt?: string,
+): FoundSession | null {
+  const sessionsDir = getWuuSessionsDir(cwd);
+  const startedMs = startedAt ? new Date(startedAt).getTime() : NaN;
+  const lowerBoundMs =
+    Number.isFinite(startedMs) ? startedMs - 1_000 : Number.NEGATIVE_INFINITY;
+
+  const indexedCandidates = readWuuSessionIndex(sessionsDir)
+    .map((entry) => {
+      const filePath = resolveSessionFile(entry.sessionId, "wuu", cwd);
+      if (!filePath || !fs.existsSync(filePath)) {
+        return null;
+      }
+      const anchorMs = Number.isFinite(entry.createdAtMs ?? NaN)
+        ? entry.createdAtMs!
+        : parseWuuSessionStartedAtMs(entry.sessionId) ?? fs.statSync(filePath).mtimeMs;
+      if (anchorMs < lowerBoundMs) {
+        return null;
+      }
+      return {
+        sessionId: entry.sessionId,
+        filePath,
+        anchorMs,
+      };
+    })
+    .filter(
+      (entry): entry is { sessionId: string; filePath: string; anchorMs: number } =>
+        entry !== null,
+    )
+    .sort((left, right) => right.anchorMs - left.anchorMs);
+
+  if (indexedCandidates.length > 0) {
+    const { sessionId, filePath } = indexedCandidates[0];
+    return {
+      sessionId,
+      filePath,
+      confidence: Number.isFinite(startedMs) ? "medium" : "weak",
+    };
+  }
+
+  const scannedCandidates = listRecentWuuSessionFiles(sessionsDir)
+    .filter((entry) => entry.anchorMs >= lowerBoundMs)
+    .sort((left, right) => right.anchorMs - left.anchorMs);
+
+  if (scannedCandidates.length > 0) {
+    const { sessionId, filePath } = scannedCandidates[0];
+    return {
+      sessionId,
+      filePath,
+      confidence: Number.isFinite(startedMs) ? "medium" : "weak",
+    };
+  }
+
+  return null;
 }
 
 interface ClaudeSessionSidecar {
@@ -579,6 +732,98 @@ export function findBestClaudeSession(
   const { sessionId, filePath, confidence } = candidates[0];
   return { sessionId, filePath, confidence };
 }
+
+function getKimiSessionsDir(cwd: string, homeDir = os.homedir()): string | null {
+  const metadataPath = path.join(homeDir, ".kimi", "kimi.json");
+  try {
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as {
+      work_dirs?: Array<{ path: string; sessions_dir?: string }>;
+    };
+    const workDirs = metadata.work_dirs ?? [];
+    for (const wd of workDirs) {
+      if (wd.path === cwd && wd.sessions_dir) {
+        return wd.sessions_dir;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  // Fallback: compute from path hash
+  const crypto = require("node:crypto");
+  const pathMd5 = crypto.createHash("md5").update(cwd).digest("hex");
+  const fallbackDir = path.join(homeDir, ".kimi", "sessions", pathMd5);
+  if (fs.existsSync(fallbackDir)) {
+    return fallbackDir;
+  }
+  return null;
+}
+
+function listKimiSessionFiles(sessionsDir: string): Array<{
+  sessionId: string;
+  filePath: string;
+  anchorMs: number;
+}> {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(sessionsDir);
+  } catch {
+    return [];
+  }
+
+  return entries
+    .map((entry) => {
+      const sessionDir = path.join(sessionsDir, entry);
+      const contextFile = path.join(sessionDir, "context.jsonl");
+      try {
+        const stat = fs.statSync(contextFile);
+        return {
+          sessionId: entry,
+          filePath: contextFile,
+          anchorMs: stat.mtimeMs,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (entry): entry is { sessionId: string; filePath: string; anchorMs: number } =>
+        entry !== null,
+    )
+    .sort((left, right) => right.anchorMs - left.anchorMs)
+    .slice(0, 32);
+}
+
+export function findBestKimiSession(
+  cwd: string,
+  startedAt?: string,
+  homeDir = os.homedir(),
+): FoundSession | null {
+  const sessionsDir = getKimiSessionsDir(cwd, homeDir);
+  if (!sessionsDir) {
+    return null;
+  }
+
+  const startedMs = startedAt ? new Date(startedAt).getTime() : NaN;
+  const lowerBoundMs =
+    Number.isFinite(startedMs) ? startedMs - 1_000 : Number.NEGATIVE_INFINITY;
+
+  const candidates = listKimiSessionFiles(sessionsDir)
+    .filter((entry) => entry.anchorMs >= lowerBoundMs)
+    .sort((left, right) => right.anchorMs - left.anchorMs);
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const { sessionId, filePath } = candidates[0];
+  return {
+    sessionId,
+    filePath,
+    confidence: Number.isFinite(startedMs) ? "medium" : "weak",
+  };
+}
+
+export { findBestOpenCodeSession };
 
 const CHUNK_BYTES = 64 * 1024;
 const MAX_SCAN_BYTES = 512 * 1024;

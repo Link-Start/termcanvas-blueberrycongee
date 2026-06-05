@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
-import { shouldIgnoreShortcutTarget } from "../src/hooks/shortcutTarget.ts";
+import {
+  isTerminalShortcutTarget,
+  shouldIgnoreShortcutTarget,
+} from "../src/hooks/shortcutTarget.ts";
+import { navigateToTerminalWithViewport } from "../src/hooks/useKeyboardShortcuts.ts";
 import {
   DEFAULT_SHORTCUTS,
   eventToShortcut,
@@ -10,6 +15,15 @@ import {
   matchesShortcut,
   useShortcutStore,
 } from "../src/stores/shortcutStore.ts";
+import { isSelectAllShortcutInput } from "../electron/select-all-shortcut.ts";
+import { useCanvasStore } from "../src/stores/canvasStore.ts";
+import { useProjectStore } from "../src/stores/projectStore.ts";
+import {
+  isXtermHelperTextArea,
+  performContextualSelectAll,
+  selectAllInTarget,
+} from "../src/utils/contextualSelectAll.ts";
+import { panToTerminal } from "../src/utils/panToTerminal.ts";
 import { getTerminalFocusOrder } from "../src/stores/projectFocus.ts";
 import {
   createTerminalSelectionAutoCopyState,
@@ -19,6 +33,10 @@ import {
   markTerminalSelectionPointerStarted,
   shouldAutoCopyTerminalSelection,
 } from "../src/terminal/selectionAutoCopy.ts";
+import {
+  isPanModeActive,
+  useCanvasToolStore,
+} from "../src/stores/canvasToolStore.ts";
 import type { ProjectData } from "../src/types/index.ts";
 
 function withPlatform(
@@ -64,6 +82,20 @@ function createTarget(
   return {
     tagName,
     isContentEditable,
+  } as unknown as EventTarget;
+}
+
+function createTargetWithClass(
+  tagName: string,
+  className: string,
+): EventTarget {
+  return {
+    tagName,
+    classList: {
+      contains(token: string) {
+        return token === className;
+      },
+    },
   } as unknown as EventTarget;
 }
 
@@ -195,6 +227,191 @@ test("editable targets allow command shortcuts to reach the app on macOS", () =>
   });
 });
 
+test("terminal shortcut target recognizes xterm helper textarea", () => {
+  assert.equal(
+    isTerminalShortcutTarget(
+      createTargetWithClass("TEXTAREA", "xterm-helper-textarea"),
+    ),
+    true,
+  );
+  assert.equal(isTerminalShortcutTarget(createTarget("TEXTAREA")), false);
+});
+
+test("canvas tool defaults to hand for canvas navigation", () => {
+  assert.equal(useCanvasToolStore.getState().tool, "hand");
+  assert.equal(isPanModeActive(), true);
+});
+
+test("canvas pan mode is explicit via hand tool or Space hold", () => {
+  useCanvasToolStore.setState({ tool: "hand", spaceHeld: false });
+  assert.equal(isPanModeActive(), true);
+
+  useCanvasToolStore.setState({ tool: "select", spaceHeld: true });
+  assert.equal(isPanModeActive(), true);
+
+  useCanvasToolStore.setState({ tool: "hand", spaceHeld: false });
+});
+
+test("terminal cursor CSS opts out of canvas pan cursor inheritance", () => {
+  const css = fs.readFileSync("src/index.css", "utf-8");
+
+  assert.match(css, /\.terminal-tile\s*\{[^}]*cursor:\s*default;/s);
+  assert.match(css, /\.tc-xterm-host,[\s\S]*cursor:\s*text !important;/);
+  assert.doesNotMatch(
+    css,
+    /body\.tc-canvas-pan-(?:mode|grabbing)[^{]*\{[^}]*cursor:\s*(?:grab|grabbing) !important;/s,
+  );
+});
+
+test("terminal resizer hit areas stay outside tile content", () => {
+  const css = fs.readFileSync("src/index.css", "utf-8");
+
+  assert.match(
+    css,
+    /\.tc-xyflow \.react-flow__resize-control\.line\.top\s*\{[^}]*translate\(-50%, -100%\)/s,
+  );
+  assert.match(
+    css,
+    /\.tc-xyflow \.react-flow__resize-control\.line\.bottom\s*\{[^}]*translate\(-50%, 100%\)/s,
+  );
+  assert.match(
+    css,
+    /\.tc-xyflow \.react-flow__resize-control\.line\.left\s*\{[^}]*translate\(-100%, -50%\)/s,
+  );
+  assert.match(
+    css,
+    /\.tc-xyflow \.react-flow__resize-control\.line\.right\s*\{[^}]*translate\(100%, -50%\)/s,
+  );
+  assert.match(
+    css,
+    /\.tc-xyflow \.react-flow__resize-control\.handle\.bottom\s*\{[^}]*translate:\s*-50% 0;/s,
+  );
+  assert.match(
+    css,
+    /\.tc-xyflow \.react-flow__resize-control\.handle\.bottom\.right\s*\{[^}]*translate:\s*0 0;/s,
+  );
+});
+
+test("select-all shortcut detection only matches the platform primary modifier", () => {
+  assert.equal(
+    isSelectAllShortcutInput(
+      {
+        type: "keyDown",
+        key: "a",
+        meta: true,
+        control: false,
+        alt: false,
+        shift: false,
+      },
+      "darwin",
+    ),
+    true,
+  );
+  assert.equal(
+    isSelectAllShortcutInput(
+      {
+        type: "keyDown",
+        key: "a",
+        meta: false,
+        control: true,
+        alt: false,
+        shift: false,
+      },
+      "darwin",
+    ),
+    false,
+  );
+  assert.equal(
+    isSelectAllShortcutInput(
+      {
+        type: "keyDown",
+        key: "A",
+        meta: false,
+        control: true,
+        alt: false,
+        shift: false,
+      },
+      "win32",
+    ),
+    true,
+  );
+  assert.equal(
+    isSelectAllShortcutInput(
+      {
+        type: "keyDown",
+        key: "a",
+        meta: false,
+        control: true,
+        alt: true,
+        shift: false,
+      },
+      "win32",
+    ),
+    false,
+  );
+});
+
+test("contextual select-all uses native selection for regular text inputs", () => {
+  let selected = false;
+  const result = performContextualSelectAll(
+    {
+      tagName: "TEXTAREA",
+      select() {
+        selected = true;
+      },
+    } as unknown as EventTarget,
+    () => false,
+  );
+
+  assert.equal(result, "target");
+  assert.equal(selected, true);
+});
+
+test("contextual select-all routes xterm helper textarea to the terminal", () => {
+  let terminalSelected = 0;
+  const target = createTargetWithClass("TEXTAREA", "xterm-helper-textarea");
+
+  assert.equal(isXtermHelperTextArea(target), true);
+  assert.equal(selectAllInTarget(target), false);
+  assert.equal(
+    performContextualSelectAll(target, () => {
+      terminalSelected += 1;
+      return true;
+    }),
+    "terminal",
+  );
+  assert.equal(terminalSelected, 1);
+});
+
+test("contextual select-all selects contenteditable contents", () => {
+  let selectedNode: unknown = null;
+  let addedRange: unknown = null;
+  const target = {
+    isContentEditable: true,
+    ownerDocument: {
+      createRange() {
+        return {
+          selectNodeContents(node: unknown) {
+            selectedNode = node;
+          },
+        };
+      },
+      getSelection() {
+        return {
+          addRange(range: unknown) {
+            addedRange = range;
+          },
+          removeAllRanges() {},
+        };
+      },
+    },
+  } as unknown as EventTarget;
+
+  assert.equal(performContextualSelectAll(target, () => false), "target");
+  assert.equal(selectedNode, target);
+  assert.notEqual(addedRange, null);
+});
+
 test("terminal auto-copy only fires after a pointer-completed selection", () => {
   let state = createTerminalSelectionAutoCopyState();
 
@@ -240,10 +457,6 @@ test("cycle focus level shortcut defaults to mod+g and matches correctly", () =>
       true,
     );
   });
-});
-
-test("compact focused project shortcut defaults to mod+shift+g", () => {
-  assert.equal(DEFAULT_SHORTCUTS.compactFocusedProject, "mod+shift+g");
 });
 
 test("Windows defaults use alt-based shortcuts", () => {
@@ -368,4 +581,119 @@ test("terminal focus order follows natural project/worktree/array order", () => 
     getTerminalFocusOrder(projects).map((terminal) => terminal.terminalId),
     ["terminal-1", "terminal-2", "terminal-3", "terminal-4"],
   );
+});
+
+test("terminal navigation re-zooms to the target tile when not in zoomed-out mode", () => {
+  const pans: Array<{ terminalId: string; preserveScale?: boolean }> = [];
+  const zooms: string[] = [];
+
+  const nextZoomedOutId = navigateToTerminalWithViewport("terminal-2", {
+    zoomedOutTerminalId: null,
+    pan: (terminalId, options) => {
+      pans.push({
+        terminalId,
+        preserveScale: options?.preserveScale,
+      });
+    },
+    zoom: (terminalId) => {
+      zooms.push(terminalId);
+    },
+  });
+
+  assert.equal(nextZoomedOutId, null);
+  assert.deepEqual(zooms, ["terminal-2"]);
+  assert.deepEqual(pans, []);
+});
+
+test("terminal navigation preserves scale only while zoomed out", () => {
+  const pans: Array<{ terminalId: string; preserveScale?: boolean }> = [];
+  const zooms: string[] = [];
+
+  const nextZoomedOutId = navigateToTerminalWithViewport("terminal-2", {
+    zoomedOutTerminalId: "terminal-1",
+    pan: (terminalId, options) => {
+      pans.push({
+        terminalId,
+        preserveScale: options?.preserveScale,
+      });
+    },
+    zoom: (terminalId) => {
+      zooms.push(terminalId);
+    },
+  });
+
+  assert.equal(nextZoomedOutId, "terminal-2");
+  assert.deepEqual(zooms, []);
+  assert.deepEqual(pans, [
+    {
+      terminalId: "terminal-2",
+      preserveScale: true,
+    },
+  ]);
+});
+
+test("terminal focus clamps fit scale for small resized tiles", () => {
+  const previousWindow = (globalThis as { window?: unknown }).window;
+  const previousProjectState = useProjectStore.getState();
+  const previousCanvasState = useCanvasStore.getState();
+
+  (globalThis as { window?: unknown }).window = {
+    innerWidth: 1600,
+    innerHeight: 1000,
+  };
+
+  useProjectStore.setState({
+    focusedProjectId: "project-1",
+    focusedWorktreeId: "worktree-1",
+    projects: [
+      {
+        id: "project-1",
+        name: "Project",
+        path: "/project",
+        worktrees: [
+          {
+            id: "worktree-1",
+            name: "main",
+            path: "/project",
+            terminals: [
+              {
+                id: "terminal-1",
+                title: "Terminal",
+                type: "shell",
+                minimized: false,
+                focused: true,
+                ptyId: null,
+                status: "idle",
+                x: 100,
+                y: 80,
+                width: 300,
+                height: 200,
+                tags: [],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+  useCanvasStore.setState({
+    viewport: { x: 0, y: 0, scale: 1 },
+    leftPanelCollapsed: true,
+    leftPanelWidth: 280,
+    rightPanelCollapsed: true,
+    rightPanelWidth: 360,
+  });
+
+  try {
+    panToTerminal("terminal-1", { immediate: true });
+    assert.equal(useCanvasStore.getState().viewport.scale, 2);
+  } finally {
+    useProjectStore.setState(previousProjectState);
+    useCanvasStore.setState(previousCanvasState);
+    if (previousWindow === undefined) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window?: unknown }).window = previousWindow;
+    }
+  }
 });

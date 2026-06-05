@@ -1,16 +1,125 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import type { NormalizedSessionTelemetryEvent, TelemetryTurnState } from "../shared/telemetry.ts";
+import { createRequire } from "node:module";
+import {
+  checkOpenCodeTurnComplete,
+  resolveOpenCodeSessionFile,
+} from "./opencode-session.ts";
+import type {
+  NormalizedSessionTelemetryEvent,
+  TelemetryTurnState,
+} from "../shared/telemetry.ts";
 
-export type SessionType = "claude" | "codex";
+const isDev = !!process.env.VITE_DEV_SERVER_URL;
+
+export type SessionType = "claude" | "codex" | "kimi" | "wuu" | "opencode";
 
 interface CompletionSignal {
   completed: boolean;
 }
 
+interface SqliteStatement {
+  get(...params: unknown[]): unknown;
+}
+
+interface SqliteDatabase {
+  prepare(sql: string): SqliteStatement;
+  close(): void;
+}
+
+type DatabaseSyncCtor = new (
+  filePath: string,
+  options?: { readonly?: boolean },
+) => SqliteDatabase;
+
+const require = createRequire(import.meta.url);
+let cachedDatabaseSyncCtor: DatabaseSyncCtor | null | undefined;
+
+function getDatabaseSyncCtor(): DatabaseSyncCtor | null {
+  if (cachedDatabaseSyncCtor !== undefined) {
+    return cachedDatabaseSyncCtor;
+  }
+
+  try {
+    const mod = require("node:sqlite") as { DatabaseSync?: DatabaseSyncCtor };
+    cachedDatabaseSyncCtor =
+      typeof mod.DatabaseSync === "function" ? mod.DatabaseSync : null;
+  } catch {
+    cachedDatabaseSyncCtor = null;
+  }
+
+  return cachedDatabaseSyncCtor;
+}
+
+function getCodexStateDbPath(homeDir = os.homedir()): string | null {
+  const codexDir = path.join(homeDir, ".codex");
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(codexDir);
+  } catch {
+    return null;
+  }
+
+  const candidates = entries
+    .map((entry) => {
+      const match = /^state_(\d+)\.sqlite$/.exec(entry);
+      if (!match) return null;
+      return {
+        filePath: path.join(codexDir, entry),
+        version: Number.parseInt(match[1] ?? "", 10),
+      };
+    })
+    .filter(
+      (candidate): candidate is { filePath: string; version: number } =>
+        candidate !== null && Number.isFinite(candidate.version),
+    )
+    .sort((left, right) => right.version - left.version);
+
+  return candidates[0]?.filePath ?? null;
+}
+
+function resolveCodexSessionFileFromStateDb(
+  sessionId: string,
+  homeDir = os.homedir(),
+): string | null {
+  const dbPath = getCodexStateDbPath(homeDir);
+  if (!dbPath || !fs.existsSync(dbPath)) {
+    return null;
+  }
+
+  const DatabaseSync = getDatabaseSyncCtor();
+  if (!DatabaseSync) {
+    return null;
+  }
+
+  let db: SqliteDatabase | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readonly: true });
+    const row = db
+      .prepare(
+        `
+      SELECT rollout_path
+      FROM threads
+      WHERE id = ? AND archived = 0
+      LIMIT 1
+    `,
+      )
+      .get(sessionId) as { rollout_path?: string } | undefined;
+    return typeof row?.rollout_path === "string" && row.rollout_path.length > 0
+      ? row.rollout_path
+      : null;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
 function getObject(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function getString(value: unknown): string | undefined {
@@ -42,10 +151,13 @@ function buildEvent(
   };
 }
 
-function buildClaudeStopReasonState(stopReason: unknown): TelemetryTurnState | undefined {
+function buildClaudeStopReasonState(
+  stopReason: unknown,
+): TelemetryTurnState | undefined {
   if (stopReason === "end_turn") return "turn_complete";
   if (stopReason === "tool_use") return "tool_pending";
-  if (typeof stopReason === "string" && stopReason.length > 0) return "turn_aborted";
+  if (typeof stopReason === "string" && stopReason.length > 0)
+    return "turn_aborted";
   return undefined;
 }
 
@@ -58,6 +170,10 @@ export function checkTurnComplete(
   type: SessionType,
   tailBytes = 131072,
 ): CompletionSignal {
+  if (type === "opencode") {
+    return { completed: false };
+  }
+
   let content: string;
   try {
     const stat = fs.statSync(filePath);
@@ -65,18 +181,23 @@ export function checkTurnComplete(
     if (size === 0) return { completed: false };
 
     const fd = fs.openSync(filePath, "r");
-    const readSize = Math.min(tailBytes, size);
-    const buf = Buffer.alloc(readSize);
-    fs.readSync(fd, buf, 0, readSize, size - readSize);
-    fs.closeSync(fd);
-    content = buf.toString("utf-8");
+    try {
+      const readSize = Math.min(tailBytes, size);
+      const buf = Buffer.alloc(readSize);
+      fs.readSync(fd, buf, 0, readSize, size - readSize);
+      content = buf.toString("utf-8");
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     return { completed: false };
   }
 
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
 
-  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+  const startIndex =
+    type === "wuu" || type === "kimi" ? 0 : Math.max(0, lines.length - 5);
+  for (let i = lines.length - 1; i >= startIndex; i--) {
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(lines[i]);
@@ -107,9 +228,87 @@ export function checkTurnComplete(
         return { completed: true };
       }
     }
+
+    if (type === "wuu") {
+      const role = getString(parsed.role);
+      if (role === "meta" || role === "system") {
+        continue;
+      }
+      if (role === "assistant") {
+        const toolCalls = Array.isArray(parsed.tool_calls)
+          ? parsed.tool_calls
+          : [];
+        if (toolCalls.length > 0) {
+          return { completed: false };
+        }
+        return {
+          completed: extractTextContent(parsed.content).trim().length > 0,
+        };
+      }
+      if (role === "tool" || role === "user") {
+        return { completed: false };
+      }
+    }
+
+    if (type === "kimi") {
+      const role = getString(parsed.role);
+      if (role === "system") {
+        continue;
+      }
+      if (role === "assistant") {
+        const toolCalls = Array.isArray(parsed.tool_calls)
+          ? parsed.tool_calls
+          : [];
+        if (toolCalls.length > 0) {
+          return { completed: false };
+        }
+        return {
+          completed: extractTextContent(parsed.content).trim().length > 0,
+        };
+      }
+      if (role === "tool" || role === "user") {
+        return { completed: false };
+      }
+    }
   }
 
   return { completed: false };
+}
+
+function resolveKimiSessionFile(sessionId: string, cwd: string): string | null {
+  const home = os.homedir();
+  const metadataPath = path.join(home, ".kimi", "kimi.json");
+  try {
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as {
+      work_dirs?: Array<{ path: string; sessions_dir?: string }>;
+    };
+    const workDirs = metadata.work_dirs ?? [];
+    for (const wd of workDirs) {
+      if (wd.path === cwd && wd.sessions_dir) {
+        const filePath = path.join(wd.sessions_dir, sessionId, "context.jsonl");
+        if (fs.existsSync(filePath)) {
+          return filePath;
+        }
+      }
+    }
+    // Fallback: compute sessions_dir from path hash (matches kimi-cli logic)
+    const crypto = require("node:crypto");
+    const pathMd5 = crypto.createHash("md5").update(cwd).digest("hex");
+    const fallbackPath = path.join(
+      home,
+      ".kimi",
+      "sessions",
+      pathMd5,
+      sessionId,
+      "context.jsonl",
+    );
+    if (fs.existsSync(fallbackPath)) {
+      return fallbackPath;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 export function toClaudeProjectKey(cwd: string): string {
@@ -125,10 +324,24 @@ export function resolveSessionFile(
 
   if (type === "claude") {
     const projectKey = toClaudeProjectKey(cwd);
-    return path.join(home, ".claude", "projects", projectKey, sessionId + ".jsonl");
+    return path.join(
+      home,
+      ".claude",
+      "projects",
+      projectKey,
+      sessionId + ".jsonl",
+    );
   }
 
   if (type === "codex") {
+    // Codex can emit SessionStart before the JSONL is created. The state db
+    // already knows the eventual rollout_path, which lets watchers attach to
+    // the parent directory immediately instead of failing one-shot resolution.
+    const fromStateDb = resolveCodexSessionFileFromStateDb(sessionId, home);
+    if (fromStateDb) {
+      return fromStateDb;
+    }
+
     const sessionsDir = path.join(home, ".codex", "sessions");
     try {
       const now = new Date();
@@ -144,9 +357,24 @@ export function resolveSessionFile(
         if (match) return path.join(dayDir, match);
       }
     } catch (err) {
-      console.warn(`[SessionWatcher] codex resolveSessionFile error for session=${sessionId}:`, err);
+      console.warn(
+        `[SessionWatcher] codex resolveSessionFile error for session=${sessionId}:`,
+        err,
+      );
     }
     return null;
+  }
+
+  if (type === "wuu") {
+    return path.join(cwd, ".wuu", "sessions", sessionId + ".jsonl");
+  }
+
+  if (type === "kimi") {
+    return resolveKimiSessionFile(sessionId, cwd);
+  }
+
+  if (type === "opencode") {
+    return resolveOpenCodeSessionFile(sessionId, cwd);
   }
 
   return null;
@@ -163,7 +391,7 @@ export function parseSessionTelemetryLine(
     return [];
   }
 
-  const at = typeof parsed.timestamp === "string" ? parsed.timestamp : undefined;
+  const at = getString(parsed.timestamp) ?? getString(parsed.at);
 
   if (type === "claude") {
     const events: NormalizedSessionTelemetryEvent[] = [];
@@ -175,24 +403,29 @@ export function parseSessionTelemetryLine(
         if (!block || typeof block !== "object") continue;
         const entry = block as Record<string, unknown>;
         if (entry.type === "thinking") {
-          events.push(buildEvent({
-            at,
-            event_type: "thinking",
-            role: "assistant",
-            turn_state: "thinking",
-            meaningful_progress: true,
-          }));
+          events.push(
+            buildEvent({
+              at,
+              event_type: "thinking",
+              role: "assistant",
+              turn_state: "thinking",
+              meaningful_progress: true,
+            }),
+          );
           continue;
         }
         if (entry.type === "tool_use") {
-          events.push(buildEvent({
-            at,
-            event_type: "tool_use",
-            role: "assistant",
-            tool_name: typeof entry.name === "string" ? entry.name : undefined,
-            turn_state: "tool_running",
-            meaningful_progress: true,
-          }));
+          events.push(
+            buildEvent({
+              at,
+              event_type: "tool_use",
+              role: "assistant",
+              tool_name:
+                typeof entry.name === "string" ? entry.name : undefined,
+              turn_state: "tool_running",
+              meaningful_progress: true,
+            }),
+          );
           continue;
         }
         const text =
@@ -202,36 +435,49 @@ export function parseSessionTelemetryLine(
               ? entry.content
               : "";
         if (text.trim().length > 0) {
-          events.push(buildEvent({
+          events.push(
+            buildEvent({
+              at,
+              event_type: "assistant_message",
+              role: "assistant",
+              turn_state: "in_turn",
+              meaningful_progress: true,
+            }),
+          );
+        }
+      }
+
+      if (
+        events.length === 0 &&
+        extractTextContent(message?.content).trim().length > 0
+      ) {
+        events.push(
+          buildEvent({
             at,
             event_type: "assistant_message",
             role: "assistant",
             turn_state: "in_turn",
             meaningful_progress: true,
-          }));
-        }
-      }
-
-      if (events.length === 0 && extractTextContent(message?.content).trim().length > 0) {
-        events.push(buildEvent({
-          at,
-          event_type: "assistant_message",
-          role: "assistant",
-          turn_state: "in_turn",
-          meaningful_progress: true,
-        }));
+          }),
+        );
       }
 
       const stopState = buildClaudeStopReasonState(stopReason);
       if (stopState) {
-        events.push(buildEvent({
-          at,
-          event_type: stopState === "turn_complete" ? "turn_complete" : "assistant_stop",
-          event_subtype: typeof stopReason === "string" ? stopReason : undefined,
-          role: "assistant",
-          turn_state: stopState,
-          meaningful_progress: stopState === "turn_complete",
-        }));
+        events.push(
+          buildEvent({
+            at,
+            event_type:
+              stopState === "turn_complete"
+                ? "turn_complete"
+                : "assistant_stop",
+            event_subtype:
+              typeof stopReason === "string" ? stopReason : undefined,
+            role: "assistant",
+            turn_state: stopState,
+            meaningful_progress: stopState === "turn_complete",
+          }),
+        );
       }
       return events;
     }
@@ -244,20 +490,22 @@ export function parseSessionTelemetryLine(
         const entry = block as Record<string, unknown>;
         if (entry.type !== "tool_result") continue;
         const toolUseResult = getObject(parsed.toolUseResult);
-        events.push(buildEvent({
-          at,
-          event_type: "tool_result",
-          role: "user",
-          event_subtype:
-            typeof toolUseResult?.status === "string"
-              ? toolUseResult.status
-              : undefined,
-          turn_state:
-            toolUseResult?.status === "async_launched"
-              ? "tool_running"
-              : "in_turn",
-          meaningful_progress: true,
-        }));
+        events.push(
+          buildEvent({
+            at,
+            event_type: "tool_result",
+            role: "user",
+            event_subtype:
+              typeof toolUseResult?.status === "string"
+                ? toolUseResult.status
+                : undefined,
+            turn_state:
+              toolUseResult?.status === "async_launched"
+                ? "tool_running"
+                : "in_turn",
+            meaningful_progress: true,
+          }),
+        );
       }
       return events;
     }
@@ -292,6 +540,174 @@ export function parseSessionTelemetryLine(
           at,
           event_type: "progress",
           role: "system",
+        }),
+      ];
+    }
+
+    return [];
+  }
+
+  if (type === "wuu") {
+    const role = getString(parsed.role);
+    if (role === "user") {
+      const text = extractTextContent(parsed.content);
+      if (!text.trim()) return [];
+      return [
+        buildEvent({
+          at,
+          event_type: "user_message",
+          role: "user",
+          turn_state: "in_turn",
+        }),
+      ];
+    }
+
+    if (role === "assistant") {
+      const events: NormalizedSessionTelemetryEvent[] = [];
+      const toolCalls = Array.isArray(parsed.tool_calls)
+        ? parsed.tool_calls
+        : [];
+
+      for (const callEntry of toolCalls) {
+        const call = getObject(callEntry);
+        if (!call) continue;
+        events.push(
+          buildEvent({
+            at,
+            event_type: "tool_use",
+            role: "assistant",
+            tool_name: getString(call.name),
+            call_id: getString(call.id),
+            lifecycle: "start",
+            turn_state: "tool_running",
+            meaningful_progress: true,
+          }),
+        );
+      }
+
+      const text = extractTextContent(parsed.content);
+      if (text.trim()) {
+        events.push(
+          buildEvent({
+            at,
+            event_type: "assistant_message",
+            role: "assistant",
+            turn_state: "turn_complete",
+            meaningful_progress: true,
+          }),
+        );
+      }
+
+      return events;
+    }
+
+    if (role === "tool") {
+      return [
+        buildEvent({
+          at,
+          event_type: "tool_result",
+          role: "tool",
+          tool_name: getString(parsed.name),
+          call_id: getString(parsed.tool_call_id),
+          lifecycle: "end",
+          turn_state: "in_turn",
+          meaningful_progress: true,
+        }),
+      ];
+    }
+
+    if (role === "system") {
+      const content = extractTextContent(parsed.content).trim();
+      if (!content) return [];
+      let eventType = "system_message";
+      if (content.includes("worker spawned")) {
+        eventType = "worker_spawned";
+      } else if (content.includes("worker completed")) {
+        eventType = "worker_completed";
+      } else if (content.includes("worker failed")) {
+        eventType = "worker_failed";
+      }
+      return [
+        buildEvent({
+          at,
+          event_type: eventType,
+          role: "system",
+          meaningful_progress: true,
+        }),
+      ];
+    }
+
+    return [];
+  }
+
+  if (type === "kimi") {
+    const role = getString(parsed.role);
+    if (role === "user") {
+      const text = extractTextContent(parsed.content);
+      if (!text.trim()) return [];
+      return [
+        buildEvent({
+          at,
+          event_type: "user_message",
+          role: "user",
+          turn_state: "in_turn",
+        }),
+      ];
+    }
+
+    if (role === "assistant") {
+      const events: NormalizedSessionTelemetryEvent[] = [];
+      const toolCalls = Array.isArray(parsed.tool_calls)
+        ? parsed.tool_calls
+        : [];
+
+      for (const callEntry of toolCalls) {
+        const call = getObject(callEntry);
+        if (!call) continue;
+        // call.function is unknown — need to narrow to a record
+        // before reaching for `.name`, otherwise TS balks.
+        const fn = getObject(call.function);
+        events.push(
+          buildEvent({
+            at,
+            event_type: "tool_use",
+            role: "assistant",
+            tool_name: getString(fn?.name) ?? getString(call.name),
+            call_id: getString(call.id),
+            lifecycle: "start",
+            turn_state: "tool_running",
+            meaningful_progress: true,
+          }),
+        );
+      }
+
+      const text = extractTextContent(parsed.content);
+      if (text.trim()) {
+        events.push(
+          buildEvent({
+            at,
+            event_type: "assistant_message",
+            role: "assistant",
+            turn_state: toolCalls.length > 0 ? "in_turn" : "turn_complete",
+            meaningful_progress: true,
+          }),
+        );
+      }
+
+      return events;
+    }
+
+    if (role === "tool") {
+      return [
+        buildEvent({
+          at,
+          event_type: "tool_result",
+          role: "tool",
+          tool_name: getString(parsed.name),
+          call_id: getString(parsed.tool_call_id),
+          lifecycle: "end",
+          turn_state: "in_turn",
+          meaningful_progress: true,
         }),
       ];
     }
@@ -362,8 +778,12 @@ export function parseSessionTelemetryLine(
       const tokenTotal =
         (typeof totals?.input_tokens === "number" ? totals.input_tokens : 0) +
         (typeof totals?.output_tokens === "number" ? totals.output_tokens : 0) +
-        (typeof totals?.cached_input_tokens === "number" ? totals.cached_input_tokens : 0) +
-        (typeof totals?.reasoning_output_tokens === "number" ? totals.reasoning_output_tokens : 0);
+        (typeof totals?.cached_input_tokens === "number"
+          ? totals.cached_input_tokens
+          : 0) +
+        (typeof totals?.reasoning_output_tokens === "number"
+          ? totals.reasoning_output_tokens
+          : 0);
       return [
         buildEvent({
           at,
@@ -467,9 +887,9 @@ export function parseSessionTelemetryLine(
     if (payloadType === "mcp_tool_call_begin") {
       const invocation = getObject(payload.invocation);
       const toolName =
-        getString(invocation?.tool)
-        ?? getString(payload.tool_name)
-        ?? "mcp_tool";
+        getString(invocation?.tool) ??
+        getString(payload.tool_name) ??
+        "mcp_tool";
       return [
         buildEvent({
           at,
@@ -485,9 +905,9 @@ export function parseSessionTelemetryLine(
     if (payloadType === "mcp_tool_call_end") {
       const invocation = getObject(payload.invocation);
       const toolName =
-        getString(invocation?.tool)
-        ?? getString(payload.tool_name)
-        ?? "mcp_tool";
+        getString(invocation?.tool) ??
+        getString(payload.tool_name) ??
+        "mcp_tool";
       return [
         buildEvent({
           at,
@@ -570,9 +990,10 @@ export function parseSessionTelemetryLine(
       ];
     }
     if (payloadType === "message") {
-      const role = payload.role === "assistant" || payload.role === "user"
-        ? payload.role
-        : undefined;
+      const role =
+        payload.role === "assistant" || payload.role === "user"
+          ? payload.role
+          : undefined;
       return [
         buildEvent({
           at,
@@ -618,11 +1039,16 @@ export class SessionWatcher {
 
     const filePath = resolveSessionFile(sessionId, type, cwd);
     if (!filePath) {
-      console.warn(`[SessionWatcher] resolveSessionFile returned null for session=${sessionId} type=${type} cwd=${cwd}`);
+      console.warn(
+        `[SessionWatcher] resolveSessionFile returned null for session=${sessionId} type=${type} cwd=${cwd}`,
+      );
       return { ok: false, reason: "session-file-not-found" };
     }
 
-    console.log(`[SessionWatcher] watch session=${sessionId} type=${type} file=${filePath}`);
+    if (isDev)
+      console.log(
+        `[SessionWatcher] watch session=${sessionId} type=${type} file=${filePath}`,
+      );
 
     const dir = path.dirname(filePath);
     const basename = path.basename(filePath);
@@ -631,7 +1057,10 @@ export class SessionWatcher {
       try {
         fs.mkdirSync(dir, { recursive: true });
       } catch (err) {
-        console.error(`[SessionWatcher] failed to create directory ${dir}:`, err);
+        console.error(
+          `[SessionWatcher] failed to create directory ${dir}:`,
+          err,
+        );
         return { ok: false, reason: "dir-create-failed" };
       }
     }
@@ -639,8 +1068,7 @@ export class SessionWatcher {
     let lastNotifiedMtime = 0;
     try {
       lastNotifiedMtime = fs.statSync(filePath).mtimeMs;
-    } catch {
-    }
+    } catch {}
 
     let debounceTimer: NodeJS.Timeout | null = null;
     let awaitingNewTurn = false;
@@ -659,12 +1087,19 @@ export class SessionWatcher {
       // Always update mtime to avoid re-checking the same file state
       entry.lastNotifiedMtime = currentMtime;
 
-      const result = checkTurnComplete(filePath, type);
-      console.log(`[SessionWatcher] checkTurnComplete source=${source} session=${sessionId} completed=${result.completed} awaitingNewTurn=${awaitingNewTurn}`);
+      const result =
+        type === "opencode"
+          ? { completed: checkOpenCodeTurnComplete(filePath, sessionId) }
+          : checkTurnComplete(filePath, type);
+      if (isDev)
+        console.log(
+          `[SessionWatcher] checkTurnComplete source=${source} session=${sessionId} completed=${result.completed} awaitingNewTurn=${awaitingNewTurn}`,
+        );
       if (result.completed) {
         if (!awaitingNewTurn) {
           awaitingNewTurn = true;
-          console.log(`[SessionWatcher] completed session=${sessionId}`);
+          if (isDev)
+            console.log(`[SessionWatcher] completed session=${sessionId}`);
           callback();
           return true;
         }
@@ -676,9 +1111,19 @@ export class SessionWatcher {
     };
 
     const watcher = fs.watch(dir, (event, changedFile) => {
-      if (changedFile && changedFile !== basename) return;
+      if (changedFile) {
+        const changed = String(changedFile);
+        if (type === "opencode") {
+          if (!changed.startsWith(basename)) return;
+        } else if (changed !== basename) {
+          return;
+        }
+      }
 
-      console.log(`[SessionWatcher] fs.watch event=${event} file=${changedFile} session=${sessionId}`);
+      if (isDev)
+        console.log(
+          `[SessionWatcher] fs.watch event=${event} file=${changedFile} session=${sessionId}`,
+        );
 
       let newMtime = 0;
       try {
@@ -707,7 +1152,10 @@ export class SessionWatcher {
       const entry = this.entries.get(sessionId);
       if (!entry) return;
 
-      console.log(`[SessionWatcher] starting fallback polling for session=${sessionId}`);
+      if (isDev)
+        console.log(
+          `[SessionWatcher] starting fallback polling for session=${sessionId}`,
+        );
       entry.pollTimer = setInterval(() => {
         if (!this.entries.has(sessionId)) {
           const e = this.entries.get(sessionId);
@@ -729,9 +1177,15 @@ export class SessionWatcher {
     // Mark awaitingNewTurn so we don't re-fire for the same completion, but
     // still fire the callback so the renderer knows the current state.
     if (lastNotifiedMtime > 0) {
-      const result = checkTurnComplete(filePath, type);
+      const result =
+        type === "opencode"
+          ? { completed: checkOpenCodeTurnComplete(filePath, sessionId) }
+          : checkTurnComplete(filePath, type);
       if (result.completed) {
-        console.log(`[SessionWatcher] initial check: already completed session=${sessionId}`);
+        if (isDev)
+          console.log(
+            `[SessionWatcher] initial check: already completed session=${sessionId}`,
+          );
         awaitingNewTurn = true;
         callback();
       }
@@ -743,7 +1197,7 @@ export class SessionWatcher {
   unwatch(sessionId: string): void {
     const entry = this.entries.get(sessionId);
     if (!entry) return;
-    console.log(`[SessionWatcher] unwatch session=${sessionId}`);
+    if (isDev) console.log(`[SessionWatcher] unwatch session=${sessionId}`);
     entry.watcher.close();
     if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
     if (entry.pollTimer) {

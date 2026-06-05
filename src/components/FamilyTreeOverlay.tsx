@@ -1,28 +1,23 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import type { ProjectData, TerminalData } from "../types";
-import { getRenderableTerminalLayouts } from "../canvas/sceneState";
-import { useProjectStore, findTerminalById, getChildTerminals } from "../stores/projectStore";
+import {
+  useProjectStore,
+  findTerminalById,
+  getChildTerminals,
+} from "../stores/projectStore";
 import {
   useCanvasStore,
-  RIGHT_PANEL_WIDTH,
   COLLAPSED_TAB_WIDTH,
 } from "../stores/canvasStore";
-import {
-  PROJ_PAD,
-  PROJ_TITLE_H,
-  WT_PAD,
-  WT_TITLE_H,
-} from "../layout";
+import { usePinStore } from "../stores/pinStore";
 import { panToTerminal } from "../utils/panToTerminal";
 import { useT } from "../i18n/useT";
 import {
   canvasPointToScreenPoint,
   getCanvasLeftInset,
 } from "../canvas/viewportBounds";
-import {
-  useResolvedTerminalRuntimeState,
-} from "../stores/terminalRuntimeStateStore";
+import { useResolvedTerminalRuntimeState } from "../stores/terminalRuntimeStateStore";
 
 const TYPE_COLORS: Record<string, string> = {
   shell: "#888",
@@ -30,7 +25,8 @@ const TYPE_COLORS: Record<string, string> = {
   codex: "#7928ca",
   kimi: "#0070f3",
   gemini: "#4285f4",
-  opencode: "#50e3c2",
+  opencode: "var(--opencode-color)",
+  wuu: "#ff6b9d",
   lazygit: "#e84d31",
   tmux: "#1bb91f",
 };
@@ -77,7 +73,7 @@ function FamilyTreeNodeRow({
   return (
     <button
       key={liveTerminal.id}
-      className={`w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--border)] transition-colors duration-100 ${
+      className={`w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--border)] transition-colors duration-quick ${
         isHovered ? "bg-[var(--border)]" : ""
       }`}
       onClick={() => {
@@ -107,7 +103,10 @@ function FamilyTreeNodeRow({
   );
 }
 
-function buildFamilyTree(projects: ProjectData[], terminalId: string): TreeNode[] {
+function buildFamilyTree(
+  projects: ProjectData[],
+  terminalId: string,
+): TreeNode[] {
   const nodes: TreeNode[] = [];
   const visited = new Set<string>();
 
@@ -144,17 +143,13 @@ function getTerminalAbsolutePosition(
 ): { x: number; y: number; w: number; h: number } | null {
   for (const p of projects) {
     for (const w of p.worktrees) {
-      const layout = getRenderableTerminalLayouts(w).find(
-        ({ terminal }) => terminal.id === terminalId,
-      );
-      if (!layout) continue;
-      const { item } = layout;
-
+      const terminal = w.terminals.find((t) => t.id === terminalId);
+      if (!terminal) continue;
       return {
-        x: p.position.x + PROJ_PAD + w.position.x + WT_PAD + item.x,
-        y: p.position.y + PROJ_TITLE_H + PROJ_PAD + w.position.y + WT_TITLE_H + WT_PAD + item.y,
-        w: item.w,
-        h: item.h,
+        x: terminal.x,
+        y: terminal.y,
+        w: terminal.width,
+        h: terminal.height,
       };
     }
   }
@@ -166,8 +161,10 @@ export function FamilyTreeOverlay() {
   const projects = useProjectStore((s) => s.projects);
   const viewport = useCanvasStore((s) => s.viewport);
   const rightPanelCollapsed = useCanvasStore((s) => s.rightPanelCollapsed);
+  const rightPanelWidth = useCanvasStore((s) => s.rightPanelWidth);
   const leftPanelCollapsed = useCanvasStore((s) => s.leftPanelCollapsed);
   const leftPanelWidth = useCanvasStore((s) => s.leftPanelWidth);
+  const taskDrawerOpen = usePinStore((s) => s.openProjectPath !== null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [visibleId, setVisibleId] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -181,7 +178,8 @@ export function FamilyTreeOverlay() {
       setHoveredId(terminalId);
     };
     window.addEventListener("termcanvas:terminal-hover", handler);
-    return () => window.removeEventListener("termcanvas:terminal-hover", handler);
+    return () =>
+      window.removeEventListener("termcanvas:terminal-hover", handler);
   }, []);
 
   useEffect(() => {
@@ -193,7 +191,8 @@ export function FamilyTreeOverlay() {
     if (hoveredId) {
       const info = findTerminalById(projects, hoveredId);
       const children = getChildTerminals(projects, hoveredId);
-      const hasConnections = info?.terminal.parentTerminalId || children.length > 0;
+      const hasConnections =
+        info?.terminal.parentTerminalId || children.length > 0;
 
       if (hasConnections) {
         timerRef.current = setTimeout(() => {
@@ -236,8 +235,12 @@ export function FamilyTreeOverlay() {
 
   const panelWidth = rightPanelCollapsed
     ? COLLAPSED_TAB_WIDTH
-    : RIGHT_PANEL_WIDTH;
-  const leftInset = getCanvasLeftInset(leftPanelCollapsed, leftPanelWidth);
+    : rightPanelWidth;
+  const leftInset = getCanvasLeftInset(
+    leftPanelCollapsed,
+    leftPanelWidth,
+    taskDrawerOpen,
+  );
   const safeLeft = leftInset + OVERLAY_MARGIN;
   const safeTop = TOOLBAR_HEIGHT + OVERLAY_MARGIN;
   const safeRight = Math.max(
@@ -252,6 +255,7 @@ export function FamilyTreeOverlay() {
     viewport,
     leftPanelCollapsed,
     leftPanelWidth,
+    taskDrawerOpen,
   );
   const anchorLeft = anchorScreenPoint.x;
   const anchorTop = anchorScreenPoint.y;
@@ -259,7 +263,10 @@ export function FamilyTreeOverlay() {
   const preferredY = anchorTop;
 
   const measured = overlayRef.current?.getBoundingClientRect();
-  const overlayW = Math.min(OVERLAY_MAX_WIDTH, measured?.width ?? OVERLAY_MAX_WIDTH);
+  const overlayW = Math.min(
+    OVERLAY_MAX_WIDTH,
+    measured?.width ?? OVERLAY_MAX_WIDTH,
+  );
   const overlayH = measured?.height ?? OVERLAY_FALLBACK_HEIGHT;
 
   const fitsRight = anchorRight + OVERLAY_GAP + overlayW <= safeRight;
@@ -286,7 +293,9 @@ export function FamilyTreeOverlay() {
         overflowY: "auto",
         animation: "fadeIn 0.15s ease",
       }}
-      onMouseEnter={() => { overlayHovered.current = true; }}
+      onMouseEnter={() => {
+        overlayHovered.current = true;
+      }}
       onMouseLeave={() => {
         overlayHovered.current = false;
         setVisibleId(null);

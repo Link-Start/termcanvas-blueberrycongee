@@ -7,6 +7,7 @@
 **Your terminals, on an infinite canvas.**
 
 [![GitHub release](https://img.shields.io/github/v/release/blueberrycongee/termcanvas)](https://github.com/blueberrycongee/termcanvas/releases)
+[![Downloads](https://img.shields.io/github/downloads/blueberrycongee/termcanvas/total?label=downloads)](https://github.com/blueberrycongee/termcanvas/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)]()
 [![Website](https://img.shields.io/badge/website-termcanvas-e8b840)](https://website-ten-mu-37.vercel.app)
@@ -19,7 +20,11 @@
 
 <br>
 
-<img src="docs/image.png?v=2" alt="TermCanvas demo — multiple AI agents on an infinite canvas" />
+<img src="docs/hero-canvas.png" alt="TermCanvas — multiple AI agents arranged on an infinite canvas" />
+
+<br><br>
+
+<img src="docs/hero-hub.png" alt="TermCanvas Hub — knowledge graph view with sessions sidebar" />
 
 </div>
 
@@ -31,11 +36,19 @@ It organizes everything in a **Project → Worktree → Terminal** hierarchy tha
 
 <p align="right"><a href="./README.zh-CN.md">中文文档 →</a></p>
 
+> **New to TermCanvas?** Read the full [**User Guide**](./docs/user-guide.md) — every interaction explained, every keyboard shortcut, plus the non-obvious tricks (⌘E focus chain, drag-to-stash, session replay, etc.).
+
 ---
 
 ## Quick Start
 
 **Download** — grab the latest build from [GitHub Releases](https://github.com/blueberrycongee/termcanvas/releases).
+
+> [!IMPORTANT]
+> **Apple Silicon (M-series) Macs — pick the file with `arm64` in its name**
+> Files **with** `arm64` in the filename (e.g. `TermCanvas-X.Y.Z-arm64.dmg`, `TermCanvas-X.Y.Z-arm64-mac.zip`) are native Apple Silicon builds. Files **without** `arm64` are Intel (x64) builds — they'll still launch on M-series Macs via Rosetta 2, but you'll see noticeable lag when panning/zooming the canvas.
+>
+> To verify after install: open **Activity Monitor**, find TermCanvas, and check the **Kind** column — it should say **Apple**, not **Intel**. If it says Intel, delete the app and redownload the `arm64` variant.
 
 > [!WARNING]
 > **macOS note for unsigned builds**
@@ -49,14 +62,18 @@ It organizes everything in a **Project → Worktree → Terminal** hierarchy tha
 
 **Build from source:**
 
+This workspace uses `pnpm`, and `pnpm-lock.yaml` is the canonical lockfile.
+
 ```bash
 git clone https://github.com/blueberrycongee/termcanvas.git
 cd termcanvas
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 **Install CLI tools** — after launching the app, go to Settings → General → Command line interface and click Register. This adds `termcanvas` and `hydra` to your PATH.
+
+Registration also installs TermCanvas skills and lifecycle hooks for Claude/Codex. For Codex 0.129.0 and newer, TermCanvas writes the required hook trust state in `~/.codex/config.toml` so the generated hooks are reviewed/trusted and continue to emit terminal lifecycle and telemetry events.
 
 ---
 
@@ -66,32 +83,35 @@ npm run dev
 
 Infinite canvas — pan, zoom, and arrange terminals freely. Three-layer hierarchy: projects contain worktrees, worktrees contain terminals. New worktrees appear automatically as you create them.
 
-Double-click a terminal title bar to zoom-to-fit. Drag to reorder. Box-select multiple terminals. Save your entire layout to a `.termcanvas` file.
+Double-click a terminal title bar to zoom-to-fit. Drag to reorder. Box-select multiple terminals. Draw and annotate freely on the canvas itself with the Free Canvas tool — sketches, callouts, and grouping lines live alongside your terminals. Save your entire layout to a `.termcanvas` file.
 
 ### AI Coding Agents
 
 First-class support for **Claude Code**, **Codex**, **Kimi**, **Gemini**, and **OpenCode**.
 
-- **Live status & completion glow** — see at a glance whether an agent is working, waiting, or done
-- **Telemetry truth layer** — real-time turn state, tool activity, and progress tracking per agent; stall detection, advisory badges, and structured snapshots for both UI and Hydra
-- **Session resume** — close and reopen an agent terminal without losing context
-- **Inline diff cards** — review an agent's changes without leaving the canvas
+- **Glance at any tile to know what it's doing** — a coloured status dot tells you whether the agent is thinking, awaiting input, idle, or done
+- **Pick up where you left off** — close and reopen an agent terminal without losing the conversation
+- **Review changes in place** — inline diff cards let you read an agent's edits without leaving the canvas
+
+### Sessions Panel
+
+Every past Claude / Codex conversation in your projects, organised as projects → worktrees → sessions. Click any row to replay it, or jump straight to the running terminal. Worktrees show their live git status so you can tell at a glance what's clean.
 
 ### Git
 
-Built-in Git panel in the left sidebar — commit history, diff viewer, and git status at a glance without leaving the canvas.
+Commit history, diff viewer, and live git status — built into the sidebar so you never need to leave the canvas to check what changed.
 
 ### Terminals
 
-Shell, lazygit, and tmux terminals live alongside AI agents on the same canvas. Star important terminals and cycle through them with <kbd>⌘</kbd> <kbd>J</kbd> / <kbd>K</kbd>. Four size presets, customizable titles, per-agent CLI override.
+Shell, lazygit, and tmux terminals live alongside AI agents on the same canvas. Star the ones you keep coming back to (<kbd>⌘</kbd><kbd>F</kbd>) and cycle through just those with <kbd>⌘</kbd><kbd>]</kbd> / <kbd>⌘</kbd><kbd>[</kbd> — use <kbd>⌘</kbd><kbd>G</kbd> to choose whether you're cycling all terminals, just starred, or whole worktrees. Custom titles, per-agent CLI override, and your preferred terminal size is remembered after the first manual resize.
 
 ### Usage Tracking
 
-Token usage and cost dashboard — total spend, per-project and per-model breakdown. Hourly token heatmap, 24-hour cost sparkline, cache hit/miss stats. Quota monitor for 5-hour and 7-day rate limits. Sign in to sync usage across devices.
+Track how much you're spending on Claude and Codex — across all projects, broken down by model, with quota meters for the 5-hour and 7-day rate limits. Sign in to keep usage in sync across devices.
 
 ### Settings
 
-6 downloadable monospace fonts · dark/light theme · customizable keyboard shortcuts · minimum contrast ratio for accessibility · English and Chinese (auto-detected) · auto-update with in-app changelog.
+Downloadable monospace fonts · dark / light theme · rebindable keyboard shortcuts · adjustable contrast for accessibility · English and Chinese · in-app auto-update.
 
 ---
 
@@ -105,33 +125,30 @@ Both CLIs are bundled with the app. Register them from Settings to use in any te
 <summary>Full command reference</summary>
 
 ```
-Usage: termcanvas <project|terminal|telemetry|diff|state> <command> [args]
+Usage: termcanvas <group> <command> [args]
 
-Project commands:
-  project add <path>                          Add a project to the canvas
-  project list                                List all projects
-  project remove <id>                         Remove a project
-  project rescan <id>                         Rescan worktrees for a project
+Groups:
+  project        add | list | remove | rescan
+  worktree       list | create | remove
+  terminal       create | list | status | output | destroy | set-title
+  workflow       Lead-driven Hydra workflow over HTTP (init / dispatch / watch …)
+  telemetry      get | events
+  pin            add | list | show | update | rm
+  diff           <worktree-path> [--summary]
+  state          dump full canvas state as JSON
 
-Terminal commands:
-  terminal create --worktree <path> --type <type>   Create a terminal
+Common shapes:
+  project add <path>
+  worktree create --repo <path> --branch <name> [--from <ref>]
+  terminal create --worktree <path> --type <claude|codex|shell|…>
           [--prompt <text>] [--parent-terminal <id>] [--auto-approve]
-  terminal list [--worktree <path>]            List terminals
-  terminal status <id>                         Get terminal status
-  terminal output <id> [--lines N]             Read terminal output (default 50 lines)
-  terminal destroy <id>                        Destroy a terminal
-
-Telemetry commands:
-  telemetry get --terminal <id>                Get terminal telemetry snapshot
-  telemetry get --workflow <id> [--repo <p>]   Get workflow telemetry snapshot
-  telemetry events --terminal <id>             List recent terminal telemetry events
-
-Other commands:
-  diff <worktree-path> [--summary]             View git diff for a worktree
-  state                                        Dump full canvas state as JSON
+  terminal output <id> [--lines N]              # default 50
+  telemetry get --terminal <id>
+  telemetry get --workflow <id> --repo <path>
+  pin add --title <t> [--body <b>] [--link <url>] [--link-type <type>]
 
 Flags:
-  --json    Output in JSON format
+  --json    Machine-readable output for any command
 ```
 
 </details>
@@ -156,68 +173,76 @@ For Claude/Codex task automation, start a fresh terminal with `termcanvas termin
 
 <br>
 
-Hydra is TermCanvas's terminal orchestration framework for multi-agent workflows. It dispatches AI agents (Claude, Codex, Kimi, Gemini) into **isolated git worktrees**, coordinates them through **file-contract handoffs**, and monitors progress via a **telemetry truth layer** — all without controlling what happens inside each agent's session.
+Hydra is TermCanvas's terminal orchestration toolkit for Lead-driven workflows and isolated direct workers. It coordinates **git worktrees**, **assignment/run file contracts**, and the **telemetry truth layer** without taking control away from the agent sessions themselves.
 
-**Design philosophy:** each agent runs in its own terminal with a fresh context and full autonomy. Agents don't share conversation history — they share a **worktree** (code on disk) and **structured file contracts** (`handoff.json`, `task.md`, `result.json`, `done`). Terminal prose is not authoritative; validated files are the single source of truth. If a workflow fails, discard the worktree and start clean.
+Hydra is now **Lead-driven**. One main terminal owns the workbench, reads the codebase, and decides what to do at each decision point. Worker terminals stay autonomous. Workbench state lives under repo-local `.hydra/workbenches/`, and the authoritative contract is on disk: `inputs/intent.md`, `dispatches/<dispatchId>/intent.md`, `report.md`, `result.json`, and `ledger.jsonl`. Terminal prose is advisory only; validated `result.json` is the machine gate.
+
+Role-driven workflows currently target **Claude/Codex** through the Hydra role registry. If you only need one isolated worker without a Lead-driven DAG, use `hydra spawn` instead.
 
 This design is inspired by [Anthropic's harness design research](https://www.anthropic.com/engineering/harness-design-long-running-apps) on long-running agent orchestration, adapted for terminal-based agents where each process is naturally isolated. For the theoretical foundations behind this approach, see [Harness Design from a Distribution Perspective](harness-design-essay.md).
 
 #### Getting started
 
-Run `hydra init` in your project (or click **Enable Hydra** in the worktree header) to teach your AI agents how to use Hydra. Then just talk to your agent:
+Run `hydra init-repo` in your project (or click **Enable Hydra** in the worktree header) to sync the Hydra instructions into `CLAUDE.md` / `AGENTS.md`. Then either talk to your main agent, or drive the workflow yourself:
 
 > *Write a PRD or describe your requirements clearly, then tell the agent:*
 >
 > *"Read the Hydra skill. I want you to choose the right mode and autonomously complete this task based on the PRD in `docs/prd/auth-redesign.md`."*
 
-The agent reads the Hydra instructions in your project's `CLAUDE.md`, classifies the task, and picks the lightest fitting path:
+The main agent should classify the task and pick the lightest fitting path:
 
 - **Stay in current agent** — simple or local tasks, no orchestration overhead
 - **`hydra spawn`** — a direct isolated worker when the task is clear and self-contained
-- **`hydra run --template single-step`** — one implementer with file-contract gates and evidence
-- **`hydra run`** (default) — planner → implementer → evaluator pipeline with evaluator-to-implementer loops
-
-Each role can target a different provider (`--planner-type claude --implementer-type codex`), or inherit from the current terminal.
+- **`hydra init` + `dispatch` + `watch`** — Lead-driven workflow for ambiguous, risky, parallel, or multi-step work
 
 ```bash
-hydra init    # one-time setup: writes Hydra instructions into CLAUDE.md and AGENTS.md
+hydra init-repo
+
+hydra init --intent "Add OAuth login" --repo .
+
+hydra dispatch --workbench <id> --dispatch dev --role dev \
+  --intent "Implement OAuth login and the tests that cover it" --repo .
+
+hydra watch --workbench <id> --repo .
+
+hydra dispatch --workbench <id> --dispatch review --role reviewer \
+  --intent "Independent review of the OAuth change" \
+  --depends-on dev --repo .
+
+hydra watch --workbench <id> --repo .
+hydra complete --workbench <id> --repo .
 ```
+
+Role files choose the CLI / model / reasoning profile. The caller chooses the `role`; Hydra resolves the terminal from that role definition.
 
 <details>
 <summary>Full command reference</summary>
 
 ```
-Usage: hydra <run|tick|watch|status|retry|spawn|list|cleanup|init> [options]
+Usage: hydra <command> [options]
 
-Workflow commands:
-  run      Create and start a file-contract workflow
-           --task <desc>              Task description (required)
-           --repo <path>              Repository path (required)
-           --template <name>          single-step | planner-implementer-evaluator (default)
-           --all-type <type>          Force one agent type for all roles
-           --planner-type <type>      Planner agent type
-           --implementer-type <type>  Implementer agent type
-           --evaluator-type <type>    Evaluator agent type
-           --timeout-minutes <num>    Per-handoff timeout (default: 30)
-           --max-retries <num>        Automatic retry limit (default: 1)
-           --auto-approve             Run sub-agent in auto-approve mode
+Lead-driven workbench:
+  init        Create a workbench context
+  dispatch    Dispatch a unit of work into a workbench
+  watch       Wait until a decision point is reached
+  redispatch  Re-run an eligible/reset dispatch
+  approve     Mark a dispatch output as approved
+  reset       Reset a dispatch (and downstream by default) for rework
+  ask         Ask a completed dispatch a follow-up question via session resume
+  merge       Merge completed parallel dispatch branches
+  complete    Mark a workbench as completed
+  fail        Mark a workbench as failed
 
-  tick     Advance one workflow tick (collect result, dispatch next handoff)
-  watch    Poll a workflow until it reaches a terminal state
-  status   Show structured workflow status + telemetry advisory
-  retry    Retry a failed or timed-out workflow
+Inspection:
+  status      Show structured workbench + assignment state
+  ledger      Show workbench event log
+  list        List direct spawned agents (pass --workbenches for workbenches)
+  list-roles  Show available role definitions
 
-Worker commands:
-  spawn    Create one direct isolated worker terminal
-           --task <desc>              Task description (required)
-           --repo <path>              Repository path (required)
-           --worker-type <type>       Worker agent type
-           --base-branch <branch>     Base branch for the new worktree
-
-Management commands:
-  list     List all spawned agents
-  cleanup  Clean up agent worktrees and terminals
-  init     Add Hydra instructions to project CLAUDE.md and AGENTS.md
+Housekeeping:
+  spawn      Create one direct isolated worker terminal
+  cleanup    Clean up workbench state or direct spawned workers
+  init-repo  Sync Hydra instructions into CLAUDE.md and AGENTS.md
 ```
 
 </details>
@@ -226,58 +251,105 @@ Management commands:
 <summary>Example commands</summary>
 
 ```bash
-# Full workflow (planner → implementer → evaluator)
-hydra run --task "fix the login bug" --repo .
+# Repo setup
+hydra init-repo
 
-# Mixed providers by role
-hydra run --task "implement auth" --repo . \
-  --planner-type claude --implementer-type codex --evaluator-type claude
+# Start a Lead-driven workbench
+hydra init --intent "fix the login bug" --repo .
 
-# Single-step (one implementer, file gates only)
-hydra run --task "implement the API change" --repo . --template single-step
+# Dispatch a unit of work and wait for the decision point
+hydra dispatch --workbench <id> --dispatch dev --role dev \
+  --intent "Fix the login bug and add regression coverage" --repo .
+hydra watch --workbench <id> --repo .
+
+# Ask a completed dispatch a follow-up question without re-running it
+hydra ask --workbench <id> --dispatch dev \
+  --message "Why did you change the session validation path?" --repo .
+
+# Send a dispatch back for rework
+hydra reset --workbench <id> --dispatch dev \
+  --feedback "The fix regressed the refresh-token path. Rework it." --repo .
+hydra redispatch --workbench <id> --dispatch dev --repo .
 
 # Direct isolated worker
 hydra spawn --task "investigate the flaky CI failure" --repo .
 
-# Orchestration
-hydra watch --repo . --workflow <workflow-id>
-hydra status --repo . --workflow <workflow-id>
-hydra retry --repo . --workflow <workflow-id>
+# Inspection
+hydra status --workbench <id> --repo .
+hydra ledger --workbench <id> --repo .
+hydra list --workbenches --repo .
+hydra list-roles --repo .
 
 # Cleanup
-hydra cleanup --workflow <workflow-id> --repo . --force
+hydra cleanup --workbench <id> --repo . --force
 hydra cleanup <agent-id> --force
 ```
 
 </details>
 
-Workflows advance through validated `result.json` + `done` evidence inside `.hydra/workflows/`. The telemetry truth layer provides real-time `turn_state`, `last_meaningful_progress_at`, and `derived_status` — used by both the UI (badges, advisory views) and Hydra itself (stall detection, retry decisions).
+Lead-driven workbenches advance through validated `result.json` evidence inside `.hydra/workbenches/`. The telemetry truth layer provides real-time `turn_state`, `last_meaningful_progress_at`, `derived_status`, and session attachment data — used by both the UI and Hydra's watch / retry / health-check paths.
 
-**Typical workflow:** write a PRD → enable Hydra → let the main-brain agent choose the mode and orchestrate autonomously → monitor via `hydra watch` or the canvas UI → review the diff and merge. See [Hydra Orchestration Guide](docs/hydra-orchestration.md) for architecture, troubleshooting, and anti-patterns. For a visual overview of every mode, state machine, and system component, see the [Hydra Panoramic Flowchart](docs/hydra-panorama-flow.md).
+**Typical workflow:** write a PRD → run `hydra init-repo` once → let the Lead choose direct work vs `spawn` vs `init/dispatch/watch` → monitor via `hydra watch` or the canvas UI → read `report.md` before approving / resetting / completing. See [Hydra Orchestration Guide](docs/hydra-orchestration.md) for the control-plane details, and the [Hydra Panoramic Flowchart](docs/hydra-panorama-flow.md) for the updated state / file model.
 
 ---
 
-## Keyboard Shortcuts
+## Find your way around
 
-All shortcuts are customizable in Settings → Shortcuts. On Windows/Linux, the default app shortcuts use <kbd>Alt</kbd>.
+A short map of where each major feature lives. Every shortcut here is rebindable in **Settings → Shortcuts** (Windows/Linux uses <kbd>Alt</kbd> in place of <kbd>⌘</kbd>).
+
+**Discovery — when you don't know where something is**
+
+| Shortcut | Surface | What it's for |
+|---|---|---|
+| <kbd>⌘</kbd><kbd>P</kbd> | Command Palette | Run any in-app action by name (toggle a panel, open settings, switch theme, etc.) |
+| <kbd>⌘</kbd><kbd>K</kbd> | Global Search | Files, terminals, sessions, git branches/commits, memory — fuzzy across the canvas |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>J</kbd> | Hub | Right-anchored command center: live terminals, recent activity, waypoints, pinned items |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>/</kbd> | Status Digest | Quiet floating chip with the 3–5 most relevant signals across the canvas |
+
+**Canvas navigation**
 
 | Shortcut | Action |
-|----------|--------|
-| <kbd>⌘</kbd> <kbd>O</kbd> | Add project |
-| <kbd>⌘</kbd> <kbd>B</kbd> | Toggle sidebar |
-| <kbd>⌘</kbd> <kbd>/</kbd> | Toggle right panel (usage) |
-| <kbd>⌘</kbd> <kbd>T</kbd> | New terminal |
-| <kbd>⌘</kbd> <kbd>D</kbd> | Close focused terminal |
-| <kbd>⌘</kbd> <kbd>;</kbd> | Rename terminal title |
-| <kbd>⌘</kbd> <kbd>]</kbd> | Next terminal |
-| <kbd>⌘</kbd> <kbd>[</kbd> | Previous terminal |
-| <kbd>⌘</kbd> <kbd>E</kbd> | Unfocus / refocus last terminal |
-| <kbd>⌘</kbd> <kbd>F</kbd> | Star / unstar focused terminal |
-| <kbd>⌘</kbd> <kbd>J</kbd> | Next starred terminal |
-| <kbd>⌘</kbd> <kbd>K</kbd> | Previous starred terminal |
-| <kbd>⌘</kbd> <kbd>S</kbd> | Save workspace |
-| <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>S</kbd> | Save workspace as |
-| <kbd>⌘</kbd> <kbd>1</kbd>–<kbd>4</kbd> | Terminal size: default / wide / tall / large |
+|---|---|
+| <kbd>⌘</kbd><kbd>E</kbd> | Toggle focus — zoom into focused terminal / out to fit |
+| <kbd>⌘</kbd><kbd>0</kbd> · <kbd>⌘</kbd><kbd>1</kbd> · <kbd>⌘</kbd><kbd>=</kbd> · <kbd>⌘</kbd><kbd>-</kbd> | Zoom: fit · 100% · in · out |
+| <kbd>⌘</kbd><kbd>]</kbd> / <kbd>⌘</kbd><kbd>[</kbd> | Next / previous terminal (or worktree / starred — see <kbd>⌘</kbd><kbd>G</kbd>) |
+| <kbd>⌘</kbd><kbd>G</kbd> | Cycle focus level (terminal → worktree → starred) |
+| <kbd>⌘</kbd><kbd>F</kbd> | Star / unstar the focused terminal |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>1</kbd>–<kbd>9</kbd> · <kbd>⌥</kbd><kbd>1</kbd>–<kbd>9</kbd> | Save / recall a spatial waypoint (per project, 9 slots) |
+| <kbd>⌥</kbd><kbd>\`</kbd> | Pan to whichever terminal had output most recently (cycles on rapid re-press) |
+| <kbd>V</kbd> · <kbd>H</kbd> · <kbd>Space</kbd>(hold) | Select tool · Hand tool · Temporary pan |
+
+**Multi-canvas**
+
+| Shortcut | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>]</kbd> / <kbd>⌘</kbd><kbd>⇧</kbd><kbd>[</kbd> | Next / previous canvas (each canvas owns its viewport, projects, waypoints) |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>N</kbd> | Open Canvas Manager (rename, reorder, switch) |
+
+**Terminals**
+
+| Shortcut | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>T</kbd> · <kbd>⌘</kbd><kbd>D</kbd> | New / close terminal in the focused worktree |
+| <kbd>⌘</kbd><kbd>;</kbd> | Open composer (or inline-rename the focused terminal title) |
+
+**Panels & overlays**
+
+| Shortcut | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>/</kbd> | Toggle right panel (Files / Diff / Git / Memory) |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>U</kbd> | Usage dashboard (cost & quotas) |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>H</kbd> | Sessions overlay |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>T</kbd> | Snapshot history (browse and restore canvas states, with diff) |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>A</kbd> | Activity heatmap on the canvas |
+
+**Workspace**
+
+| Shortcut | Action |
+|---|---|
+| <kbd>⌘</kbd><kbd>O</kbd> | Add project |
+| <kbd>⌘</kbd><kbd>S</kbd> · <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> | Save / save-as a `.termcanvas` workspace file |
+| <kbd>⌘</kbd><kbd>,</kbd> | Settings |
 
 ---
 

@@ -14,6 +14,11 @@ interface SessionStore {
   replayError: string | null;
   setSessions: (sessions: SessionInfo[]) => void;
   loadReplay: (filePath: string) => Promise<void>;
+  forkSession: (
+    sourceFilePath: string,
+    turnIndex: number,
+    targetProvider?: "claude" | "codex",
+  ) => Promise<{ newSessionId: string; newFilePath: string }>;
   exitReplay: () => void;
   seekTo: (index: number) => void;
   stepForward: () => void;
@@ -53,6 +58,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       set({ replayError: err instanceof Error ? err.message : "Failed to load replay", panelView: "replay" });
     }
   },
+
+  forkSession: (sourceFilePath, turnIndex, targetProvider) =>
+    window.termcanvas.sessions.forkSession(
+      sourceFilePath,
+      turnIndex,
+      targetProvider,
+    ),
 
   exitReplay: () => set({ panelView: "list", replayTimeline: null, replayCurrentIndex: 0, replayIsPlaying: false, replayError: null }),
 

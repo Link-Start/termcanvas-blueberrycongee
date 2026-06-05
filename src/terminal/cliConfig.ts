@@ -84,6 +84,9 @@ export const TERMINAL_CONFIG: Record<TerminalType, TerminalAdapterConfig> = {
       resumeArgs: (id) => ["--resume", id],
       newArgs: () => [],
       autoApproveArgs: () => ["--dangerously-skip-permissions"],
+      // Claude's variadic options, such as --mcp-config, otherwise consume
+      // following positional prompts as additional option values.
+      promptArgs: (prompt) => ["--", prompt],
     },
     composer: {
       supportsComposer: true,
@@ -166,6 +169,25 @@ export const TERMINAL_CONFIG: Record<TerminalType, TerminalAdapterConfig> = {
       supportsImages: true,
       pasteKeySequence: () => "",
       imageFallback: "image-path",
+      pasteDelayMs: 120,
+      pasteStrategy: "separate",
+    },
+  },
+  wuu: {
+    type: "wuu",
+    launch: {
+      shell: "wuu",
+      resumeArgs: (id) => ["--resume", id],
+      newArgs: () => [],
+      promptArgs: (prompt) => ["run", prompt],
+    },
+    composer: {
+      supportsComposer: true,
+      allowedStatuses: INTERACTIVE_STATUSES,
+      inputMode: "bracketed-paste",
+      supportsImages: false,
+      pasteKeySequence: () => "",
+      imageFallback: "error",
       pasteDelayMs: 120,
       pasteStrategy: "separate",
     },

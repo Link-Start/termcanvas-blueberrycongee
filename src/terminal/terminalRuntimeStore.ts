@@ -1,14 +1,40 @@
 import { create } from "zustand";
 import * as xtermModule from "@xterm/xterm";
-import type { Terminal as XtermTerminal } from "@xterm/xterm";
+import type { Terminal as XtermTerminal, ILink, ILinkProvider } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
+import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
-import { acquireWebGL, releaseWebGL, touch as touchWebGL } from "./webglContextPool";
-import { registerTerminal, serializeTerminal, unregisterTerminal } from "./terminalRegistry";
+import {
+  acquireWebGL,
+  releaseWebGL,
+  touch as touchWebGL,
+  rebuildTerminalAtlas,
+  resetWebGL,
+} from "./webglContextPool";
+import {
+  installRenderDiagnosticsListeners,
+  recordRenderDiagnostic,
+} from "./renderDiagnostics";
+import { getVisibilityObserver } from "./visibilityObserver";
+import {
+  registerTerminal,
+  serializeTerminal,
+  unregisterTerminal,
+} from "./terminalRegistry";
+import { patchXtermMouseService } from "./xtermMouseScalePatch";
+import {
+  clearTerminalActivity,
+  recordTerminalActivity,
+} from "./terminalActivityTracker";
+import { useCanvasStore } from "../stores/canvasStore";
 import { useNotificationStore } from "../stores/notificationStore";
-import { usePreferencesStore } from "../stores/preferencesStore";
+import {
+  usePreferencesStore,
+  type TerminalRendererMode,
+} from "../stores/preferencesStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useTerminalFindStore } from "../stores/terminalFindStore";
 import { getTerminalDisplayTitle } from "../stores/terminalState";
 import {
   resolveTerminalWithRuntimeState,
@@ -25,6 +51,19 @@ import { isRegisteredAppShortcutEvent } from "../stores/shortcutStore";
 import { en } from "../i18n/en";
 import { zh } from "../i18n/zh";
 import type { TerminalTelemetrySnapshot } from "../../shared/telemetry";
+import {
+  CLI_DETECTION_MAX_ATTEMPTS,
+  CLI_DETECTION_POLL_INTERVAL_MS,
+  HOOK_SESSION_FALLBACK_MS,
+  SESSION_POLL_INTERVAL_MS,
+  SESSION_POLL_MAX_ATTEMPTS,
+  SHELL_WAITING_AFTER_SILENCE_MS,
+  TELEMETRY_POLL_FAST_MS,
+  TELEMETRY_POLL_SLOW_MS,
+  TELEMETRY_PUSH_STALE_MS,
+  TURN_COMPLETE_DEDUP_MS,
+  WORKTREE_ACTIVITY_THROTTLE_MS,
+} from "../../shared/lifecycleThresholds";
 import { onTerminalTurnCompleted } from "./summaryScheduler";
 import {
   clampPreviewAnsi,
@@ -64,13 +103,21 @@ interface AttachOptions {
   onCopy?: () => void;
 }
 
+interface TerminalLifecycleCause {
+  caller?: string;
+  detail?: Record<string, unknown>;
+  reason: string;
+}
+
 interface ManagedTerminalRuntime {
   activityPending: boolean;
   activityTimer: ReturnType<typeof setTimeout> | null;
   activityThrottled: boolean;
   attachedContainer: HTMLDivElement | null;
   attachOptions: AttachOptions | null;
-  cliOverride: ReturnType<typeof usePreferencesStore.getState>["cliCommands"][TerminalType];
+  cliOverride: ReturnType<
+    typeof usePreferencesStore.getState
+  >["cliCommands"][TerminalType];
   currentStatus: TerminalStatus;
   detectAttempts: number;
   detectTimer: ReturnType<typeof setTimeout> | null;
@@ -86,6 +133,7 @@ interface ManagedTerminalRuntime {
   ptyId: number | null;
   ptyPromise: Promise<void> | null;
   previewAnsi: string;
+  rendererMode: TerminalRendererMode;
   hookFallbackTimer: ReturnType<typeof setTimeout> | null;
   lastPushAt: number;
   lastTurnCompletedAt: number;
@@ -94,6 +142,7 @@ interface ManagedTerminalRuntime {
   removeHookStopFailure: (() => void) | null;
   removeTurnComplete: (() => void) | null;
   resizeDisposable: { dispose(): void } | null;
+  searchAddon: SearchAddon | null;
   selectionAutoCopy: TerminalSelectionAutoCopyState;
   selectionDisposable: { dispose(): void } | null;
   selectionPointerCleanup: (() => void) | null;
@@ -116,8 +165,6 @@ type XtermRuntimeModule = typeof xtermModule & {
 };
 
 const dictionaries = { en, zh } as const;
-const WAITING_THRESHOLD = 30_000;
-const ACTIVITY_THROTTLE_MS = 3_000;
 const SPAWN_STAGGER_MS = 150;
 const TERMINAL_PARKING_ROOT_ID = "tc-terminal-runtime-parking-root";
 
@@ -127,15 +174,23 @@ let spawnStaggerResetTimer: ReturnType<typeof setTimeout> | null = null;
 function nextSpawnDelay(): number {
   spawnStaggerCount += 1;
   if (spawnStaggerResetTimer) clearTimeout(spawnStaggerResetTimer);
-  spawnStaggerResetTimer = setTimeout(() => { spawnStaggerCount = 0; }, 3_000);
+  spawnStaggerResetTimer = setTimeout(() => {
+    spawnStaggerCount = 0;
+  }, 3_000);
   return spawnStaggerCount * SPAWN_STAGGER_MS;
 }
 const runtimeRegistry = new Map<string, ManagedTerminalRuntime>();
 const xtermRuntimeModule = xtermModule as XtermRuntimeModule;
-const XtermTerminalConstructor = (
-  xtermRuntimeModule.Terminal ??
-  xtermRuntimeModule.default?.Terminal
-) as XtermTerminalConstructor;
+const XtermTerminalConstructor = (xtermRuntimeModule.Terminal ??
+  xtermRuntimeModule.default?.Terminal) as XtermTerminalConstructor;
+
+function isSessionTelemetryProvider(
+  type: TerminalType,
+): type is "claude" | "codex" | "kimi" | "wuu" | "opencode" {
+  return (
+    type === "claude" || type === "codex" || type === "kimi" || type === "wuu" || type === "opencode"
+  );
+}
 
 export const useTerminalRuntimeStore = create<TerminalRuntimeStoreState>(
   () => ({
@@ -189,6 +244,9 @@ function sameTelemetrySnapshot(
     left.derived_status === right.derived_status &&
     left.provider === right.provider &&
     left.session_attached === right.session_attached &&
+    left.session_id === right.session_id &&
+    left.session_file === right.session_file &&
+    left.first_user_prompt === right.first_user_prompt &&
     left.last_meaningful_progress_at === right.last_meaningful_progress_at &&
     left.last_session_event_at === right.last_session_event_at &&
     left.last_session_event_kind === right.last_session_event_kind &&
@@ -198,7 +256,6 @@ function sameTelemetrySnapshot(
     left.task_status === right.task_status &&
     left.task_status_source === right.task_status_source &&
     left.result_exists === right.result_exists &&
-    left.done_exists === right.done_exists &&
     left.turn_state === right.turn_state
   );
 }
@@ -264,15 +321,30 @@ async function pollSessionId(
   ptyId: number,
   cliType: string,
   worktreePath: string,
-  onFound: (
-    match: { sessionId: string; confidence?: "strong" | "medium" | "weak" },
-  ) => void,
+  onFound: (match: {
+    sessionId: string;
+    confidence?: "strong" | "medium" | "weak";
+  }) => void,
   shouldCancel: () => boolean,
   detectedCliPid?: number | null,
   startedAt?: string,
 ) {
-  const maxAttempts = cliType === "codex" ? 20 : 10;
-  const interval = cliType === "codex" ? 500 : 5_000;
+  const maxAttempts =
+    cliType === "codex"
+      ? SESSION_POLL_MAX_ATTEMPTS.codex
+      : cliType === "opencode"
+        ? SESSION_POLL_MAX_ATTEMPTS.opencode
+      : cliType === "wuu"
+        ? SESSION_POLL_MAX_ATTEMPTS.wuu
+        : SESSION_POLL_MAX_ATTEMPTS.default;
+  const interval =
+    cliType === "codex"
+      ? SESSION_POLL_INTERVAL_MS.codex
+      : cliType === "opencode"
+        ? SESSION_POLL_INTERVAL_MS.opencode
+      : cliType === "wuu"
+        ? SESSION_POLL_INTERVAL_MS.wuu
+        : SESSION_POLL_INTERVAL_MS.default;
 
   let cachedPid: number | null = detectedCliPid ?? null;
   if (!cachedPid && cliType === "claude") {
@@ -285,9 +357,11 @@ async function pollSessionId(
   }
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    if (attempt > 0 || cliType !== "codex") {
-      await new Promise((resolve) => setTimeout(resolve, interval));
-    }
+    // Always wait before polling — Codex needs time to write its session
+    // file after launch.  Polling immediately on the first attempt would
+    // find the PREVIOUS session in the same cwd and lock onto it because
+    // onFound returns after the first match.
+    await new Promise((resolve) => setTimeout(resolve, interval));
     if (shouldCancel()) {
       return;
     }
@@ -295,15 +369,21 @@ async function pollSessionId(
     let sessionId: string | null = null;
     let confidence: "strong" | "medium" | "weak" | undefined;
     if (cliType === "codex") {
-      const candidate = await window.termcanvas.session.findCodex(worktreePath, startedAt);
+      const candidate = await window.termcanvas.session.findCodex(
+        worktreePath,
+        startedAt,
+      );
       sessionId = candidate?.sessionId ?? null;
       confidence = candidate?.confidence;
-      if (sessionId && sessionId === codexBaseline && candidate?.confidence !== "medium") {
+      // Reject baseline (the session that existed before this terminal
+      // started) so we don't attach to a stale session.
+      if (sessionId && sessionId === codexBaseline) {
         sessionId = null;
         confidence = undefined;
       }
     } else if (cliType === "claude") {
-      const pid = cachedPid ?? (await window.termcanvas.terminal.getPid(ptyId)) ?? null;
+      const pid =
+        cachedPid ?? (await window.termcanvas.terminal.getPid(ptyId)) ?? null;
       if (!cachedPid && pid) {
         cachedPid = pid;
       }
@@ -315,7 +395,26 @@ async function pollSessionId(
       sessionId = candidate?.sessionId ?? null;
       confidence = candidate?.confidence;
     } else if (cliType === "kimi") {
-      sessionId = await window.termcanvas.session.getKimiLatest(worktreePath);
+      const candidate = await window.termcanvas.session.findKimi(
+        worktreePath,
+        startedAt,
+      );
+      sessionId = candidate?.sessionId ?? null;
+      confidence = candidate?.confidence;
+    } else if (cliType === "wuu") {
+      const candidate = await window.termcanvas.session.findWuu(
+        worktreePath,
+        startedAt,
+      );
+      sessionId = candidate?.sessionId ?? null;
+      confidence = candidate?.confidence;
+    } else if (cliType === "opencode") {
+      const candidate = await window.termcanvas.session.findOpenCode(
+        worktreePath,
+        startedAt,
+      );
+      sessionId = candidate?.sessionId ?? null;
+      confidence = candidate?.confidence;
     }
 
     if (shouldCancel()) {
@@ -345,26 +444,24 @@ function updateTerminalInStore(
   };
 }
 
-function withResolvedRuntimeMeta(meta: TerminalRuntimeMeta): TerminalRuntimeMeta {
+function withResolvedRuntimeMeta(
+  meta: TerminalRuntimeMeta,
+): TerminalRuntimeMeta {
   return {
     ...meta,
     terminal: resolveTerminalWithRuntimeState(meta.terminal),
   };
 }
 
-function setPtyId(
-  runtime: ManagedTerminalRuntime,
-  ptyId: number | null,
-) {
+function setPtyId(runtime: ManagedTerminalRuntime, ptyId: number | null) {
   runtime.ptyId = ptyId;
-  useTerminalRuntimeStateStore.getState().setPtyId(runtime.meta.terminal.id, ptyId);
+  useTerminalRuntimeStateStore
+    .getState()
+    .setPtyId(runtime.meta.terminal.id, ptyId);
   updateTerminalInStore(runtime, (terminal) => ({ ...terminal, ptyId }));
 }
 
-function setStatus(
-  runtime: ManagedTerminalRuntime,
-  status: TerminalStatus,
-) {
+function setStatus(runtime: ManagedTerminalRuntime, status: TerminalStatus) {
   if (runtime.currentStatus === status) {
     return;
   }
@@ -404,10 +501,7 @@ function setSessionId(
   }
 }
 
-function setAutoApprove(
-  runtime: ManagedTerminalRuntime,
-  autoApprove: boolean,
-) {
+function setAutoApprove(runtime: ManagedTerminalRuntime, autoApprove: boolean) {
   useProjectStore
     .getState()
     .updateTerminalAutoApprove(
@@ -454,10 +548,15 @@ function clearWatchedSession(runtime: ManagedTerminalRuntime) {
 
   const sessionId = runtime.watchedSessionId;
   runtime.watchedSessionId = null;
-  if (runtime.meta.terminal.type === "claude" || runtime.meta.terminal.type === "codex") {
-    void window.termcanvas.telemetry.detachSession(runtime.meta.terminal.id).catch((error) => {
-      console.error("[terminalRuntime] failed to detach telemetry session:", error);
-    });
+  if (isSessionTelemetryProvider(runtime.meta.terminal.type)) {
+    void window.termcanvas.telemetry
+      .detachSession(runtime.meta.terminal.id)
+      .catch((error) => {
+        console.error(
+          "[terminalRuntime] failed to detach telemetry session:",
+          error,
+        );
+      });
   }
   void window.termcanvas.session.unwatch(sessionId).catch((error) => {
     console.error("[terminalRuntime] failed to unwatch session:", error);
@@ -479,16 +578,18 @@ function watchSession(
   }
 
   runtime.watchedSessionId = sessionId;
-  if (type === "claude" || type === "codex") {
-    void window.termcanvas.telemetry.attachSession({
-      terminalId: runtime.meta.terminal.id,
-      provider: type,
-      sessionId,
-      cwd: runtime.meta.worktreePath,
-      confidence: confidence ?? (type === "claude" ? "strong" : "medium"),
-    }).catch((error: unknown) => {
-      console.error("[terminalRuntime] telemetry attach failed:", error);
-    });
+  if (isSessionTelemetryProvider(type)) {
+    void window.termcanvas.telemetry
+      .attachSession({
+        terminalId: runtime.meta.terminal.id,
+        provider: type,
+        sessionId,
+        cwd: runtime.meta.worktreePath,
+        confidence: confidence ?? (type === "claude" ? "strong" : "medium"),
+      })
+      .catch((error: unknown) => {
+        console.error("[terminalRuntime] telemetry attach failed:", error);
+      });
   }
   void window.termcanvas.session
     .watch(type, sessionId, runtime.meta.worktreePath)
@@ -498,10 +599,7 @@ function watchSession(
       }
 
       if (!result?.ok) {
-        notify(
-          "warn",
-          `Session watch failed: ${result?.reason ?? "unknown"}`,
-        );
+        notify("warn", `Session watch failed: ${result?.reason ?? "unknown"}`);
       }
     })
     .catch((error: unknown) => {
@@ -513,10 +611,7 @@ function watchSession(
     });
 }
 
-function setTerminalType(
-  runtime: ManagedTerminalRuntime,
-  type: TerminalType,
-) {
+function setTerminalType(runtime: ManagedTerminalRuntime, type: TerminalType) {
   useProjectStore
     .getState()
     .updateTerminalType(
@@ -530,7 +625,9 @@ function setTerminalType(
 
 function lookupCurrentTerminal(runtime: ManagedTerminalRuntime) {
   const state = useProjectStore.getState();
-  const project = state.projects.find((entry) => entry.id === runtime.meta.projectId);
+  const project = state.projects.find(
+    (entry) => entry.id === runtime.meta.projectId,
+  );
   const worktree = project?.worktrees.find(
     (entry) => entry.id === runtime.meta.worktreeId,
   );
@@ -562,6 +659,91 @@ function disposeRendererBindings(runtime: ManagedTerminalRuntime) {
   disposeSelectionBindings(runtime);
 }
 
+function readElementNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function getElementMetrics(
+  element:
+    | {
+        clientHeight?: unknown;
+        clientWidth?: unknown;
+        offsetHeight?: unknown;
+        offsetWidth?: unknown;
+      }
+    | null
+    | undefined,
+) {
+  if (!element) {
+    return {
+      client_height: null,
+      client_width: null,
+      offset_height: null,
+      offset_width: null,
+    };
+  }
+
+  return {
+    client_height: readElementNumber(element.clientHeight),
+    client_width: readElementNumber(element.clientWidth),
+    offset_height: readElementNumber(element.offsetHeight),
+    offset_width: readElementNumber(element.offsetWidth),
+  };
+}
+
+function getRuntimeDiagnosticData(
+  runtime: ManagedTerminalRuntime,
+): Record<string, unknown> {
+  return {
+    attached_container_present: !!runtime.attachedContainer,
+    current_status: runtime.currentStatus,
+    host_metrics: getElementMetrics(runtime.hostElement),
+    mode: runtime.mode,
+    pty_id: runtime.ptyId,
+    renderer_mode: runtime.rendererMode,
+    terminal_focused: runtime.meta.terminal.focused,
+    terminal_type: runtime.meta.terminal.type,
+    uses_agent_renderer: runtime.usesAgentRenderer,
+    xterm_present: !!runtime.xterm,
+    xterm_size: runtime.xterm
+      ? {
+          cols: runtime.xterm.cols,
+          rows: runtime.xterm.rows,
+        }
+      : null,
+    container_metrics: getElementMetrics(runtime.attachedContainer),
+  };
+}
+
+function recordRuntimeDiagnostic(
+  runtime: ManagedTerminalRuntime,
+  kind: string,
+  data: Record<string, unknown> = {},
+) {
+  recordRenderDiagnostic({
+    kind,
+    terminalId: runtime.meta.terminal.id,
+    data: {
+      ...getRuntimeDiagnosticData(runtime),
+      ...data,
+    },
+  });
+}
+
+function getLifecycleDiagnosticData(
+  cause?: TerminalLifecycleCause,
+): Record<string, unknown> {
+  if (!cause) {
+    return {};
+  }
+
+  return {
+    ...(cause.caller ? { lifecycle_caller: cause.caller } : {}),
+    ...(cause.detail ?? {}),
+    lifecycle_reason: cause.reason,
+  };
+}
+
 function shouldFitAttachedRuntime(runtime: ManagedTerminalRuntime) {
   return !!runtime.attachedContainer;
 }
@@ -572,6 +754,21 @@ function ensureRuntimeWebGL(runtime: ManagedTerminalRuntime) {
   }
 
   return acquireWebGL(runtime.meta.terminal.id, runtime.xterm);
+}
+
+function syncRuntimeRenderer(runtime: ManagedTerminalRuntime) {
+  if (!runtime.xterm) {
+    return false;
+  }
+
+  recordRuntimeDiagnostic(runtime, "terminal_renderer_sync");
+
+  if (runtime.rendererMode === "webgl") {
+    return ensureRuntimeWebGL(runtime);
+  }
+
+  releaseWebGL(runtime.meta.terminal.id);
+  return true;
 }
 
 function scheduleRuntimeRefresh(callback: () => void) {
@@ -588,7 +785,9 @@ function ensureParkingRoot(): HTMLDivElement | null {
     return null;
   }
 
-  let root = document.getElementById(TERMINAL_PARKING_ROOT_ID) as HTMLDivElement | null;
+  let root = document.getElementById(
+    TERMINAL_PARKING_ROOT_ID,
+  ) as HTMLDivElement | null;
   if (root) {
     return root;
   }
@@ -609,7 +808,9 @@ function ensureParkingRoot(): HTMLDivElement | null {
   return root.parentElement ? root : null;
 }
 
-function ensureRuntimeHost(runtime: ManagedTerminalRuntime): HTMLDivElement | null {
+function ensureRuntimeHost(
+  runtime: ManagedTerminalRuntime,
+): HTMLDivElement | null {
   if (runtime.hostElement || typeof document === "undefined") {
     return runtime.hostElement;
   }
@@ -736,7 +937,22 @@ function wireRendererBindings(
   wireInteractiveBindings(runtime);
 }
 
-function detachTerminalRenderer(runtime: ManagedTerminalRuntime) {
+function getRuntimeMouseScale(runtime: ManagedTerminalRuntime): number {
+  const container = runtime.attachedContainer;
+  if (!container?.closest(".terminal-tile")) {
+    return 1;
+  }
+  return useCanvasStore.getState().viewport.scale;
+}
+
+function detachTerminalRenderer(
+  runtime: ManagedTerminalRuntime,
+  cause?: TerminalLifecycleCause,
+) {
+  recordRuntimeDiagnostic(runtime, "terminal_renderer_detach", {
+    ...getLifecycleDiagnosticData(cause),
+  });
+
   if (!runtime.xterm) {
     removeTerminalHost(runtime);
     return;
@@ -754,10 +970,18 @@ function detachTerminalRenderer(runtime: ManagedTerminalRuntime) {
   runtime.xterm = null;
   runtime.fitAddon = null;
   runtime.serializeAddon = null;
+  runtime.searchAddon = null;
   removeTerminalHost(runtime);
 }
 
-function parkTerminalRenderer(runtime: ManagedTerminalRuntime) {
+function parkTerminalRenderer(
+  runtime: ManagedTerminalRuntime,
+  cause?: TerminalLifecycleCause,
+) {
+  recordRuntimeDiagnostic(runtime, "terminal_renderer_park", {
+    ...getLifecycleDiagnosticData(cause),
+  });
+
   if (!runtime.xterm) {
     parkTerminalHost(runtime);
     return;
@@ -770,6 +994,7 @@ function parkTerminalRenderer(runtime: ManagedTerminalRuntime) {
   }
 
   disposeRendererBindings(runtime);
+  releaseWebGL(runtime.meta.terminal.id);
   parkTerminalHost(runtime);
 }
 
@@ -812,15 +1037,111 @@ function syncAttachedTerminalGeometry(runtime: ManagedTerminalRuntime) {
     runtime.xterm.cols,
     runtime.xterm.rows,
   );
+  recordRuntimeDiagnostic(runtime, "terminal_runtime_fit");
+}
+
+const URL_REGEX =
+  /(https?|HTTPS?):\/\/[^\s"'!*(){}|\\\^<>`]*[^\s"':,.!?{}|\\\^~\[\]`()<>]/;
+
+function registerModifierAwareLinkProvider(
+  xterm: XtermTerminal,
+  host: HTMLElement,
+): () => void {
+  let modifierHeld = false;
+  const activeLinks = new Set<ILink>();
+
+  const updateDecorations = () => {
+    host.classList.toggle("modifier-held", modifierHeld);
+    for (const link of activeLinks) {
+      if (link.decorations) {
+        link.decorations.underline = modifierHeld;
+        link.decorations.pointerCursor = modifierHeld;
+      }
+    }
+  };
+
+  const onKeyChange = (e: KeyboardEvent) => {
+    const held = e.metaKey || e.ctrlKey;
+    if (held !== modifierHeld) {
+      modifierHeld = held;
+      updateDecorations();
+    }
+  };
+
+  const onWindowBlur = () => {
+    if (modifierHeld) {
+      modifierHeld = false;
+      updateDecorations();
+    }
+  };
+
+  host.addEventListener("keydown", onKeyChange, true);
+  host.addEventListener("keyup", onKeyChange, true);
+  window.addEventListener("blur", onWindowBlur);
+
+  const provider: ILinkProvider = {
+    provideLinks(bufferLineNumber, callback) {
+      const line = xterm.buffer.active.getLine(bufferLineNumber - 1);
+      if (!line) {
+        callback(undefined);
+        return;
+      }
+      const text = line.translateToString(true);
+      const links: ILink[] = [];
+      const regex = new RegExp(URL_REGEX.source, "g");
+      let match: RegExpExecArray | null;
+
+      while ((match = regex.exec(text)) !== null) {
+        const uri = match[0];
+        const startX = match.index + 1;
+        const endX = match.index + uri.length;
+        const link: ILink = {
+          range: {
+            start: { x: startX, y: bufferLineNumber },
+            end: { x: endX, y: bufferLineNumber },
+          },
+          text: uri,
+          decorations: { underline: modifierHeld, pointerCursor: modifierHeld },
+          activate(_event, linkText) {
+            if (_event.metaKey || _event.ctrlKey) {
+              window.open(linkText);
+            }
+          },
+          dispose() {
+            activeLinks.delete(link);
+          },
+        };
+        activeLinks.add(link);
+        links.push(link);
+      }
+
+      callback(links.length > 0 ? links : undefined);
+    },
+  };
+
+  const linkDisposable = xterm.registerLinkProvider(provider);
+
+  return () => {
+    linkDisposable.dispose();
+    host.removeEventListener("keydown", onKeyChange, true);
+    host.removeEventListener("keyup", onKeyChange, true);
+    window.removeEventListener("blur", onWindowBlur);
+    host.classList.remove("modifier-held");
+    activeLinks.clear();
+  };
 }
 
 function createTerminalRenderer(
   runtime: ManagedTerminalRuntime,
   container: HTMLDivElement,
 ) {
+  recordRuntimeDiagnostic(runtime, "terminal_renderer_create");
   const theme = useThemeStore.getState().theme;
   const preferences = usePreferencesStore.getState();
   const xterm = new XtermTerminalConstructor({
+    // addon-search uses registerDecoration for match counts/highlights, and
+    // xterm exposes that API behind the proposed API gate.
+    allowProposedApi: true,
     allowTransparency: false,
     cursorBlink: true,
     cursorStyle: "bar",
@@ -834,6 +1155,7 @@ function createTerminalRenderer(
   });
   const fitAddon = new FitAddon();
   const serializeAddon = new SerializeAddon();
+  const searchAddon = new SearchAddon();
   const host = attachTerminalHost(runtime, container);
   if (!host) {
     return;
@@ -842,11 +1164,23 @@ function createTerminalRenderer(
   xterm.loadAddon(fitAddon);
   xterm.loadAddon(serializeAddon);
   xterm.open(host);
+  // SearchAddon's DecorationManager registers markers via the live
+  // renderer — load it AFTER `open()` so its `activate()` runs against an
+  // initialized terminal. Loading before `open()` makes findNext silently
+  // produce zero results for some paths under the WebGL renderer pool.
+  xterm.loadAddon(searchAddon);
 
   try {
     xterm.loadAddon(new ImageAddon());
-  } catch {
-  }
+  } catch {}
+
+  // Pre-scales mouse coords inside xterm's hit-test so selection/drag/mouse-
+  // report stay accurate when React Flow's viewport transform is non-identity.
+  // See xtermMouseScalePatch.ts for the why.
+  runtime.globalDisposers.push(
+    patchXtermMouseService(xterm, () => getRuntimeMouseScale(runtime)),
+  );
+  runtime.globalDisposers.push(registerModifierAwareLinkProvider(xterm, host));
 
   xterm.attachCustomKeyEventHandler((event) => {
     if (event.type === "keydown" && isRegisteredAppShortcutEvent(event)) {
@@ -866,7 +1200,8 @@ function createTerminalRenderer(
   runtime.xterm = xterm;
   runtime.fitAddon = fitAddon;
   runtime.serializeAddon = serializeAddon;
-  ensureRuntimeWebGL(runtime);
+  runtime.searchAddon = searchAddon;
+  syncRuntimeRenderer(runtime);
 
   registerTerminal(runtime.meta.terminal.id, xterm, serializeAddon);
   if (runtime.previewAnsi) {
@@ -907,6 +1242,14 @@ function setupRuntimeSubscriptions(runtime: ManagedTerminalRuntime) {
   const themeUnsubscribe = useThemeStore.subscribe((state) => {
     if (runtime.xterm) {
       runtime.xterm.options.theme = XTERM_THEMES[state.theme];
+      // Theme change inverts fg/bg colours — every cached glyph in
+      // the atlas was rasterised against the previous theme's text
+      // colour and is now visually wrong. Drop the cache so the
+      // next frame re-rasterises in the new palette. Without this,
+      // xterm.refresh() alone would redraw using stale atlas
+      // entries and text would look ghostly / off-palette until
+      // each glyph naturally churns out of the cache.
+      rebuildTerminalAtlas(runtime.meta.terminal.id, "theme_changed");
       runtime.xterm.refresh(0, runtime.xterm.rows - 1);
     }
 
@@ -920,9 +1263,22 @@ function setupRuntimeSubscriptions(runtime: ManagedTerminalRuntime) {
       return;
     }
 
+    if (runtime.rendererMode !== state.terminalRenderer) {
+      runtime.rendererMode = state.terminalRenderer;
+      syncRuntimeRenderer(runtime);
+    }
+
     const family = buildFontFamily(state.terminalFontFamily);
+    // Font family / size / contrast changes all invalidate every
+    // cached glyph in the atlas (wrong face, wrong dimensions, or
+    // wrong foreground colour after contrast adjustment). Track
+    // whether we touched any of them and rebuild once at the end.
+    let atlasInvalidated = false;
+    const atlasReasons: string[] = [];
     if (runtime.xterm.options.fontFamily !== family) {
       runtime.xterm.options.fontFamily = family;
+      atlasInvalidated = true;
+      atlasReasons.push("font_family");
       if (shouldFitAttachedRuntime(runtime)) {
         runtime.fitAddon?.fit();
       }
@@ -930,17 +1286,27 @@ function setupRuntimeSubscriptions(runtime: ManagedTerminalRuntime) {
 
     if (runtime.xterm.options.fontSize !== state.terminalFontSize) {
       runtime.xterm.options.fontSize = state.terminalFontSize;
+      atlasInvalidated = true;
+      atlasReasons.push("font_size");
       if (shouldFitAttachedRuntime(runtime)) {
         runtime.fitAddon?.fit();
       }
     }
 
     if (
-      runtime.xterm.options.minimumContrastRatio !==
-      state.minimumContrastRatio
+      runtime.xterm.options.minimumContrastRatio !== state.minimumContrastRatio
     ) {
       runtime.xterm.options.minimumContrastRatio = state.minimumContrastRatio;
+      atlasInvalidated = true;
+      atlasReasons.push("minimum_contrast_ratio");
       runtime.xterm.refresh(0, runtime.xterm.rows - 1);
+    }
+
+    if (atlasInvalidated) {
+      rebuildTerminalAtlas(
+        runtime.meta.terminal.id,
+        `preferences_changed:${atlasReasons.join(",")}`,
+      );
     }
   });
 
@@ -986,7 +1352,7 @@ function scheduleSessionCapture(
     runtime.meta.worktreePath,
     ({ sessionId, confidence }) => {
       setSessionId(runtime, sessionId);
-      if (cliType === "claude" || cliType === "codex") {
+      if (isSessionTelemetryProvider(cliType)) {
         watchSession(runtime, cliType, sessionId, confidence);
       }
       if (cliType === "claude" || cliType === "codex") {
@@ -1006,15 +1372,12 @@ function scheduleSessionCapture(
   });
 }
 
-const DETECT_INTERVAL_MS = 3_000;
-const DETECT_MAX_ATTEMPTS = 30;
-
 function triggerDetection(runtime: ManagedTerminalRuntime) {
   if (runtime.meta.terminal.type !== "shell" || runtime.ptyId === null) {
     return;
   }
 
-  if (runtime.detectAttempts >= DETECT_MAX_ATTEMPTS) return;
+  if (runtime.detectAttempts >= CLI_DETECTION_MAX_ATTEMPTS) return;
 
   // Don't reset an already-scheduled timer — allows detection during active output
   if (runtime.detectTimer) return;
@@ -1044,15 +1407,20 @@ function triggerDetection(runtime: ManagedTerminalRuntime) {
       } else if (nextType === "codex") {
         void useCodexQuotaStore.getState().fetch();
       }
-      if (nextType === "claude" || nextType === "codex") {
-        void window.termcanvas.telemetry.updateTerminal({
-          terminalId: runtime.meta.terminal.id,
-          worktreePath: runtime.meta.worktreePath,
-          provider: nextType,
-          ptyId: runtime.ptyId,
-        }).catch((error: unknown) => {
-          console.error("[terminalRuntime] telemetry provider update failed:", error);
-        });
+      if (isSessionTelemetryProvider(nextType)) {
+        void window.termcanvas.telemetry
+          .updateTerminal({
+            terminalId: runtime.meta.terminal.id,
+            worktreePath: runtime.meta.worktreePath,
+            provider: nextType,
+            ptyId: runtime.ptyId,
+          })
+          .catch((error: unknown) => {
+            console.error(
+              "[terminalRuntime] telemetry provider update failed:",
+              error,
+            );
+          });
       }
       if (nextType === "tmux" && result?.sessionName) {
         setSessionId(runtime, result.sessionName);
@@ -1061,12 +1429,13 @@ function triggerDetection(runtime: ManagedTerminalRuntime) {
 
       scheduleSessionCapture(runtime, runtime.ptyId!, nextType, result?.pid);
     });
-  }, DETECT_INTERVAL_MS);
+  }, CLI_DETECTION_POLL_INTERVAL_MS);
 }
 
 function handleRuntimeOutput(runtime: ManagedTerminalRuntime, data: string) {
   appendPreview(runtime, data);
   runtime.xterm?.write(data);
+  recordTerminalActivity(runtime.meta.terminal.id, data.length);
   triggerDetection(runtime);
 
   if (!runtime.activityThrottled) {
@@ -1079,7 +1448,7 @@ function handleRuntimeOutput(runtime: ManagedTerminalRuntime, data: string) {
         runtime.activityPending = false;
         dispatchWorktreeActivity(runtime.meta.worktreePath);
       }
-    }, ACTIVITY_THROTTLE_MS);
+    }, WORKTREE_ACTIVITY_THROTTLE_MS);
   } else {
     runtime.activityPending = true;
   }
@@ -1096,7 +1465,7 @@ function handleRuntimeOutput(runtime: ManagedTerminalRuntime, data: string) {
       setStatus(runtime, "waiting");
       dispatchWorktreeActivity(runtime.meta.worktreePath);
     }
-  }, WAITING_THRESHOLD);
+  }, SHELL_WAITING_AFTER_SILENCE_MS);
 }
 
 function buildTerminalRuntime(
@@ -1114,7 +1483,8 @@ function buildTerminalRuntime(
     attachedContainer: null,
     attachOptions: null,
     cliOverride:
-      usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ?? undefined,
+      usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ??
+      undefined,
     currentStatus: resolvedMeta.terminal.status,
     detectAttempts: 0,
     detectTimer: null,
@@ -1130,6 +1500,7 @@ function buildTerminalRuntime(
     ptyId: resolvedMeta.terminal.ptyId,
     ptyPromise: null,
     previewAnsi: clampPreviewAnsi(resolvedMeta.terminal.scrollback ?? ""),
+    rendererMode: usePreferencesStore.getState().terminalRenderer,
     hookFallbackTimer: null,
     lastPushAt: 0,
     lastTurnCompletedAt: 0,
@@ -1138,6 +1509,7 @@ function buildTerminalRuntime(
     removeHookStopFailure: null,
     removeTurnComplete: null,
     resizeDisposable: null,
+    searchAddon: null,
     selectionAutoCopy: createTerminalSelectionAutoCopyState(),
     selectionDisposable: null,
     selectionPointerCleanup: null,
@@ -1153,8 +1525,9 @@ function buildTerminalRuntime(
         resolvedMeta.terminal.type,
         resolvedMeta.terminal.sessionId,
         resolvedMeta.terminal.autoApprove,
-        usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ??
-          undefined,
+        usePreferencesStore.getState().cliCommands[
+          resolvedMeta.terminal.type
+        ] ?? undefined,
       ),
     watchedSessionId: null,
     xterm: null,
@@ -1169,7 +1542,10 @@ function buildTerminalRuntime(
   return runtime;
 }
 
-async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: string) {
+async function spawnPty(
+  runtime: ManagedTerminalRuntime,
+  resumeSessionId?: string,
+) {
   const launch = getTerminalLaunchOptions(
     runtime.meta.terminal.type,
     resumeSessionId,
@@ -1205,13 +1581,15 @@ async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: strin
   // Register hook listener BEFORE spawning pty to avoid race condition (C2)
   let hookSessionReceived = false;
   const isHookEnabled =
-    (runtime.meta.terminal.type === "claude" || runtime.meta.terminal.type === "shell") &&
+    (runtime.meta.terminal.type === "claude" ||
+      runtime.meta.terminal.type === "codex" ||
+      runtime.meta.terminal.type === "shell") &&
     !!window.termcanvas?.hooks;
 
   if (!resumeSessionId && launch && isHookEnabled) {
     runtime.removeHookSessionStarted?.();
-    runtime.removeHookSessionStarted = window.termcanvas!.hooks.onSessionStarted(
-      (payload) => {
+    runtime.removeHookSessionStarted =
+      window.termcanvas!.hooks.onSessionStarted((payload) => {
         if (payload.terminalId !== runtime.meta.terminal.id) return;
         if (runtime.disposed || hookSessionReceived) return;
         hookSessionReceived = true;
@@ -1226,19 +1604,22 @@ async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: strin
         if (runtime.meta.terminal.type === "shell") {
           setTerminalType(runtime, "claude");
           useQuotaStore.getState().nudge();
-          void window.termcanvas!.telemetry.updateTerminal({
-            terminalId: runtime.meta.terminal.id,
-            worktreePath: runtime.meta.worktreePath,
-            provider: "claude",
-            ptyId: runtime.ptyId,
-          }).catch(() => {});
+          void window
+            .termcanvas!.telemetry.updateTerminal({
+              terminalId: runtime.meta.terminal.id,
+              worktreePath: runtime.meta.worktreePath,
+              provider: "claude",
+              ptyId: runtime.ptyId,
+            })
+            .catch(() => {});
         }
 
+        const hookSessionType =
+          runtime.meta.terminal.type === "codex" ? "codex" : "claude";
         setSessionId(runtime, payload.sessionId);
-        watchSession(runtime, "claude", payload.sessionId, "strong");
+        watchSession(runtime, hookSessionType, payload.sessionId, "strong");
         void syncPermissionMode(runtime, payload.sessionId);
-      },
-    );
+      });
   }
 
   try {
@@ -1253,15 +1634,18 @@ async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: strin
 
     if (
       resumeSessionId &&
-      (runtime.meta.terminal.type === "claude" ||
-        runtime.meta.terminal.type === "codex")
+      isSessionTelemetryProvider(runtime.meta.terminal.type)
     ) {
       watchSession(runtime, runtime.meta.terminal.type, resumeSessionId);
     }
 
     if (!resumeSessionId && launch) {
-      if (runtime.meta.terminal.type === "claude" && isHookEnabled) {
-        // Hook is primary for claude; fall back to polling after 30s if no hook event
+      if (
+        isHookEnabled &&
+        (runtime.meta.terminal.type === "claude" ||
+          runtime.meta.terminal.type === "codex")
+      ) {
+        // Hook is primary for claude/codex; fall back to polling if no hook event.
         runtime.hookFallbackTimer = setTimeout(() => {
           runtime.hookFallbackTimer = null;
           if (!hookSessionReceived && !runtime.disposed) {
@@ -1270,7 +1654,7 @@ async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: strin
             );
             scheduleSessionCapture(runtime, ptyId, runtime.meta.terminal.type);
           }
-        }, 30_000);
+        }, HOOK_SESSION_FALLBACK_MS);
       } else if (runtime.meta.terminal.type !== "shell") {
         scheduleSessionCapture(runtime, ptyId, runtime.meta.terminal.type);
       }
@@ -1287,7 +1671,10 @@ async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: strin
     const t = getT();
     notify(
       "error",
-      t.failed_create_pty(getTerminalDisplayTitle(runtime.meta.terminal), message),
+      t.failed_create_pty(
+        getTerminalDisplayTitle(runtime.meta.terminal),
+        message,
+      ),
     );
     setStatus(runtime, "error");
     appendPreview(
@@ -1297,7 +1684,43 @@ async function spawnPty(runtime: ManagedTerminalRuntime, resumeSessionId?: strin
   }
 }
 
+let renderRecoveryInstalled = false;
+
+function installRenderRecoveryListeners() {
+  if (
+    renderRecoveryInstalled ||
+    typeof document === "undefined" ||
+    typeof document.addEventListener !== "function"
+  ) {
+    return;
+  }
+  renderRecoveryInstalled = true;
+
+  const observer = getVisibilityObserver({
+    subscribeLifecycleIPC: window.termcanvas?.lifecycle?.onVisible,
+    recordDiagnostic: (event) => {
+      recordRenderDiagnostic({ kind: event.kind, data: event.data });
+    },
+  });
+  observer.install();
+  observer.onRecovery(({ reason, severity }) => {
+    refreshAllTerminalRenderers(reason);
+    if (severity === "heavy") {
+      // WebGL canvases lose their framebuffer when the page is genuinely
+      // hidden (sleep/wake, minimize, OS Space switch). For light triggers
+      // (bare window.focus where the page may have just briefly lost focus)
+      // a refresh is enough. If WebGL's renderer state is corrupted,
+      // clearing the atlas can still leave new glyphs wrong; cycling the
+      // addon matches the user-visible DOM -> WebGL recovery path.
+      resetWebGL(undefined, reason);
+    }
+  });
+}
+
 function startTerminalRuntime(runtime: ManagedTerminalRuntime) {
+  installRenderDiagnosticsListeners();
+  installRenderRecoveryListeners();
+
   if (runtime.started || runtime.disposed || !window.termcanvas) {
     return;
   }
@@ -1306,82 +1729,124 @@ function startTerminalRuntime(runtime: ManagedTerminalRuntime) {
   setupRuntimeSubscriptions(runtime);
   refreshTelemetry(runtime);
 
-  const TELEMETRY_POLL_SLOW = 30_000;
-  const TELEMETRY_POLL_FAST = 5_000;
-  const PUSH_STALE_THRESHOLD = 60_000;
-
   const telemetryTick = () => {
     refreshTelemetry(runtime);
-    const pushStale = runtime.lastPushAt > 0 &&
-      Date.now() - runtime.lastPushAt > PUSH_STALE_THRESHOLD;
-    const currentInterval = pushStale ? TELEMETRY_POLL_FAST : TELEMETRY_POLL_SLOW;
+    const pushStale =
+      runtime.lastPushAt > 0 &&
+      Date.now() - runtime.lastPushAt > TELEMETRY_PUSH_STALE_MS;
+    const currentInterval = pushStale
+      ? TELEMETRY_POLL_FAST_MS
+      : TELEMETRY_POLL_SLOW_MS;
     if (runtime.telemetryTimer) clearInterval(runtime.telemetryTimer);
     runtime.telemetryTimer = setInterval(telemetryTick, currentInterval);
   };
-  runtime.telemetryTimer = setInterval(telemetryTick, TELEMETRY_POLL_SLOW);
+  runtime.telemetryTimer = setInterval(telemetryTick, TELEMETRY_POLL_SLOW_MS);
 
   // Push-based telemetry: immediate updates from hook events
   if (window.termcanvas.telemetry?.onSnapshotChanged) {
     let prevTurnState: string | undefined;
-    const removePush = window.termcanvas.telemetry.onSnapshotChanged((payload) => {
-      if (payload.terminalId !== runtime.meta.terminal.id) return;
-      if (runtime.disposed) return;
-      runtime.lastPushAt = Date.now();
+    const removePush = window.termcanvas.telemetry.onSnapshotChanged(
+      (payload) => {
+        if (payload.terminalId !== runtime.meta.terminal.id) return;
+        if (runtime.disposed) return;
+        runtime.lastPushAt = Date.now();
 
-      const snap = payload.snapshot as TerminalTelemetrySnapshot;
+        const snap = payload.snapshot as TerminalTelemetrySnapshot;
 
-      if (snap.turn_state === "turn_complete" && prevTurnState !== "turn_complete") {
-        onTerminalTurnCompleted(runtime.meta.terminal.id);
-      }
-      prevTurnState = snap.turn_state;
+        if (
+          snap.turn_state === "turn_complete" &&
+          prevTurnState !== "turn_complete"
+        ) {
+          onTerminalTurnCompleted(runtime.meta.terminal.id);
+        }
+        prevTurnState = snap.turn_state;
 
-      updateRuntimeSnapshot(runtime.meta.terminal.id, {
-        telemetry: snap,
-      });
-    });
+        updateRuntimeSnapshot(runtime.meta.terminal.id, {
+          telemetry: snap,
+        });
+      },
+    );
     runtime.globalDisposers.push(removePush);
   }
 
-  runtime.outputUnsubscribe = window.termcanvas.terminal.onOutput((ptyId, data) => {
-    if (ptyId !== runtime.ptyId) {
-      return;
-    }
+  runtime.outputUnsubscribe = window.termcanvas.terminal.onOutput(
+    (ptyId, data) => {
+      if (ptyId !== runtime.ptyId) {
+        return;
+      }
 
-    handleRuntimeOutput(runtime, data);
-  });
+      handleRuntimeOutput(runtime, data);
+    },
+  );
 
-  const exitUnsubscribe = window.termcanvas.terminal.onExit((ptyId, exitCode) => {
-    if (ptyId !== runtime.ptyId) {
-      return;
-    }
+  const exitUnsubscribe = window.termcanvas.terminal.onExit(
+    (ptyId, exitCode) => {
+      if (ptyId !== runtime.ptyId) {
+        return;
+      }
 
-    if (runtime.waitingTimer) {
-      clearTimeout(runtime.waitingTimer);
-      runtime.waitingTimer = null;
-    }
+      if (runtime.waitingTimer) {
+        clearTimeout(runtime.waitingTimer);
+        runtime.waitingTimer = null;
+      }
 
-    if (exitCode !== 0 && runtime.wasResumeAttempt && !runtime.hasRespawned) {
-      runtime.hasRespawned = true;
-      clearWatchedSession(runtime);
-      setSessionId(runtime, undefined);
-      appendPreview(
-        runtime,
-        "\r\n\x1b[33m[Session expired, starting fresh...]\x1b[0m\r\n",
+      if (exitCode !== 0 && runtime.wasResumeAttempt && !runtime.hasRespawned) {
+        runtime.hasRespawned = true;
+        clearWatchedSession(runtime);
+        setSessionId(runtime, undefined);
+        const expiredNotice =
+          "\r\n\x1b[33m[Session expired, starting fresh...]\x1b[0m\r\n";
+        appendPreview(runtime, expiredNotice);
+        runtime.xterm?.write(expiredNotice);
+        void spawnPty(runtime);
+        return;
+      }
+
+      // When a CLI tile's PTY exits (graceful or otherwise), keep the tile alive
+      // by demoting it to a plain user shell in the same xterm. This fixes the
+      // long-standing "restored CLI dies on Ctrl+C with no fallback shell" bug:
+      // restored CLI tiles spawn the CLI as PID 1 (no parent shell), so killing
+      // the CLI used to leave the tile dead. Now we transparently fall back.
+      if (runtime.meta.terminal.type !== "shell") {
+        const previousType = runtime.meta.terminal.type;
+        clearWatchedSession(runtime);
+        setSessionId(runtime, undefined);
+        runtime.removeHookSessionStarted?.();
+        runtime.removeHookSessionStarted = null;
+        if (runtime.hookFallbackTimer) {
+          clearTimeout(runtime.hookFallbackTimer);
+          runtime.hookFallbackTimer = null;
+        }
+        runtime.sessionCancel?.();
+        runtime.sessionCancel = null;
+        runtime.wasResumeAttempt = false;
+        runtime.hasRespawned = false;
+        setTerminalType(runtime, "shell");
+        // Note: we intentionally do not call telemetry.updateTerminal here.
+        // `clearWatchedSession` already invoked `detachSession`, which flips
+        // `session_attached` to false — that is the canonical signal that this
+        // terminal no longer has a live CLI session. The cached `provider`
+        // field is left untouched (telemetry-service.updateTerminal has no way
+        // to clear it; passing `undefined` is a silent no-op).
+        const fallbackNotice = `\r\n\x1b[2m[${previousType} exited with code ${exitCode}; dropped to shell]\x1b[0m\r\n`;
+        appendPreview(runtime, fallbackNotice);
+        runtime.xterm?.write(fallbackNotice);
+        void spawnPty(runtime);
+        return;
+      }
+
+      const nextStatus = exitCode === 0 ? "success" : "error";
+      setStatus(runtime, nextStatus);
+      appendPreview(runtime, getT().process_exited(exitCode));
+      notify(
+        exitCode === 0 ? "info" : "warn",
+        getT().terminal_exited(
+          getTerminalDisplayTitle(runtime.meta.terminal),
+          exitCode,
+        ),
       );
-      void spawnPty(runtime);
-      return;
-    }
-
-    const nextStatus = exitCode === 0 ? "success" : "error";
-    setStatus(runtime, nextStatus);
-    appendPreview(runtime, getT().process_exited(exitCode));
-    notify(
-      exitCode === 0 ? "info" : "warn",
-      getT().terminal_exited(getTerminalDisplayTitle(runtime.meta.terminal), exitCode),
-    );
-  });
-
-  const TURN_COMPLETE_DEDUP_MS = 5_000;
+    },
+  );
 
   const handleTurnComplete = () => {
     const now = Date.now();
@@ -1389,7 +1854,8 @@ function startTerminalRuntime(runtime: ManagedTerminalRuntime) {
     if (
       runtime.currentStatus !== "active" &&
       runtime.currentStatus !== "waiting"
-    ) return;
+    )
+      return;
     runtime.lastTurnCompletedAt = now;
     setStatus(runtime, "completed");
   };
@@ -1407,6 +1873,16 @@ function startTerminalRuntime(runtime: ManagedTerminalRuntime) {
     runtime.removeHookTurnComplete = window.termcanvas.hooks.onTurnComplete(
       (payload) => {
         if (payload.terminalId !== runtime.meta.terminal.id) return;
+        // Reject events from a stale CLI session: after a fallback-shell
+        // demotion the terminal id is reused, so a delayed hook event from
+        // the dead claude/codex run could otherwise corrupt the new shell's
+        // status. The terminal's current sessionId is the source of truth.
+        if (
+          payload.sessionId &&
+          payload.sessionId !== runtime.meta.terminal.sessionId
+        ) {
+          return;
+        }
         handleTurnComplete();
       },
     );
@@ -1414,6 +1890,12 @@ function startTerminalRuntime(runtime: ManagedTerminalRuntime) {
     runtime.removeHookStopFailure = window.termcanvas.hooks.onStopFailure(
       (payload) => {
         if (payload.terminalId !== runtime.meta.terminal.id) return;
+        if (
+          payload.sessionId &&
+          payload.sessionId !== runtime.meta.terminal.sessionId
+        ) {
+          return;
+        }
         if (payload.error) {
           setStatus(runtime, "error");
           appendPreview(
@@ -1429,17 +1911,19 @@ function startTerminalRuntime(runtime: ManagedTerminalRuntime) {
 
   const doSpawn = () => {
     if (runtime.disposed) return;
-    runtime.ptyPromise = spawnPty(runtime, runtime.meta.terminal.sessionId).finally(
-      () => {
-        runtime.ptyPromise = null;
-      },
-    );
+    runtime.ptyPromise = spawnPty(
+      runtime,
+      runtime.meta.terminal.sessionId,
+    ).finally(() => {
+      runtime.ptyPromise = null;
+    });
   };
 
   // For restored Claude/Codex sessions, read permission state from the
   // JSONL before spawning so the bypass flag is included in launch args.
   const needsPermissionSync =
-    (runtime.meta.terminal.type === "claude" || runtime.meta.terminal.type === "codex") &&
+    (runtime.meta.terminal.type === "claude" ||
+      runtime.meta.terminal.type === "codex") &&
     !!runtime.meta.terminal.sessionId &&
     !runtime.meta.terminal.autoApprove;
 
@@ -1467,7 +1951,8 @@ export function ensureTerminalRuntime(meta: TerminalRuntimeMeta) {
   if (existing) {
     existing.meta = resolvedMeta;
     existing.cliOverride =
-      usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ?? undefined;
+      usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ??
+      undefined;
     if (!existing.previewAnsi && resolvedMeta.terminal.scrollback) {
       pushPreview(existing, resolvedMeta.terminal.scrollback);
     }
@@ -1486,7 +1971,8 @@ export function updateTerminalRuntime(meta: TerminalRuntimeMeta) {
   const runtime = ensureTerminalRuntime(resolvedMeta);
   runtime.meta = resolvedMeta;
   runtime.cliOverride =
-    usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ?? undefined;
+    usePreferencesStore.getState().cliCommands[resolvedMeta.terminal.type] ??
+    undefined;
 
   if (!runtime.previewAnsi && resolvedMeta.terminal.scrollback) {
     pushPreview(runtime, resolvedMeta.terminal.scrollback);
@@ -1496,6 +1982,7 @@ export function updateTerminalRuntime(meta: TerminalRuntimeMeta) {
 export function setTerminalRuntimeMode(
   terminalId: string,
   mode: TerminalMountMode,
+  cause?: TerminalLifecycleCause,
 ) {
   const runtime = runtimeRegistry.get(terminalId);
   if (!runtime || runtime.mode === mode) {
@@ -1503,8 +1990,14 @@ export function setTerminalRuntimeMode(
     return;
   }
 
+  const previousMode = runtime.mode;
   runtime.mode = mode;
   updateRuntimeSnapshot(terminalId, { mode });
+  recordRuntimeDiagnostic(runtime, "terminal_runtime_mode_changed", {
+    ...getLifecycleDiagnosticData(cause),
+    next_mode: mode,
+    previous_mode: previousMode,
+  });
 
   if (mode === "live") {
     return;
@@ -1512,11 +2005,11 @@ export function setTerminalRuntimeMode(
 
   if (mode === "evicted") {
     runtime.xterm?.blur();
-    detachTerminalRenderer(runtime);
+    detachTerminalRenderer(runtime, cause);
     return;
   }
 
-  parkTerminalRenderer(runtime);
+  parkTerminalRenderer(runtime, cause);
 }
 
 export function attachTerminalContainer(
@@ -1530,6 +2023,9 @@ export function attachTerminalContainer(
   }
 
   runtime.attachOptions = options;
+  recordRuntimeDiagnostic(runtime, "terminal_container_attach", {
+    has_existing_xterm: !!runtime.xterm,
+  });
   if (runtime.usesAgentRenderer) {
     return;
   }
@@ -1544,7 +2040,7 @@ export function attachTerminalContainer(
     return;
   }
 
-  ensureRuntimeWebGL(runtime);
+  syncRuntimeRenderer(runtime);
   wireRendererBindings(runtime, host);
   scheduleRuntimeRefresh(() => {
     syncAttachedTerminalGeometry(runtime);
@@ -1552,13 +2048,19 @@ export function attachTerminalContainer(
   });
 }
 
-export function detachTerminalContainer(terminalId: string) {
+export function detachTerminalContainer(
+  terminalId: string,
+  cause?: TerminalLifecycleCause,
+) {
   const runtime = runtimeRegistry.get(terminalId);
   if (!runtime) {
     return;
   }
 
-  parkTerminalRenderer(runtime);
+  recordRuntimeDiagnostic(runtime, "terminal_container_detach", {
+    ...getLifecycleDiagnosticData(cause),
+  });
+  parkTerminalRenderer(runtime, cause);
 }
 
 export function fitTerminalRuntime(terminalId: string) {
@@ -1573,6 +2075,7 @@ export function fitTerminalRuntime(terminalId: string) {
     runtime.xterm.cols,
     runtime.xterm.rows,
   );
+  recordRuntimeDiagnostic(runtime, "terminal_runtime_fit_manual");
 }
 
 export function focusTerminalRuntime(terminalId: string): boolean {
@@ -1581,6 +2084,7 @@ export function focusTerminalRuntime(terminalId: string): boolean {
     return false;
   }
 
+  recordRuntimeDiagnostic(runtime, "terminal_runtime_focus");
   runtime.xterm.focus();
   return true;
 }
@@ -1595,8 +2099,22 @@ export function blurTerminalRuntime(terminalId: string): boolean {
   return true;
 }
 
+export function selectAllTerminalRuntime(terminalId: string): boolean {
+  const runtime = runtimeRegistry.get(terminalId);
+  if (!runtime?.xterm) {
+    return false;
+  }
+
+  runtime.xterm.selectAll();
+  return true;
+}
+
 export function touchTerminalRuntime(terminalId: string) {
   if (runtimeRegistry.get(terminalId)?.xterm) {
+    const runtime = runtimeRegistry.get(terminalId);
+    if (runtime) {
+      recordRuntimeDiagnostic(runtime, "terminal_runtime_touch");
+    }
     touchWebGL(terminalId);
   }
 }
@@ -1618,19 +2136,38 @@ export function serializeAllTerminalRuntimeBuffers(): Record<string, string> {
   return serialized;
 }
 
-export function destroyTerminalRuntime(terminalId: string) {
+export function destroyTerminalRuntime(
+  terminalId: string,
+  cause?: TerminalLifecycleCause,
+) {
   const runtime = runtimeRegistry.get(terminalId);
   if (!runtime) {
+    recordRenderDiagnostic({
+      kind: "terminal_runtime_destroy_skipped",
+      terminalId,
+      data: {
+        ...getLifecycleDiagnosticData(cause),
+        runtime_present: false,
+      },
+    });
     removeRuntimeSnapshot(terminalId);
+    clearTerminalActivity(terminalId);
     return;
   }
 
+  recordRuntimeDiagnostic(runtime, "terminal_runtime_destroy_requested", {
+    ...getLifecycleDiagnosticData(cause),
+    pty_present: runtime.ptyId !== null,
+  });
+  if (useTerminalFindStore.getState().openTerminalId === terminalId) {
+    useTerminalFindStore.getState().close();
+  }
   runtime.disposed = true;
   clearRuntimeTimers(runtime);
   runtime.sessionCancel?.();
   runtime.sessionCancel = null;
   runtime.xterm?.blur();
-  detachTerminalRenderer(runtime);
+  detachTerminalRenderer(runtime, cause);
   clearWatchedSession(runtime);
 
   runtime.outputUnsubscribe?.();
@@ -1663,11 +2200,41 @@ export function destroyTerminalRuntime(terminalId: string) {
 
   runtimeRegistry.delete(terminalId);
   removeRuntimeSnapshot(terminalId);
+  clearTerminalActivity(terminalId);
 }
 
 export function destroyAllTerminalRuntimes() {
   for (const terminalId of [...runtimeRegistry.keys()]) {
-    destroyTerminalRuntime(terminalId);
+    destroyTerminalRuntime(terminalId, {
+      caller: "destroyAllTerminalRuntimes",
+      reason: "destroy_all_terminal_runtimes",
+    });
+  }
+}
+
+/**
+ * Force every live terminal to repaint its full visible buffer.
+ *
+ * WebGL canvases lose their framebuffer content after the window is hidden
+ * (sleep/wake, minimize, GPU process restart) because `preserveDrawingBuffer`
+ * is not set. xterm's internal IntersectionObserver only triggers a catch-up
+ * repaint when `_needsFullRefresh` was set during the pause—which requires
+ * at least one `refreshRows` call while paused. If the terminal was idle
+ * the entire time, no repaint is queued and the canvas stays blank.
+ *
+ * Call this on `document.visibilitychange → "visible"` and after window
+ * restore/focus to guarantee every terminal repaints.
+ */
+export function refreshAllTerminalRenderers(reason = "unspecified") {
+  recordRenderDiagnostic({
+    kind: "terminal_refresh_all_renderers",
+    data: { reason, runtime_count: runtimeRegistry.size },
+  });
+  for (const runtime of runtimeRegistry.values()) {
+    if (!runtime.xterm || runtime.disposed) continue;
+    try {
+      runtime.xterm.refresh(0, runtime.xterm.rows - 1);
+    } catch { /* terminal may be mid-disposal */ }
   }
 }
 
@@ -1693,7 +2260,11 @@ export async function refreshClaudeSessionStates(): Promise<void> {
   const tasks: Promise<void>[] = [];
 
   for (const runtime of runtimeRegistry.values()) {
-    if (runtime.disposed || runtime.meta.terminal.type !== "claude" || runtime.ptyId === null) {
+    if (
+      runtime.disposed ||
+      runtime.meta.terminal.type !== "claude" ||
+      runtime.ptyId === null
+    ) {
       continue;
     }
 
@@ -1706,7 +2277,10 @@ export async function refreshClaudeSessionStates(): Promise<void> {
           await window.termcanvas.session.getClaudeByPid(pid);
         if (runtime.disposed) return;
 
-        if (latestSessionId && latestSessionId !== runtime.meta.terminal.sessionId) {
+        if (
+          latestSessionId &&
+          latestSessionId !== runtime.meta.terminal.sessionId
+        ) {
           setSessionId(runtime, latestSessionId);
         }
 

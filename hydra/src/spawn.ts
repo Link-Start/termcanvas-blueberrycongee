@@ -1,25 +1,23 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import crypto from "node:crypto";
-import {
-  ensureProjectTracked,
-  findProjectByPath,
-  projectRescan,
-} from "./termcanvas.ts";
-import { saveAgent } from "./store.ts";
-import { buildTaskPackageContext, writeTaskPackage } from "./task-package.ts";
+import { getRuntime } from "./runtime/index.ts";
+import { AGENT_STORE_SCHEMA_VERSION, saveAgent } from "./store.ts";
+import { writeRunTask } from "./run-task.ts";
 import { dispatchCreateOnly } from "./dispatcher.ts";
+import { getRunResultFile } from "./layout.ts";
 import {
   AUTO_APPROVE_AGENT_TYPES,
   DEFAULT_AGENT_TYPE,
+  SUPPORTED_AGENT_TYPES,
   parseAgentTypeFlag,
-  resolveCurrentAgentType,
-  resolveWorkerAgentType,
 } from "./agent-selection.ts";
-import type { AgentType } from "./handoff/types.ts";
+import { loadRole, type RoleTerminal } from "./roles/loader.ts";
+import type { AgentType } from "./assignment/types.ts";
 
 export interface SpawnArgs {
   task: string;
+  role?: string;
   workerType?: AgentType;
   repo: string;
   worktree?: string;
@@ -31,13 +29,14 @@ function printSpawnUsage(): never {
   console.log("Usage: hydra spawn [options]");
   console.log("");
   console.log("Options:");
-  console.log("  --task <desc>       Task description for the sub-agent (required)");
-  console.log("  --worker-type <type> Worker agent type");
-  console.log(`  --type <type>       Alias for --worker-type (fallback default: ${DEFAULT_AGENT_TYPE})`);
-  console.log("  --repo <path>       Path to the git repository (required)");
-  console.log("  --worktree <path>   Use an existing worktree (read-only mode)");
-  console.log("  --base-branch <br>  Base branch for the new worktree (default: current)");
-  console.log("  --no-auto-approve   Disable auto-approve (sub-agents auto-approve by default)");
+  console.log("  --task <desc>        Task description for the sub-agent (required)");
+  console.log("  --role <name>        Role from the registry (default: dev)");
+  console.log("  --worker-type <type> Override the role's CLI agent type");
+  console.log(`  --type <type>        Alias for --worker-type (fallback default: ${DEFAULT_AGENT_TYPE})`);
+  console.log("  --repo <path>        Path to the git repository (required)");
+  console.log("  --worktree <path>    Use an existing worktree (read-only mode)");
+  console.log("  --base-branch <br>   Base branch for the new worktree (default: current)");
+  console.log("  --no-auto-approve    Disable auto-approve (sub-agents auto-approve by default)");
   process.exit(0);
 }
 
@@ -54,6 +53,8 @@ export function parseSpawnArgs(args: string[]): SpawnArgs {
     const arg = args[i];
     if (arg === "--task" && i + 1 < args.length) {
       result.task = args[++i];
+    } else if (arg === "--role" && i + 1 < args.length) {
+      result.role = args[++i];
     } else if ((arg === "--worker-type" || arg === "--type") && i + 1 < args.length) {
       result.workerType = parseAgentTypeFlag(arg, args[++i]);
     } else if (arg === "--repo" && i + 1 < args.length) {
@@ -71,13 +72,20 @@ export function parseSpawnArgs(args: string[]): SpawnArgs {
 
   if (!result.task) throw new Error("Missing required flag: --task");
   if (!result.repo) throw new Error("Missing required flag: --repo");
-
   return result as SpawnArgs;
 }
 
 export function generateAgentId(): string {
   const hex = crypto.randomBytes(8).toString("hex");
   return `hydra-${hex}`;
+}
+
+function generateAssignmentId(agentId: string): string {
+  return `assignment-${agentId}`;
+}
+
+function generateRunId(agentId: string): string {
+  return `run-${agentId}`;
 }
 
 function getCurrentBranch(repoPath: string): string {
@@ -113,11 +121,49 @@ export function validateWorktreePath(repoPath: string, worktreePath: string): st
   return resolvedWorktree;
 }
 
+/**
+ * Inject default flags for `hydra scan`. Scan is a convenience alias for
+ * `hydra spawn --role janitor` with a default task.
+ */
+export function injectScanDefaults(args: string[]): string[] {
+  const result = [...args];
+  if (!result.includes("--role")) {
+    result.push("--role", "janitor");
+  }
+  if (!result.includes("--task")) {
+    result.push("--task", "Scan this repository for codebase entropy and produce a health report.");
+  }
+  return result;
+}
+
 export async function spawn(args: string[]): Promise<void> {
   const parsed = parseSpawnArgs(args);
   const repo = path.resolve(parsed.repo);
-  const workerType = resolveWorkerAgentType(parsed, process.env);
-  const parentAgentType = resolveCurrentAgentType(process.env) ?? workerType;
+
+  // Resolve role from registry. Fail fast if the role doesn't exist.
+  const roleName = parsed.role ?? "dev";
+  const role = loadRole(roleName, repo);
+
+  // Pick the first terminal whose CLI is a supported agent type.
+  const supportedSet = new Set<string>(SUPPORTED_AGENT_TYPES);
+  let chosenTerminal: RoleTerminal | undefined;
+  for (const terminal of role.terminals) {
+    if (supportedSet.has(terminal.cli)) {
+      chosenTerminal = terminal;
+      break;
+    }
+    console.error(`hydra: role "${roleName}" terminal cli="${terminal.cli}" is not a supported agent type, trying next`);
+  }
+  if (!chosenTerminal) {
+    throw new Error(
+      `Role "${roleName}" has no terminal with a supported CLI (tried: ${role.terminals.map(t => t.cli).join(", ")})`,
+    );
+  }
+
+  // User --type overrides role terminal; otherwise role terminal wins.
+  const workerType = parsed.workerType ?? (chosenTerminal.cli as AgentType);
+  const model = chosenTerminal.model;
+  const reasoningEffort = chosenTerminal.reasoning_effort;
 
   if (parsed.autoApprove && !AUTO_APPROVE_AGENT_TYPES.has(workerType)) {
     throw new Error(
@@ -127,7 +173,8 @@ export async function spawn(args: string[]): Promise<void> {
 
   const agentId = generateAgentId();
   const workflowId = `workflow-${agentId}`;
-  const handoffId = `handoff-${agentId}`;
+  const assignmentId = generateAssignmentId(agentId);
+  const runId = generateRunId(agentId);
   const baseBranch = parsed.baseBranch ?? getCurrentBranch(repo);
 
   let worktreePath: string;
@@ -148,90 +195,89 @@ export async function spawn(args: string[]): Promise<void> {
     ownWorktree = true;
   }
 
-  const project = ensureProjectTracked(repo);
-  projectRescan(project.id);
+  const runtime = getRuntime();
+  runtime.ensureProjectTracked(repo);
+  runtime.syncProject(repo);
 
-  const taskPackage = buildTaskPackageContext({
-    workspaceRoot: worktreePath,
-    workflowId,
-    handoffId,
-    from: {
-      role: "planner",
-      agent_type: parentAgentType,
-      agent_id: process.env.TERMCANVAS_TERMINAL_ID ?? "hydra-spawn",
-    },
-    to: {
-      role: "implementer",
-      agent_type: workerType,
-      agent_id: null,
-    },
-    task: {
-      type: parsed.worktree ? "read-only-task" : "code-change-task",
-      title: parsed.task.slice(0, 80),
-      description: parsed.task,
-      acceptance_criteria: [
-        "Complete the requested task",
-        "Write a valid result.json file",
-        "Write the done marker after result.json is complete",
-      ],
-    },
-    context: {
-      files: [],
-      previous_handoffs: [],
-      shared_state: {
-        worktree_path: worktreePath,
-        branch,
-        base_branch: baseBranch,
+  const taskRun = writeRunTask({
+    repoPath: repo,
+    workbenchId: workflowId,
+    assignmentId,
+    runId,
+    role: roleName,
+    agentType: workerType,
+    model,
+    reasoningEffort,
+    roleBody: role.body,
+    sourceRole: null,
+    objective: [
+      parsed.task,
+    ],
+    readFiles: [],
+    writeTargets: [
+      {
+        label: "Result JSON",
+        path: getRunResultFile(repo, workflowId, assignmentId, runId),
       },
-    },
+    ],
+    decisionRules: [
+      "Use outcome=completed when your work is done.",
+      "Use outcome=stuck when you cannot proceed without external help.",
+      "Use outcome=error only for technical failures.",
+    ],
+    acceptanceCriteria: [
+      "Complete the requested task",
+      "Write a valid result.json file",
+    ],
+    skills: [],
   });
-  const artifacts = writeTaskPackage(taskPackage.contract);
 
-  const parentTerminalId = process.env.TERMCANVAS_TERMINAL_ID;
+  const parentTerminalId = runtime.getCurrentLeadId();
   const dispatch = await dispatchCreateOnly({
-    workflowId,
-    handoffId,
+    workbenchId: workflowId,
+    assignmentId,
+    runId,
     repoPath: repo,
     worktreePath,
     agentType: workerType,
-    taskFile: artifacts.task_file,
-    doneFile: artifacts.done_file,
-    resultFile: artifacts.result_file,
+    model,
+    reasoningEffort,
+    taskFile: taskRun.task_file,
+    resultFile: taskRun.result_file,
     autoApprove: parsed.autoApprove,
     parentTerminalId,
   });
 
-  // Cleanup is manual via `hydra cleanup <agentId>` or Cmd+D in the app.
   saveAgent({
+    schema_version: AGENT_STORE_SCHEMA_VERSION,
     id: agentId,
     task: parsed.task,
     type: workerType,
+    role: roleName,
     workflowId,
-    handoffId,
+    assignmentId,
+    runId,
     repo,
     terminalId: dispatch.terminalId,
     worktreePath,
     branch,
     baseBranch,
     ownWorktree,
-    taskFile: artifacts.task_file,
-    handoffFile: artifacts.handoff_file,
-    resultFile: artifacts.result_file,
-    doneFile: artifacts.done_file,
+    taskFile: taskRun.task_file,
+    resultFile: taskRun.result_file,
     createdAt: new Date().toISOString(),
   });
 
-  const result = {
+  console.log(JSON.stringify({
     agentId,
     workflowId,
-    handoffId,
+    assignmentId,
+    runId,
+    role: roleName,
     terminalId: dispatch.terminalId,
     worktreePath,
     branch,
-    handoffFile: artifacts.handoff_file,
-    taskFile: artifacts.task_file,
-    resultFile: artifacts.result_file,
-    doneFile: artifacts.done_file,
-  };
-  console.log(JSON.stringify(result, null, 2));
+    taskFile: taskRun.task_file,
+    resultFile: taskRun.result_file,
+  }, null, 2));
 }

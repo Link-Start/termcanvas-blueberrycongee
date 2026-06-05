@@ -12,8 +12,7 @@ function loadTheme(): Theme {
   try {
     const saved = localStorage.getItem("termcanvas-theme");
     if (saved === "dark" || saved === "light") return saved;
-  } catch {
-  }
+  } catch {}
   return "dark";
 }
 
@@ -30,8 +29,7 @@ export const useThemeStore = create<ThemeStore>((set) => ({
       document.documentElement.setAttribute("data-theme", next);
       try {
         localStorage.setItem("termcanvas-theme", next);
-      } catch {
-      }
+      } catch {}
       return { theme: next };
     }),
 }));
@@ -42,7 +40,7 @@ export const XTERM_THEMES: Record<Theme, ITheme> = {
     foreground: "#e4e2df",
     cursor: "#e4e2df",
     cursorAccent: "#1a1918",
-    selectionBackground: "rgba(91, 158, 245, 0.25)",
+    selectionBackground: "rgba(196, 192, 184, 0.25)",
     black: "#1e1d1c",
     red: "#d4685a",
     green: "#6ab07a",
@@ -65,22 +63,22 @@ export const XTERM_THEMES: Record<Theme, ITheme> = {
     foreground: "#1c1917",
     cursor: "#1c1917",
     cursorAccent: "#eae8e4",
-    selectionBackground: "rgba(37, 99, 235, 0.18)",
+    selectionBackground: "rgba(68, 64, 60, 0.18)",
     black: "#44403c",
-    red: "#dc2626",
-    green: "#16a34a",
-    yellow: "#d97706",
+    red: "#b91c1c",
+    green: "#166534",
+    yellow: "#92400e",
     blue: "#1e40af",
     magenta: "#7c3aed",
     cyan: "#0b6158",
-    white: "#8b847c",
-    brightBlack: "#78716c",
+    white: "#8a837b",
+    brightBlack: "#57534e",
     brightRed: "#b91c1c",
-    brightGreen: "#15803d",
-    brightYellow: "#a16207",
+    brightGreen: "#166534",
+    brightYellow: "#92400e",
     brightBlue: "#1e3a8a",
     brightMagenta: "#6d28d9",
     brightCyan: "#0d4f4a",
-    brightWhite: "#b2aba3",
+    brightWhite: "#8a837b",
   },
 };

@@ -1,5 +1,6 @@
 ﻿import { useEffect, useRef, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
+import { Search } from "lucide-react";
 import type { TerminalData } from "../types";
 import { activateTerminalInScene } from "../actions/sceneSelectionActions";
 import {
@@ -14,8 +15,8 @@ import {
   findTerminalById,
   getChildTerminals,
 } from "../stores/projectStore";
-import { useSelectionStore } from "../stores/selectionStore";
 import { ContextMenu } from "../components/ContextMenu";
+import { TagManager } from "./TagManager";
 import { usePreferencesStore } from "../stores/preferencesStore";
 import { useCanvasStore } from "../stores/canvasStore";
 import { getTerminalHeaderContextLabel } from "../stores/terminalState";
@@ -23,6 +24,8 @@ import { useResolvedTerminalRuntimeState } from "../stores/terminalRuntimeStateS
 import { useT } from "../i18n/useT";
 import { getComposerAdapter } from "./cliConfig";
 import { panToTerminal } from "../utils/panToTerminal";
+import { panToWorktree } from "../utils/panToWorktree";
+import { focusWorktreeInScene } from "../actions/sceneSelectionActions";
 import { requestSummary, useIsSummarizing } from "./summaryScheduler";
 import {
   attachTerminalContainer,
@@ -42,8 +45,20 @@ import {
   scheduleTerminalFocus,
 } from "./focusScheduler";
 import { useSidebarDragStore } from "../stores/sidebarDragStore";
+import { usePinDragStore } from "../stores/pinDragStore";
+import { usePinStore } from "../stores/pinStore";
+import { useHandoffDragStore } from "../stores/handoffDragStore";
+import { useNotificationStore } from "../stores/notificationStore";
+import { useViewportFocusStore } from "../stores/viewportFocusStore";
 import { TERMINAL_TYPE_CONFIG } from "./terminalTypeConfig";
 import { AgentRenderer } from "../components/agent/AgentRenderer";
+import { ActivitySparkline } from "./ActivitySparkline";
+import { TerminalFindOverlay } from "./TerminalFindOverlay";
+import { WtermTile } from "./WtermTile";
+import { useTerminalFindStore } from "../stores/terminalFindStore";
+import { recordRenderDiagnostic } from "./renderDiagnostics";
+import { resetWebGL } from "./webglContextPool";
+import { refreshRegisteredTerminalViewports } from "./terminalRegistry";
 
 interface Props {
   lodMode: TerminalMountMode;
@@ -52,17 +67,8 @@ interface Props {
   worktreeName: string;
   worktreePath: string;
   terminal: TerminalData;
-  gridX: number;
-  gridY: number;
   width: number;
   height: number;
-  onDragStart?: (terminalId: string, e: React.MouseEvent) => void;
-  isDragging?: boolean;
-  isStashing?: boolean;
-  dragOffsetX?: number;
-  dragOffsetY?: number;
-  onDoubleClick?: () => void;
-  onSpanChange?: (span: { cols: number; rows: number }) => void;
 }
 
 const TYPE_CONFIG = TERMINAL_TYPE_CONFIG;
@@ -81,7 +87,7 @@ function HierarchyBadges({ terminal }: { terminal: TerminalData }) {
     <>
       {parentInfo && (
         <button
-          className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] text-[var(--text-faint)] hover:text-[var(--text-secondary)] hover:bg-[var(--border)] transition-colors duration-150 shrink-0"
+          className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] text-[var(--text-faint)] hover:text-[var(--text-secondary)] hover:bg-[var(--border)] transition-colors duration-quick shrink-0"
           title={`Parent: ${parentInfo.terminal.title} (${parentInfo.terminal.type})`}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
@@ -104,7 +110,7 @@ function HierarchyBadges({ terminal }: { terminal: TerminalData }) {
       )}
       {children.length > 0 && (
         <button
-          className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] text-[var(--text-faint)] hover:text-[var(--text-secondary)] hover:bg-[var(--border)] transition-colors duration-150 shrink-0"
+          className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] text-[var(--text-faint)] hover:text-[var(--text-secondary)] hover:bg-[var(--border)] transition-colors duration-quick shrink-0"
           title={`${children.length} agent${children.length > 1 ? "s" : ""}`}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
@@ -180,19 +186,14 @@ export function TerminalTile({
   worktreeName,
   worktreePath,
   terminal,
-  gridX,
-  gridY,
   width,
   height,
-  onDragStart,
-  isDragging = false,
-  isStashing = false,
-  dragOffsetX = 0,
-  dragOffsetY = 0,
-  onDoubleClick,
-  onSpanChange,
 }: Props) {
   const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [tagManager, setTagManager] = useState<{
     x: number;
     y: number;
   } | null>(null);
@@ -213,6 +214,7 @@ export function TerminalTile({
   const copiedNonce = useTerminalRuntimeStore(
     (s) => s.terminals[terminal.id]?.copiedNonce ?? 0,
   );
+  const mountNonceRef = useRef(copiedNonce);
   const previewText = useTerminalRuntimeStore(
     (s) => s.terminals[terminal.id]?.previewText ?? "",
   );
@@ -225,8 +227,37 @@ export function TerminalTile({
 
   const isAgent = terminal.type === "claude" || terminal.type === "codex";
   const useAgentRenderer = false; // TODO: re-enable when agent renderer is ready
+  const latestLodModeRef = useRef(lodMode);
+  const latestContainerElRef = useRef<HTMLDivElement | null>(containerEl);
+  latestLodModeRef.current = lodMode;
+  latestContainerElRef.current = containerEl;
   const isSummarizing = useIsSummarizing(terminal.id);
   const sidebarDragActive = useSidebarDragStore((s) => s.active);
+  const taskDragActive = usePinDragStore((s) => s.active);
+  const handoffActive = useHandoffDragStore((s) => s.active);
+  const handoffSourceId = useHandoffDragStore((s) => s.payload?.sourceTerminalId ?? null);
+  const handoffHoveredTerminalId = useHandoffDragStore(
+    (s) => s.hoveredTerminalId,
+  );
+  const isHandoffSource = handoffActive && handoffSourceId === terminal.id;
+  const isHandoffTarget =
+    handoffActive && handoffHoveredTerminalId === terminal.id;
+  const terminalTaskAssignment = usePinStore(
+    (s) => s.terminalPinMap[terminal.id],
+  );
+  const [taskFlash, setTaskFlash] = useState(false);
+  const taskFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const composerAdapter = getComposerAdapter(terminal.type);
+  const acceptsTaskDrop = composerAdapter !== null;
+  const viewportScale = useCanvasStore((s) => s.viewport.scale);
+  const zoomedOutTerminalId = useViewportFocusStore(
+    (s) => s.zoomedOutTerminalId,
+  );
+  const fitAllScale = useViewportFocusStore((s) => s.fitAllScale);
+  const isOverviewMode =
+    fitAllScale !== null &&
+    zoomedOutTerminalId !== null &&
+    viewportScale <= fitAllScale * 1.2;
   const liveRuntimeState = useResolvedTerminalRuntimeState(terminal);
   const liveTerminal = {
     ...terminal,
@@ -248,13 +279,6 @@ export function TerminalTile({
     worktreeName,
     terminal.title,
   );
-  const projectName = useProjectStore(
-    useCallback(
-      (s) => s.projects.find((p) => p.id === projectId)?.name ?? "",
-      [projectId],
-    ),
-  );
-
   useEffect(() => {
     if (!isEditingCustomTitle) {
       setCustomTitleDraft(terminal.customTitle ?? "");
@@ -280,6 +304,17 @@ export function TerminalTile({
     setIsEditingCustomTitle(false);
   }, [customTitleDraft, projectId, terminal.id, worktreeId]);
 
+  const zoomIntoTerminalFromOverview = useCallback(() => {
+    activateTerminalInScene(projectId, worktreeId, terminal.id);
+    panToTerminal(terminal.id);
+    useViewportFocusStore.getState().setZoomedOutTerminalId(null);
+  }, [projectId, terminal.id, worktreeId]);
+
+  const focusTerminalInOverview = useCallback(() => {
+    activateTerminalInScene(projectId, worktreeId, terminal.id);
+    useViewportFocusStore.getState().setZoomedOutTerminalId(terminal.id);
+  }, [projectId, terminal.id, worktreeId]);
+
   useEffect(() => {
     if (!isEditingCustomTitle) return;
 
@@ -289,16 +324,17 @@ export function TerminalTile({
     });
   }, [isEditingCustomTitle]);
 
-  const isSelected = useSelectionStore((s) =>
-    s.selectedItems.some(
-      (item) => item.type === "terminal" && item.terminalId === terminal.id,
-    ),
-  );
-
   useEffect(() => {
-    if (copiedNonce === 0) {
+    // Skip the initial mount — only show the toast when the nonce actually
+    // increments after the component is alive.  Without this guard, terminals
+    // re-mounted by React Flow's onlyRenderVisibleElements (e.g. after
+    // cmd+e zoom-to-fit) would re-flash the "Copied" toast for every
+    // terminal that was copied in the past.
+    if (copiedNonce === 0 || copiedNonce === mountNonceRef.current) {
+      mountNonceRef.current = copiedNonce;
       return;
     }
+    mountNonceRef.current = copiedNonce;
 
     if (copiedTimerRef.current) {
       clearTimeout(copiedTimerRef.current);
@@ -318,8 +354,26 @@ export function TerminalTile({
       if (copiedTimerRef.current) {
         clearTimeout(copiedTimerRef.current);
       }
+      if (taskFlashTimerRef.current) {
+        clearTimeout(taskFlashTimerRef.current);
+      }
     },
     [],
+  );
+
+  useEffect(
+    () => () => {
+      recordRenderDiagnostic({
+        kind: "terminal_tile_unmount",
+        terminalId: terminal.id,
+        data: {
+          had_container: latestContainerElRef.current !== null,
+          lod_mode: latestLodModeRef.current,
+          use_agent_renderer: useAgentRenderer,
+        },
+      });
+    },
+    [terminal.id, useAgentRenderer],
   );
 
   useEffect(() => {
@@ -329,7 +383,15 @@ export function TerminalTile({
 
     attachTerminalContainer(terminal.id, containerEl);
     return () => {
-      detachTerminalContainer(terminal.id);
+      detachTerminalContainer(terminal.id, {
+        caller: "TerminalTile.liveEffect",
+        detail: {
+          container_present: !!containerEl,
+          lod_mode: lodMode,
+          use_agent_renderer: useAgentRenderer,
+        },
+        reason: "terminal_tile_live_effect_cleanup",
+      });
     };
   }, [lodMode, terminal.id, useAgentRenderer, containerEl]);
 
@@ -460,6 +522,11 @@ export function TerminalTile({
   }, [isAgent, sidebarDragActive, terminal.id, containerEl]);
 
   const composerEnabled = usePreferencesStore((s) => s.composerEnabled);
+  const activityHeatmapEnabled = usePreferencesStore(
+    (s) => s.activityHeatmapEnabled,
+  );
+  const terminalRenderer = usePreferencesStore((s) => s.terminalRenderer);
+  const terminalEngine = usePreferencesStore((s) => s.terminalEngine);
   const focusLiveTerminal = useCallback(() => {
     const tile = tileRef.current;
     if (!tile || tile.getClientRects().length === 0) {
@@ -534,88 +601,142 @@ export function TerminalTile({
   useEffect(() => {
     if (!containerEl || lodMode !== "live") return;
 
-    const corrected = new WeakSet<Event>();
-
-    const fix = (e: MouseEvent) => {
-      if (corrected.has(e)) return;
-      const { scale } = useCanvasStore.getState().viewport;
-      if (scale === 1) return;
-
-      // xterm computes selection coordinates from `.xterm-screen`, not the
-      // outer host div. When the canvas is zoomed, even a tiny mismatch between
-      // the host hitbox and xterm's actual screen area expands into a visible
-      // dead zone near the top-left. Measure against the real screen element
-      // and, if the pointer lands in a host/gap area, re-dispatch to the xterm
-      // root so selection still starts inside xterm.
-      const xtermRoot = containerEl.querySelector(".xterm");
-      const screenElement =
-        containerEl.querySelector(".xterm-screen") ?? xtermRoot ?? containerEl;
-      const rect = screenElement.getBoundingClientRect();
-      const dispatchTarget =
-        e.target instanceof Element &&
-        xtermRoot instanceof Element &&
-        xtermRoot.contains(e.target)
-          ? e.target
-          : (xtermRoot ?? containerEl);
-      const adjusted = new MouseEvent(e.type, {
-        altKey: e.altKey,
-        bubbles: e.bubbles,
-        button: e.button,
-        buttons: e.buttons,
-        cancelable: e.cancelable,
-        clientX: rect.left + (e.clientX - rect.left) / scale,
-        clientY: rect.top + (e.clientY - rect.top) / scale,
-        ctrlKey: e.ctrlKey,
-        detail: e.detail,
-        metaKey: e.metaKey,
-        screenX: e.screenX,
-        screenY: e.screenY,
-        shiftKey: e.shiftKey,
-      });
-
-      corrected.add(adjusted);
+    // Overview-mode click handling: tile clicks focus, double-click zooms
+    // back into normal mode. Bypasses xterm entirely.
+    const overview = (e: MouseEvent) => {
+      if (!isOverviewMode) return;
+      if (
+        e.type !== "mousedown" &&
+        e.type !== "mouseup" &&
+        e.type !== "click" &&
+        e.type !== "dblclick"
+      ) return;
       e.stopPropagation();
       e.preventDefault();
-      dispatchTarget.dispatchEvent(adjusted);
+      if (e.type === "click" && e.detail === 1) focusTerminalInOverview();
+      else if (e.type === "dblclick") zoomIntoTerminalFromOverview();
     };
 
-    // When zoomed, capture pointer on mousedown so that mousemove/mouseup
-    // events route through this container even when the cursor leaves it.
-    // Without this, xterm's document-level selection listener receives
-    // uncorrected coordinates while the mouse is outside, causing the
-    // selection to jump when the mouse re-enters.
-    const capturePointer = (e: PointerEvent) => {
-      if (e.button !== 0) return;
-      const { scale } = useCanvasStore.getState().viewport;
-      if (scale === 1) return;
-      const target = e.target instanceof Element ? e.target : containerEl;
-      target.setPointerCapture(e.pointerId);
-    };
+    // Stop mousedown from bubbling past containerEl so it never starts a
+    // canvas pan — every click inside terminal content would otherwise
+    // fight xterm's selection.
+    const stopMouseDownBubble = (e: MouseEvent) => e.stopPropagation();
 
-    // Stop mousedown from bubbling past the container so it never reaches
-    // the Canvas pan handler.  Without this, every click inside the terminal
-    // content area also starts a canvas pan, fighting xterm's selection.
-    // At scale != 1 the corrected event also needs to be caught; at scale 1
-    // the original native event needs to be caught.
-    const stopMouseDownBubble = (e: MouseEvent) => {
-      e.stopPropagation();
-    };
-
-    const types = ["mousedown", "mousemove", "mouseup", "dblclick"];
-    for (const type of types) {
-      containerEl.addEventListener(type, fix as EventListener, true);
+    const overviewTypes = ["mousedown", "mouseup", "click", "dblclick"] as const;
+    for (const type of overviewTypes) {
+      containerEl.addEventListener(type, overview, true);
     }
     containerEl.addEventListener("mousedown", stopMouseDownBubble);
-    containerEl.addEventListener("pointerdown", capturePointer);
 
     return () => {
-      for (const type of types) {
-        containerEl.removeEventListener(type, fix as EventListener, true);
+      for (const type of overviewTypes) {
+        containerEl.removeEventListener(type, overview, true);
       }
       containerEl.removeEventListener("mousedown", stopMouseDownBubble);
-      containerEl.removeEventListener("pointerdown", capturePointer);
     };
-  }, [lodMode, containerEl]);
+  }, [
+    containerEl,
+    focusTerminalInOverview,
+    isOverviewMode,
+    lodMode,
+    zoomIntoTerminalFromOverview,
+  ]);
+
+  const flashTaskAccept = useCallback(() => {
+    setTaskFlash(true);
+    if (taskFlashTimerRef.current) clearTimeout(taskFlashTimerRef.current);
+    taskFlashTimerRef.current = setTimeout(() => {
+      setTaskFlash(false);
+      taskFlashTimerRef.current = null;
+    }, 350);
+  }, []);
+
+  const handleTaskDropPayload = useCallback(
+    async (raw: string) => {
+      let parsed: { repo: string; id: string };
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!parsed?.repo || !parsed?.id) return;
+
+      const ptyId = getTerminalPtyId(terminal.id);
+      if (ptyId === null) {
+        useNotificationStore
+          .getState()
+          .notify("warn", t["pin.dispatch.terminalNotRunning"]);
+        return;
+      }
+      if (!composerAdapter) {
+        useNotificationStore
+          .getState()
+          .notify(
+            "warn",
+            t["pin.dispatch.unsupportedTerminal"](terminal.type),
+          );
+        return;
+      }
+
+      activateTerminalInScene(projectId, worktreeId, terminal.id);
+
+      try {
+        const result = await window.termcanvas.pins.dispatchToTerminal(
+          parsed.repo,
+          parsed.id,
+          {
+            terminalId: terminal.id,
+            ptyId,
+            terminalType: terminal.type,
+            worktreePath,
+          },
+        );
+        if (result.ok) {
+          // Record the terminal ↔ pin association for the badge. Look the
+          // full pin up so we cache its current title; if the project
+          // drawer is closed for some reason (rare race) fall back to a
+          // placeholder title — the entry still resolves visually.
+          const pinState = usePinStore.getState();
+          const fullPin = (pinState.pinsByProject[parsed.repo] ?? []).find(
+            (entry) => entry.id === parsed.id,
+          );
+          pinState.assignPinToTerminal(
+            terminal.id,
+            fullPin ?? {
+              id: parsed.id,
+              repo: parsed.repo,
+              title: t["pin.untitled"],
+            },
+          );
+          flashTaskAccept();
+        } else {
+          useNotificationStore
+            .getState()
+            .notify(
+              "error",
+              t["pin.dispatch.failed"](
+                result.detail ?? result.error ?? "unknown",
+              ),
+            );
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        useNotificationStore
+          .getState()
+          .notify("error", t["pin.dispatch.failed"](detail));
+      }
+    },
+    [
+      composerAdapter,
+      flashTaskAccept,
+      projectId,
+      t,
+      terminal.id,
+      terminal.type,
+      worktreeId,
+      worktreePath,
+    ],
+  );
 
   // Intercept drag events on the xterm container in the capture phase so they
   // are not swallowed by xterm's own handlers.
@@ -623,7 +744,14 @@ export function TerminalTile({
     const container = containerEl;
     if (!container || lodMode !== "live") return;
 
+    const isTaskDrag = (e: DragEvent) =>
+      !!e.dataTransfer &&
+      Array.from(e.dataTransfer.types).includes(
+        "application/x-termcanvas-pin",
+      );
+
     const onDragOver = (e: DragEvent) => {
+      if (isTaskDrag(e) && !acceptsTaskDrop) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
@@ -636,17 +764,27 @@ export function TerminalTile({
     };
 
     const onDrop = (e: DragEvent) => {
+      if (isTaskDrag(e)) {
+        if (!acceptsTaskDrop) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOver(false);
+        const raw = e.dataTransfer?.getData("application/x-termcanvas-pin");
+        if (raw) void handleTaskDropPayload(raw);
+        return;
+      }
+
       e.preventDefault();
       e.stopPropagation();
       setDragOver(false);
 
-      const filePath = e.dataTransfer?.getData("text/plain");
-      if (!filePath) return;
+      const rawPath = e.dataTransfer?.getData("text/plain");
+      if (!rawPath) return;
 
       const ptyId = getTerminalPtyId(terminal.id);
       if (ptyId === null) return;
 
-      const escaped = shellEscapePath(filePath);
+      const escaped = rawPath.split("\n").filter(Boolean).map(shellEscapePath).join(" ");
       window.termcanvas.terminal.input(ptyId, " " + escaped);
       activateTerminalInScene(projectId, worktreeId, terminal.id);
     };
@@ -660,18 +798,44 @@ export function TerminalTile({
       container.removeEventListener("dragleave", onDragLeave, true);
       container.removeEventListener("drop", onDrop, true);
     };
-  }, [containerEl, lodMode, projectId, terminal.id, worktreeId]);
+  }, [
+    containerEl,
+    lodMode,
+    projectId,
+    terminal.id,
+    worktreeId,
+    acceptsTaskDrop,
+    handleTaskDropPayload,
+  ]);
 
   const handleClose = useCallback(() => {
     closeTerminalInScene(projectId, worktreeId, terminal.id);
   }, [projectId, terminal.id, worktreeId]);
 
-  const handleTileDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    e.dataTransfer.dropEffect = "copy";
-    setDragOver(true);
-  }, []);
+  const handleOpenFind = useCallback(() => {
+    // Capture the xterm selection BEFORE activation — focus changes
+    // triggered by activateTerminalInScene can drop the selection, which
+    // would break "select text → click magnifier → search box prefilled".
+    const selection = getTerminalRuntime(terminal.id)?.xterm?.getSelection() ?? "";
+    activateTerminalInScene(projectId, worktreeId, terminal.id, {
+      focusInput: false,
+    });
+    useTerminalFindStore.getState().openFor(terminal.id, selection);
+  }, [projectId, terminal.id, worktreeId]);
+
+  const isTaskDragEvent = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer.types).includes("application/x-termcanvas-pin");
+
+  const handleTileDragOver = useCallback(
+    (e: React.DragEvent) => {
+      if (isTaskDragEvent(e) && !acceptsTaskDrop) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = "copy";
+      setDragOver(true);
+    },
+    [acceptsTaskDrop],
+  );
 
   const handleTileDragLeave = useCallback((e: React.DragEvent) => {
     e.stopPropagation();
@@ -680,60 +844,77 @@ export function TerminalTile({
 
   const handleTileDrop = useCallback(
     (e: React.DragEvent) => {
+      if (isTaskDragEvent(e)) {
+        if (!acceptsTaskDrop) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOver(false);
+        const raw = e.dataTransfer.getData("application/x-termcanvas-pin");
+        if (raw) void handleTaskDropPayload(raw);
+        return;
+      }
+
       e.preventDefault();
       e.stopPropagation();
       setDragOver(false);
 
-      const filePath = e.dataTransfer.getData("text/plain");
-      if (!filePath) return;
+      const rawPath = e.dataTransfer.getData("text/plain");
+      if (!rawPath) return;
 
       const ptyId = getTerminalPtyId(terminal.id);
       if (ptyId === null) return;
 
-      const escaped = shellEscapePath(filePath);
+      const escaped = rawPath.split("\n").filter(Boolean).map(shellEscapePath).join(" ");
       window.termcanvas.terminal.input(ptyId, " " + escaped);
       activateTerminalInScene(projectId, worktreeId, terminal.id);
     },
-    [projectId, terminal.id, worktreeId],
+    [
+      acceptsTaskDrop,
+      handleTaskDropPayload,
+      projectId,
+      terminal.id,
+      worktreeId,
+    ],
   );
 
   return (
     <div
       ref={tileRef}
+      data-focused={terminal.focused ? "true" : undefined}
+      data-drag-over={dragOver ? "true" : undefined}
+      data-task-flash={taskFlash ? "true" : undefined}
+      data-receptive={
+        taskDragActive && acceptsTaskDrop && !dragOver && !taskFlash
+          ? "true"
+          : undefined
+      }
+      data-overview={isOverviewMode ? "true" : undefined}
+      data-handoff-terminal-id={terminal.id}
+      data-handoff-source={isHandoffSource ? "true" : undefined}
+      data-handoff-target={isHandoffTarget ? "true" : undefined}
       onDragOver={handleTileDragOver}
       onDragLeave={handleTileDragLeave}
       onDrop={handleTileDrop}
-      className="absolute terminal-tile rounded-md bg-[var(--bg)] overflow-hidden flex flex-col"
+      className="terminal-tile rounded-md border border-[var(--border)] bg-[var(--surface)] overflow-hidden flex flex-col h-full w-full"
       style={{
-        left: gridX + (isDragging ? dragOffsetX : 0),
-        top: gridY + (isDragging ? dragOffsetY : 0),
         width: width,
         height: terminal.minimized ? "auto" : height,
-        zIndex: isDragging ? 50 : undefined,
-        opacity: isStashing ? 0.4 : isDragging ? 0.9 : 1,
-        transition:
-          isDragging || lodMode === "live"
-            ? "none"
-            : "left 0.2s ease, top 0.2s ease, width 0.2s ease, height 0.2s ease",
-        boxShadow: isDragging
-          ? "0 8px 32px rgba(0,0,0,0.3)"
-          : dragOver
-            ? "0 0 0 2px var(--accent), 0 0 12px color-mix(in srgb, var(--accent) 25%, transparent)"
-            : terminal.focused
-              ? "0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), 0 0 8px color-mix(in srgb, var(--accent) 15%, transparent)"
-              : undefined,
-        transform: isStashing
-          ? "scale(0.95)"
-          : isDragging
-            ? "scale(1.02)"
-            : undefined,
         outline: "none",
       }}
       onClick={(e) => {
         e.stopPropagation();
+        if (isOverviewMode) {
+          focusTerminalInOverview();
+          return;
+        }
         activateTerminalInScene(projectId, worktreeId, terminal.id, {
           focusInput: false,
         });
+      }}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        if (!isOverviewMode) return;
+        zoomIntoTerminalFromOverview();
       }}
       onMouseEnter={() => {
         window.dispatchEvent(
@@ -748,17 +929,26 @@ export function TerminalTile({
       onWheel={(e) => e.stopPropagation()}
     >
       <div
-        className="flex items-center gap-2 px-3 py-2 select-none shrink-0 cursor-grab active:cursor-grabbing"
-        onMouseDown={(e) => onDragStart?.(terminal.id, e)}
-        onDoubleClick={onDoubleClick}
+        className="tc-tile-header relative flex items-center gap-2 px-3 py-2 select-none shrink-0"
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
           setContextMenu({ x: e.clientX, y: e.clientY });
         }}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          if (isOverviewMode) {
+            zoomIntoTerminalFromOverview();
+            return;
+          }
+          panToTerminal(terminal.id);
+        }}
       >
         {terminal.origin !== "agent" && (
-          <div className="w-[3px] h-3 rounded-full bg-amber-500/60 shrink-0" />
+          <div
+            className="w-[3px] h-3 rounded-full shrink-0"
+            style={{ background: "var(--amber)", opacity: 0.7 }}
+          />
         )}
         <span
           className="text-[11px] font-medium"
@@ -767,35 +957,24 @@ export function TerminalTile({
           {config.label}
         </span>
         <HierarchyBadges terminal={terminal} />
-        {projectName && (
-          <span
-            className="shrink-0 whitespace-nowrap text-[11px] font-medium text-[var(--text-primary)]"
-            style={{
-              fontFamily: '"Geist Mono", monospace',
-              position: "relative" as const,
-              padding: "0.1em 0.4em 0.15em 0.3em",
-              backgroundImage: [
-                "linear-gradient(104deg, transparent 0.9%, rgba(255,224,0,0.1) 2.4%, rgba(255,224,0,0.4) 5.8%, rgba(255,224,0,0.32) 40%, rgba(255,224,0,0.45) 55%, rgba(255,224,0,0.28) 80%, rgba(255,224,0,0.1) 96%, transparent 98%)",
-                "linear-gradient(183deg, transparent 10%, rgba(255,224,0,0.15) 30%, rgba(255,224,0,0.2) 50%, transparent 85%)",
-              ].join(", "),
-              borderRadius: "7.5px 12.5px 8px 15.5px",
-              transform: "rotate(-1.2deg) skewX(-1deg)",
-              boxDecorationBreak: "clone" as const,
-            }}
-            title={projectName}
-          >
-            {projectName}
-          </span>
-        )}
         <span
-          className="shrink-0 whitespace-nowrap text-[11px] text-[var(--text-muted)]"
+          className="shrink-0 whitespace-nowrap text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--border)] rounded px-1 py-0.5 transition-colors duration-quick cursor-pointer"
           style={{ fontFamily: '"Geist Mono", monospace' }}
           title={headerContextLabel}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            focusWorktreeInScene(projectId, worktreeId);
+            panToWorktree(projectId, worktreeId, { enterOverview: true });
+            const canvas = useCanvasStore.getState();
+            canvas.setRightPanelCollapsed(false);
+            canvas.setRightPanelActiveTab("files");
+          }}
         >
           {headerContextLabel}
         </span>
         <div
-          className={`h-6 min-w-0 flex-1 rounded-md border px-1.5 text-[11px] ${
+          className={`tc-tile-title-editable nodrag h-6 min-w-0 flex-1 rounded-md border px-1.5 text-[11px] ${
             terminal.customTitle
               ? "border-[var(--border)] bg-[var(--surface)] text-[var(--text-primary)]"
               : "border-dashed border-[var(--border)] bg-[var(--bg)] text-[var(--text-faint)]"
@@ -805,16 +984,21 @@ export function TerminalTile({
           onMouseDown={(e) => e.stopPropagation()}
           onDoubleClick={(e) => {
             e.stopPropagation();
+            if (isOverviewMode) {
+              zoomIntoTerminalFromOverview();
+              return;
+            }
             startCustomTitleEdit();
           }}
         >
           <div className="flex h-full items-center gap-1.5 min-w-0">
             <button
-              className={`shrink-0 rounded p-0.5 transition-colors duration-150 ${
+              className={`tc-tile-action shrink-0 rounded p-0.5 ${
                 terminal.starred
-                  ? "text-amber-400 hover:text-amber-300"
-                  : "text-[var(--text-faint)] hover:text-amber-400"
+                  ? "text-[var(--amber)] hover:brightness-110"
+                  : "text-[var(--text-faint)] hover:text-[var(--amber)]"
               }`}
+              data-pinned={terminal.starred ? "true" : undefined}
               title={terminal.starred ? t.terminal_unstar : t.terminal_star}
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
@@ -866,15 +1050,66 @@ export function TerminalTile({
                 {t.summary_in_progress}
               </span>
             ) : (
-              <span className="min-w-0 flex-1 truncate leading-[22px]">
-                {terminal.customTitle || t.terminal_custom_title_placeholder}
-              </span>
+              <>
+                <span className="min-w-0 flex-1 truncate leading-[22px]">
+                  {terminal.customTitle || t.terminal_custom_title_placeholder}
+                </span>
+                <button
+                  type="button"
+                  className="tc-tile-action shrink-0 rounded p-0.5 text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-[var(--border)]"
+                  title={t.terminal_custom_title_placeholder}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (isOverviewMode) {
+                      zoomIntoTerminalFromOverview();
+                      return;
+                    }
+                    startCustomTitleEdit();
+                  }}
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M1.6 8.4 L7.2 2.8 L8.5 4.1 L2.9 9.7 Z"
+                      stroke="currentColor"
+                      strokeWidth="1"
+                      strokeLinejoin="round"
+                      transform="translate(-0.3 -1.2)"
+                    />
+                  </svg>
+                </button>
+              </>
             )}
           </div>
         </div>
+        {activityHeatmapEnabled && (
+          <ActivitySparkline terminalId={terminal.id} />
+        )}
         <div className="flex items-center gap-0.5">
+          {!useAgentRenderer && lodMode === "live" && !terminal.minimized && (
+            <button
+              type="button"
+              className="tc-tile-action text-[var(--text-faint)] hover:text-[var(--text-primary)] p-1 rounded-md hover:bg-[var(--border)]"
+              title={t.shortcut_open_terminal_find}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleOpenFind();
+              }}
+            >
+              <Search size={10} strokeWidth={1.6} aria-hidden="true" />
+            </button>
+          )}
           <button
-            className="text-[var(--text-faint)] hover:text-[var(--text-primary)] transition-colors duration-150 p-1 rounded-md hover:bg-[var(--border)]"
+            className="tc-tile-action text-[var(--text-faint)] hover:text-[var(--text-primary)] p-1 rounded-md hover:bg-[var(--border)]"
+            data-visible="always"
+            data-pinned={terminal.minimized ? "true" : undefined}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
@@ -903,7 +1138,8 @@ export function TerminalTile({
             </svg>
           </button>
           <button
-            className="text-[var(--text-faint)] hover:text-[var(--red)] transition-colors duration-150 p-1 rounded-md hover:bg-[var(--border)]"
+            className="tc-tile-action text-[var(--text-faint)] hover:text-[var(--red)] p-1 rounded-md hover:bg-[var(--border)]"
+            data-visible="always"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
@@ -921,6 +1157,30 @@ export function TerminalTile({
           </button>
         </div>
       </div>
+
+      {terminalTaskAssignment && (
+        <div className="shrink-0 flex items-center px-3 pb-1.5 -mt-1">
+          <button
+            type="button"
+            className="group/badge inline-flex items-center gap-1 max-w-[200px] px-1.5 py-0.5 rounded-sm text-[10px] leading-none cursor-pointer bg-[var(--accent)]/10 text-[var(--accent)] border border-[var(--accent)]/25 hover:border-[var(--accent)]/45 transition-colors duration-quick"
+            title={t["pin.terminalBadge.tooltip"](
+              terminalTaskAssignment.title,
+            )}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              const pinState = usePinStore.getState();
+              pinState.openDrawer(terminalTaskAssignment.repo);
+              pinState.openDetail(terminalTaskAssignment.pinId);
+            }}
+          >
+            <span aria-hidden="true" className="shrink-0">
+              ▸
+            </span>
+            <span className="truncate">{terminalTaskAssignment.title}</span>
+          </button>
+        </div>
+      )}
 
       {useAgentRenderer ? (
         <div
@@ -949,6 +1209,21 @@ export function TerminalTile({
           )}
         </div>
       ) : lodMode === "live" ? (
+        terminalEngine === "wterm" ? (
+          <div
+            className={
+              terminal.minimized
+                ? "relative nopan nodrag nowheel"
+                : "flex-1 min-h-0 relative nopan nodrag nowheel"
+            }
+            style={{
+              height: terminal.minimized ? 0 : undefined,
+              overflow: "hidden",
+            }}
+          >
+            <WtermTile terminal={liveTerminal} />
+          </div>
+        ) : (
         <div
           className={
             terminal.minimized
@@ -980,7 +1255,12 @@ export function TerminalTile({
                   }
                 : undefined),
             }}
-            onClick={() => {
+            onClick={(e) => {
+              if (isOverviewMode) {
+                e.stopPropagation();
+                focusTerminalInOverview();
+                return;
+              }
               const adapter = getComposerAdapter(terminal.type);
               if (
                 !adapter ||
@@ -989,11 +1269,15 @@ export function TerminalTile({
               ) {
                 scheduleXtermFocus();
               } else {
-                window.dispatchEvent(new CustomEvent("termcanvas:focus-composer"));
+                window.dispatchEvent(
+                  new CustomEvent("termcanvas:focus-composer"),
+                );
               }
             }}
           />
+          <TerminalFindOverlay terminalId={terminal.id} />
         </div>
+        )
       ) : (
         <div
           className={terminal.minimized ? "" : "flex-1 min-h-0"}
@@ -1009,7 +1293,7 @@ export function TerminalTile({
       )}
 
       {showCopiedToast && (
-        <div className="absolute left-1/2 bottom-3 -translate-x-1/2 px-3 py-1 rounded-md bg-[var(--surface)] text-[var(--text-primary)] text-xs font-medium shadow-lg border border-[var(--border)] pointer-events-none z-10 animate-[fadeIn_0.15s_ease-out]">
+        <div className="tc-enter-pop absolute left-1/2 bottom-3 -translate-x-1/2 px-3 py-1 rounded-md bg-[var(--surface)] text-[var(--text-primary)] text-xs font-medium shadow-lg border border-[var(--border)] pointer-events-none z-10">
           {t.terminal_copied}
         </div>
       )}
@@ -1021,31 +1305,30 @@ export function TerminalTile({
             y={contextMenu.y}
             items={[
               {
-                label: "1×1",
-                active: terminal.span.cols === 1 && terminal.span.rows === 1,
-                onClick: () => onSpanChange?.({ cols: 1, rows: 1 }),
-              },
-              {
-                label: "2×1 Wide",
-                active: terminal.span.cols === 2 && terminal.span.rows === 1,
-                onClick: () => onSpanChange?.({ cols: 2, rows: 1 }),
-              },
-              {
-                label: "1×2 Tall",
-                active: terminal.span.cols === 1 && terminal.span.rows === 2,
-                onClick: () => onSpanChange?.({ cols: 1, rows: 2 }),
-              },
-              {
-                label: "2×2 Large",
-                active: terminal.span.cols === 2 && terminal.span.rows === 2,
-                onClick: () => onSpanChange?.({ cols: 2, rows: 2 }),
-              },
-              { type: "separator" as const },
-              {
                 label: t.stash_terminal,
                 onClick: () =>
                   stashTerminalInScene(projectId, worktreeId, terminal.id),
               },
+              {
+                label: "Tags…",
+                onClick: () =>
+                  setTagManager({ x: contextMenu.x, y: contextMenu.y }),
+              },
+              ...(terminalRenderer === "webgl"
+                ? [
+                    { type: "separator" as const },
+                    {
+                      label: t["palette.cmd.refresh_terminal_rendering"],
+                      onClick: () => {
+                        resetWebGL(
+                          terminal.id,
+                          "terminal_context_menu_refresh_rendering",
+                        );
+                        refreshRegisteredTerminalViewports(terminal.id);
+                      },
+                    },
+                  ]
+                : []),
               ...((terminal.type === "claude" || terminal.type === "codex") &&
               liveTerminal.sessionId
                 ? [
@@ -1064,6 +1347,19 @@ export function TerminalTile({
                 : []),
             ]}
             onClose={() => setContextMenu(null)}
+          />,
+          document.body,
+        )}
+
+      {tagManager &&
+        createPortal(
+          <TagManager
+            projectId={projectId}
+            worktreeId={worktreeId}
+            terminalId={terminal.id}
+            clientX={tagManager.x}
+            clientY={tagManager.y}
+            onClose={() => setTagManager(null)}
           />,
           document.body,
         )}

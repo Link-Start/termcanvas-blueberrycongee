@@ -2,11 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { cleanup } from "../src/cleanup.ts";
-import { writeDoneMarker, writeResultContract } from "../src/collector.ts";
-import { HandoffManager } from "../src/handoff/manager.ts";
+import { AssignmentManager } from "../src/assignment/manager.ts";
 import { terminalDestroy, terminalStatus } from "../src/termcanvas.ts";
-import { getWorkflowStatus, runWorkflow, tickWorkflow } from "../src/workflow.ts";
-import { loadWorkflow } from "../src/workflow-store.ts";
+import {
+  initWorkbench,
+  dispatch,
+  redispatch,
+  watchUntilDecision,
+  approveDispatch,
+  resetDispatch,
+  completeWorkbench,
+  getWorkbenchStatus,
+} from "../src/workflow-lead.ts";
+import { loadWorkbench } from "../src/workflow-store.ts";
+import { RESULT_SCHEMA_VERSION } from "../src/protocol.ts";
+import { getReportFilePath } from "../src/artifacts.ts";
+import type { AssignmentRecord } from "../src/assignment/types.ts";
 
 interface Args {
   repo: string;
@@ -15,7 +26,8 @@ interface Args {
 
 interface StageRecord {
   stage: string;
-  handoffId: string;
+  dispatchId: string;
+  assignmentId: string;
   role: string;
   terminalId: string | null;
   terminalStatus: string | null;
@@ -24,217 +36,202 @@ interface StageRecord {
 
 function parseArgs(argv: string[]): Args {
   const result: Partial<Args> = {};
-
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--repo" && i + 1 < argv.length) {
-      result.repo = argv[++i];
-    } else if (arg === "--report" && i + 1 < argv.length) {
-      result.report = argv[++i];
-    }
+    if (arg === "--repo" && i + 1 < argv.length) result.repo = argv[++i];
+    else if (arg === "--report" && i + 1 < argv.length) result.report = argv[++i];
   }
-
-  if (!result.repo) {
-    throw new Error("Missing required flag: --repo");
-  }
-
+  if (!result.repo) throw new Error("Missing required flag: --repo");
   return {
     repo: path.resolve(result.repo),
-    report: path.resolve(
-      result.report ?? path.join(result.repo, "docs", "hydra-acceptance-report.md"),
-    ),
+    report: path.resolve(result.report ?? path.join(result.repo, "docs", "hydra-acceptance-report.md")),
   };
 }
 
-async function captureStage(
+function latestRun(assignment: AssignmentRecord): AssignmentRecord["runs"][number] {
+  const active = assignment.active_run_id
+    ? assignment.runs.find((run) => run.id === assignment.active_run_id) : null;
+  const run = active ?? assignment.runs[assignment.runs.length - 1] ?? null;
+  assert.ok(run, `assignment ${assignment.id} must have a run`);
+  return run;
+}
+
+function writeResult(
   repoPath: string,
-  workflowId: string,
-  expectedRole: string,
+  workbenchId: string,
+  assignmentId: string,
+  run: AssignmentRecord["runs"][number],
   summary: string,
-  success: boolean,
-  nextAction: { type: "complete" | "retry" | "handoff"; reason: string; handoff_id?: string },
-): Promise<StageRecord> {
-  const workflow = loadWorkflow(repoPath, workflowId);
-  assert.ok(workflow, "workflow must exist");
+  outcome: "completed" | "stuck" | "error",
+): void {
+  const reportFile = getReportFilePath(repoPath, workbenchId, assignmentId, run.id);
+  fs.mkdirSync(path.dirname(reportFile), { recursive: true });
+  fs.writeFileSync(
+    reportFile,
+    [
+      "# Acceptance Run Report",
+      "",
+      "## Summary",
+      "",
+      summary,
+      "",
+      "## Outputs",
+      "",
+      "- hydra e2e acceptance script artifact",
+      "",
+      "## Evidence",
+      "",
+      "- hydra e2e acceptance script",
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
 
-  const manager = new HandoffManager(repoPath);
-  const handoff = manager.load(workflow.current_handoff_id);
-  assert.ok(handoff, "current handoff must exist");
-  assert.equal(handoff.to.role, expectedRole);
-  assert.ok(handoff.artifacts, "handoff must have artifacts");
+  fs.writeFileSync(
+    run.result_file,
+    JSON.stringify({
+      schema_version: RESULT_SCHEMA_VERSION,
+      workbench_id: workbenchId,
+      assignment_id: assignmentId,
+      run_id: run.id,
+      outcome,
+      report_file: reportFile,
+    }, null, 2),
+    "utf-8",
+  );
+}
 
-  let terminalId: string | null = handoff.dispatch?.active_terminal_id ?? null;
+function captureStage(
+  dispatchId: string,
+  assignmentId: string,
+  role: string,
+  terminalId: string | null,
+  summary: string,
+): StageRecord {
   let status: string | null = null;
   if (terminalId) {
-    try {
-      status = terminalStatus(terminalId).status;
-    } catch {
-      status = "missing";
-    }
+    try { status = terminalStatus(terminalId).status; } catch { status = "missing"; }
   }
-
-  writeResultContract(
-    { artifacts: handoff.artifacts },
-    {
-      version: "hydra/v2",
-      handoff_id: handoff.id,
-      workflow_id: handoff.workflow_id,
-      success,
-      summary,
-      outputs: [{ path: `${expectedRole}.md`, description: `${expectedRole} acceptance artifact` }],
-      evidence: ["hydra e2e acceptance script"],
-      next_action: nextAction,
-    },
-  );
-  writeDoneMarker({
-    artifacts: handoff.artifacts,
-    handoff_id: handoff.id,
-    workflow_id: handoff.workflow_id,
-  });
-
-  if (terminalId) {
-    try {
-      terminalDestroy(terminalId);
-    } catch {
-      // best-effort cleanup; report still records the original terminal
-    }
-  }
-
-  return {
-    stage: expectedRole,
-    handoffId: handoff.id,
-    role: handoff.to.role,
-    terminalId,
-    terminalStatus: status,
-    summary,
-  };
+  return { stage: role, dispatchId, assignmentId, role, terminalId, terminalStatus: status, summary };
 }
 
-function renderReport(args: Args, workflowId: string, records: StageRecord[]): string {
-  const lines = [
+function renderReport(args: Args, workbenchId: string, records: StageRecord[]): string {
+  return [
     "# Hydra Acceptance Report",
     "",
     `- Date: ${new Date().toISOString()}`,
     `- Repo: ${args.repo}`,
-    `- Workflow ID: ${workflowId}`,
-    `- Mode: real TermCanvas terminal create + deterministic file evidence injection`,
-    "",
-    "## Reproduction",
-    "",
-    "```bash",
-    `cd ${args.repo}`,
-    "cd hydra",
-    `npm run e2e:acceptance -- --repo ${args.repo} --report ${args.report}`,
-    "```",
-    "",
-    "## Notes",
-    "",
-    "- Each stage launched a real Claude/Codex terminal via `termcanvas terminal create --prompt`.",
-    "- The acceptance script then wrote deterministic `result.json` + `done` files to exercise the control plane without relying on model nondeterminism.",
-    "- The flow includes an evaluator failure loop and a successful recovery.",
+    `- Workbench ID: ${workbenchId}`,
+    `- Mode: Lead-driven dispatch + deterministic result injection`,
     "",
     "## Observed Stages",
     "",
-    "| Stage | Handoff ID | Terminal ID | Terminal Status Before Cleanup | Summary |",
-    "|------|------------|-------------|-------------------------------|---------|",
-    ...records.map((record) => `| ${record.stage} | ${record.handoffId} | ${record.terminalId ?? "-"} | ${record.terminalStatus ?? "-"} | ${record.summary} |`),
+    "| Stage | Dispatch ID | Assignment ID | Terminal ID | Summary |",
+    "|-------|-------------|---------------|-------------|---------|",
+    ...records.map((r) => `| ${r.stage} | ${r.dispatchId} | ${r.assignmentId} | ${r.terminalId ?? "-"} | ${r.summary} |`),
     "",
     "## Outcome",
     "",
-    "- Sequence exercised: `planner (Claude) -> implementer (Codex) -> evaluator (Claude) -> implementer retry (Codex) -> evaluator recovery (Claude)`",
-    "- Verified: create-only dispatch, schema gate, evaluator loopback, retry/recovery, workflow completion, and cleanup.",
+    "- Verified: init, dispatch, watch, approve, reset (reviewer loopback), complete, cleanup.",
     "",
-  ];
-
-  return lines.join("\n");
+  ].join("\n");
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const records: StageRecord[] = [];
-  let workflowId: string | null = null;
+  let workbenchId: string | null = null;
 
   try {
-    const started = await runWorkflow({
-      task: "Hydra acceptance harness: do not modify repository source files. Only interact with the generated Hydra task package and acceptance artifacts.",
+    // 1. Init workbench
+    const init = await initWorkbench({
+      intent: "Hydra acceptance harness: exercise the Lead-driven control plane.",
       repoPath: args.repo,
-      template: "planner-implementer-evaluator",
-      agentType: "codex",
-      evaluatorType: "claude",
-      timeoutMinutes: 5,
-      maxRetries: 1,
-      autoApprove: true,
+      worktreePath: args.repo,
     });
-    workflowId = started.workflow.id;
+    workbenchId = init.workbench_id;
 
-    records.push(await captureStage(
-      args.repo,
-      workflowId,
-      "planner",
-      "Planner produced an actionable acceptance plan.",
-      true,
-      { type: "handoff", reason: "Implementation can start.", handoff_id: started.handoffs[1].id },
-    ));
+    // 2. Dispatch the first dispatch (cli/model come from the role file's terminals[0])
+    const researcher = await dispatch({
+      repoPath: args.repo, workbenchId, dispatchId: "researcher",
+      role: "dev", intent: "Produce acceptance research brief.",
+    });
+    assert.equal(researcher.status, "dispatched");
 
-    await tickWorkflow({ repoPath: args.repo, workflowId });
-    records.push(await captureStage(
-      args.repo,
-      workflowId,
-      "implementer",
-      "Implementer completed the first pass.",
-      true,
-      { type: "handoff", reason: "Evaluator can start.", handoff_id: started.handoffs[2].id },
-    ));
+    // Write researcher result
+    const manager = new AssignmentManager(args.repo, workbenchId);
+    let assignment = manager.load(researcher.dispatch_id)!;
+    let run = latestRun(assignment);
+    writeResult(args.repo, workbenchId, assignment.id, run, "Research brief produced.", "completed");
+    records.push(captureStage("researcher", assignment.id, "dev", researcher.terminal_id ?? null, "Research brief produced."));
 
-    await tickWorkflow({ repoPath: args.repo, workflowId });
-    records.push(await captureStage(
-      args.repo,
-      workflowId,
-      "evaluator",
-      "Evaluator found an unmet standard and requested another implementation pass.",
-      false,
-      { type: "handoff", reason: "Implementer must address the blocked standard.", handoff_id: started.handoffs[1].id },
-    ));
+    // 3. Watch → researcher completes
+    let decision = await watchUntilDecision({ repoPath: args.repo, workbenchId, timeoutMs: 10_000 });
+    assert.equal(decision.type, "dispatch_completed");
 
-    await tickWorkflow({ repoPath: args.repo, workflowId });
-    records.push(await captureStage(
-      args.repo,
-      workflowId,
-      "implementer",
-      "Implementer addressed the evaluator findings.",
-      true,
-      { type: "handoff", reason: "Re-run evaluation.", handoff_id: started.handoffs[2].id },
-    ));
+    // 4. Approve researcher
+    await approveDispatch({ repoPath: args.repo, workbenchId, dispatchId: "researcher" });
 
-    await tickWorkflow({ repoPath: args.repo, workflowId });
-    records.push(await captureStage(
-      args.repo,
-      workflowId,
-      "evaluator",
-      "Evaluator confirmed the recovery pass met the bar.",
-      true,
-      { type: "complete", reason: "Workflow is complete." },
-    ));
+    // 5. Dispatch dev
+    const dev = await dispatch({
+      repoPath: args.repo, workbenchId, dispatchId: "dev",
+      role: "dev", intent: "Implement first pass.",
+    });
+    assert.equal(dev.status, "dispatched");
 
-    await tickWorkflow({ repoPath: args.repo, workflowId });
-    const completed = getWorkflowStatus({ repoPath: args.repo, workflowId });
-    assert.equal(completed.workflow.status, "completed");
+    assignment = manager.load(dev.dispatch_id)!;
+    run = latestRun(assignment);
+    writeResult(args.repo, workbenchId, assignment.id, run, "First implementation pass done.", "completed");
+    records.push(captureStage("dev", assignment.id, "dev", dev.terminal_id ?? null, "First pass done."));
 
+    decision = await watchUntilDecision({ repoPath: args.repo, workbenchId, timeoutMs: 10_000 });
+    assert.equal(decision.type, "dispatch_completed");
+
+    // 6. Dispatch reviewer (codex variant — exercises a cross-CLI workflow)
+    const reviewer = await dispatch({
+      repoPath: args.repo, workbenchId, dispatchId: "review",
+      role: "reviewer", intent: "Review implementation.",
+    });
+    assert.equal(reviewer.status, "dispatched");
+
+    assignment = manager.load(reviewer.dispatch_id)!;
+    run = latestRun(assignment);
+    writeResult(args.repo, workbenchId, assignment.id, run, "Found issues, needs rework.", "completed");
+    records.push(captureStage("review", assignment.id, "reviewer", reviewer.terminal_id ?? null, "Found issues."));
+
+    decision = await watchUntilDecision({ repoPath: args.repo, workbenchId, timeoutMs: 10_000 });
+    assert.equal(decision.type, "dispatch_completed");
+    assert.equal(decision.completed?.outcome, "completed");
+
+    // 7. Reset dev based on reviewer feedback
+    await resetDispatch({ repoPath: args.repo, workbenchId, dispatchId: "dev", feedback: "Fix the issues the reviewer found." });
+
+    // 8. Re-dispatch the same dev node (reset made it eligible)
+    const dev2 = await redispatch({
+      repoPath: args.repo, workbenchId, dispatchId: "dev", intent: "Fix reviewer findings.",
+    });
+    assert.equal(dev2.status, "dispatched");
+
+    assignment = manager.load(dev2.dispatch_id)!;
+    run = latestRun(assignment);
+    writeResult(args.repo, workbenchId, assignment.id, run, "Fixed all reviewer findings.", "completed");
+    records.push(captureStage("dev", assignment.id, "dev", dev2.terminal_id ?? null, "Fixed findings."));
+
+    decision = await watchUntilDecision({ repoPath: args.repo, workbenchId, timeoutMs: 10_000 });
+    assert.equal(decision.type, "dispatch_completed");
+
+    // 9. Complete
+    await completeWorkbench({ repoPath: args.repo, workbenchId, summary: "Acceptance test passed." });
+    const final = getWorkbenchStatus(args.repo, workbenchId);
+    assert.equal(final.workbench.status, "completed");
+
+    // Write report
     fs.mkdirSync(path.dirname(args.report), { recursive: true });
-    fs.writeFileSync(args.report, renderReport(args, workflowId, records), "utf-8");
-    console.log(JSON.stringify({
-      workflowId,
-      report: args.report,
-      stages: records,
-      finalStatus: completed.workflow.status,
-    }, null, 2));
+    fs.writeFileSync(args.report, renderReport(args, workbenchId, records), "utf-8");
+    console.log(JSON.stringify({ workbenchId, report: args.report, stages: records, finalStatus: "completed" }, null, 2));
   } finally {
-    if (workflowId) {
-      try {
-        await cleanup(["--workflow", workflowId, "--repo", args.repo, "--force"]);
-      } catch {
-        // best-effort cleanup
-      }
+    if (workbenchId) {
+      try { await cleanup(["--workbench", workbenchId, "--repo", args.repo, "--force"]); } catch {}
     }
   }
 }

@@ -3,10 +3,14 @@ import type { TerminalTelemetrySnapshot } from "../../shared/telemetry";
 import { resolveTerminalWithRuntimeState } from "../stores/terminalRuntimeStateStore";
 import type { ProjectData, TerminalData } from "../types/index.ts";
 
+// Three real states. "active" collapses what was "running" + "thinking":
+// from the user's POV both are "agent is working, no need to look", so
+// splitting them is internal noise. "done" and "idle" are kept separate
+// in the model (so freshDone/seen tracking still works) but render the
+// same gray — both communicate "no signal needed".
 export type CanvasTerminalState =
   | "attention"
-  | "running"
-  | "thinking"
+  | "active"
   | "done"
   | "idle";
 
@@ -25,7 +29,7 @@ export interface CanvasTerminalItem {
   activityAt?: string;
   turnStartedAt?: string;
   currentTool?: string;
-  attentionReason?: "error" | "stall" | "awaiting_input";
+  attentionReason?: "error" | "awaiting_input";
 }
 
 export interface CanvasTerminalSections {
@@ -48,7 +52,7 @@ export interface WorktreeGroup {
   worktreeId: string;
   worktreeName: string;
   worktreePath: string;
-  isMain: boolean;
+  isPrimary: boolean;
   statusSummary: StatusSummary;
   terminals: CanvasTerminalItem[];
 }
@@ -59,23 +63,32 @@ export interface ProjectGroup {
   projectPath: string;
   statusSummary: StatusSummary;
   worktrees: WorktreeGroup[];
-  flat: boolean;
+}
+
+export interface StashedTerminalItem {
+  terminalId: string;
+  projectId: string;
+  worktreeId: string;
+  type: TerminalData["type"];
+  ptyId: number | null;
+  status: TerminalData["status"];
+  title: string;
+  originLabel: string;
+  stashedAt?: number;
+}
+
+export interface ProjectTreeResult {
+  projects: ProjectGroup[];
+  stashed: StashedTerminalItem[];
 }
 
 const GENERIC_TERMINAL_TITLES =
-  /^(terminal|shell|claude|codex|kimi|gemini|opencode|lazygit|tmux)$/i;
+  /^(terminal|shell|claude|codex|kimi|gemini|opencode|wuu|lazygit|tmux)$/i;
 
-function isCanvasTerminal(
-  projectCollapsed: boolean,
-  worktreeCollapsed: boolean,
+export function isCanvasTerminal(
   terminal: Pick<TerminalData, "minimized" | "stashed">,
 ): boolean {
-  return (
-    !projectCollapsed &&
-    !worktreeCollapsed &&
-    !terminal.minimized &&
-    !terminal.stashed
-  );
+  return !terminal.minimized && !terminal.stashed;
 }
 
 function collapseWhitespace(value: string, maxLength: number): string {
@@ -84,32 +97,65 @@ function collapseWhitespace(value: string, maxLength: number): string {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
+const VAGUE_TERMS = new Set([
+  "看看", "看一下", "这个", "那个", "帮忙", "搞一下", "弄一下",
+  "改一下", "修一下", "处理一下",
+  "help", "this", "that", "hey", "hi", "ok", "yes", "no",
+]);
+
+export function extractIntent(
+  raw: string | undefined,
+  maxLen = 40,
+): string | null {
+  if (!raw) return null;
+  let text = raw.trim();
+  text = text.replace(/```[\s\S]*?```/g, "").trim();
+  // Only strip things that look like real file paths (must have 2+ segments
+  // and start with . / or a known directory prefix like src/ node_modules/)
+  text = text.replace(/(?:\.\.?\/|(?:src|lib|dist|node_modules|packages)\/)\S+/g, "").trim();
+  text = text
+    .replace(/^(帮我|请你?|麻烦|could you|please)\s*/i, "")
+    .trim();
+  // Cut at sentence-ending punctuation, Chinese comma, or newline.
+  // English comma is excluded (often enumeration, not a sentence break).
+  const cut = text.search(/[，.。;；!！?？\n]/);
+  if (cut > 0) text = text.slice(0, cut).trim();
+  if (text.length > maxLen) {
+    text = text.slice(0, maxLen - 1).trimEnd() + "…";
+  }
+  if (!text || VAGUE_TERMS.has(text)) return null;
+  return text;
+}
+
 function resolveTerminalTitle(
   terminal: Pick<TerminalData, "customTitle" | "title" | "initialPrompt">,
   worktreeName: string,
   projectName: string,
   provider?: string,
+  firstUserPrompt?: string,
 ): string {
-  const displayTitle = collapseWhitespace(
-    terminal.customTitle
-      ? `${terminal.customTitle} · ${terminal.title}`
-      : terminal.title,
-    64,
-  );
-  const initialPrompt = terminal.initialPrompt
-    ? collapseWhitespace(terminal.initialPrompt, 72)
-    : "";
-
-  if (displayTitle && !GENERIC_TERMINAL_TITLES.test(displayTitle)) {
-    return displayTitle;
+  if (terminal.customTitle) {
+    return collapseWhitespace(terminal.customTitle, 40);
   }
 
-  if (initialPrompt) return initialPrompt;
+  if (terminal.title && !GENERIC_TERMINAL_TITLES.test(terminal.title)) {
+    return collapseWhitespace(terminal.title, 40);
+  }
+
+  const fromInit = extractIntent(terminal.initialPrompt);
+  if (fromInit) return fromInit;
+
+  const fromTelemetry = extractIntent(firstUserPrompt);
+  if (fromTelemetry) return fromTelemetry;
+
   if (provider && provider !== "unknown") {
     return provider.charAt(0).toUpperCase() + provider.slice(1);
   }
-  if (worktreeName) return worktreeName;
-  return projectName;
+
+  if (terminal.title) {
+    return terminal.title.charAt(0).toUpperCase() + terminal.title.slice(1);
+  }
+  return "Terminal";
 }
 
 function deriveStateFromTelemetry(
@@ -130,6 +176,12 @@ function deriveStateFromTelemetry(
     telemetry.last_input_at;
   const turnStartedAt = telemetry.turn_started_at;
 
+  // Attention is reserved for signals that should be visible in the
+  // left panel: a real process error, `awaiting_input`, or an exited PTY
+  // with a non-zero code. We deliberately do NOT promote
+  // `derived_status === "stall_candidate"` to attention — it's a
+  // heuristic ("output has been quiet for a while") that fires on slow
+  // models, which is the exact false positive we're trying to kill.
   if (
     telemetry.derived_status === "error" ||
     (!telemetry.pty_alive &&
@@ -146,19 +198,10 @@ function deriveStateFromTelemetry(
     };
   }
 
-  if (telemetry.derived_status === "stall_candidate") {
-    return {
-      state: "attention",
-      activityAt,
-      turnStartedAt,
-      currentTool: telemetry.foreground_tool,
-      sessionFilePath: telemetry.session_file,
-      attentionReason: "stall",
-    };
-  }
-
-  // Detect awaiting user interaction: main process sets turn_state
-  // to "awaiting_input" after PreToolUse has been pending for ≥5s.
+  // Active review area: `awaiting_input` can be explicit (Claude
+  // Notification) or heuristic (provider-specific PreToolUse silence
+  // timer in telemetry-service.ts). Keep this path easy to audit because
+  // false positives here make the left panel show red.
   if (telemetry.turn_state === "awaiting_input") {
     return {
       state: "attention",
@@ -172,10 +215,12 @@ function deriveStateFromTelemetry(
 
   if (
     telemetry.turn_state === "tool_running" ||
-    telemetry.turn_state === "tool_pending"
+    telemetry.turn_state === "tool_pending" ||
+    telemetry.turn_state === "thinking" ||
+    telemetry.turn_state === "in_turn"
   ) {
     return {
-      state: "running",
+      state: "active",
       activityAt,
       turnStartedAt,
       currentTool: telemetry.foreground_tool,
@@ -183,12 +228,9 @@ function deriveStateFromTelemetry(
     };
   }
 
-  if (
-    telemetry.turn_state === "thinking" ||
-    telemetry.turn_state === "in_turn"
-  ) {
+  if (telemetry.derived_status === "awaiting_contract") {
     return {
-      state: telemetry.foreground_tool ? "running" : "thinking",
+      state: "active",
       activityAt,
       turnStartedAt,
       currentTool: telemetry.foreground_tool,
@@ -206,12 +248,9 @@ function deriveStateFromTelemetry(
     };
   }
 
-  if (
-    telemetry.derived_status === "progressing" ||
-    telemetry.derived_status === "awaiting_contract"
-  ) {
+  if (telemetry.derived_status === "progressing") {
     return {
-      state: telemetry.foreground_tool ? "running" : "thinking",
+      state: "active",
       activityAt,
       turnStartedAt,
       currentTool: telemetry.foreground_tool,
@@ -243,15 +282,9 @@ function deriveStateFromSession(
         sessionFilePath: session.filePath,
       };
     case "tool_running":
-      return {
-        state: "running",
-        activityAt: session.lastActivityAt,
-        currentTool: session.currentTool,
-        sessionFilePath: session.filePath,
-      };
     case "generating":
       return {
-        state: "thinking",
+        state: "active",
         activityAt: session.lastActivityAt,
         currentTool: session.currentTool,
         sessionFilePath: session.filePath,
@@ -285,7 +318,7 @@ function deriveStateFromTerminal(
     case "running":
     case "active":
     case "waiting":
-      return { state: "running" };
+      return { state: "active" };
     case "completed":
     case "success":
       return { state: "done" };
@@ -294,7 +327,7 @@ function deriveStateFromTerminal(
   }
 }
 
-function deriveTerminalState(
+export function deriveTerminalState(
   terminal: Pick<TerminalData, "status" | "sessionId">,
   telemetry: TerminalTelemetrySnapshot | null | undefined,
   session: SessionInfo | undefined,
@@ -308,7 +341,13 @@ function deriveTerminalState(
   | "attentionReason"
 > {
   if (telemetry) {
-    return deriveStateFromTelemetry(telemetry);
+    const derived = deriveStateFromTelemetry(telemetry);
+    // Race window: Path B (hook:stop-failure → setStatus('error')) may arrive before
+    // Path A (telemetry IPC) updates derived_status. Override stale telemetry state.
+    if (terminal.status === "error" && derived.state !== "attention") {
+      return { ...derived, state: "attention", attentionReason: "error" };
+    }
+    return derived;
   }
 
   if (session) {
@@ -334,8 +373,7 @@ function computeStatusSummary(
       case "attention":
         summary.attention++;
         break;
-      case "running":
-      case "thinking":
+      case "active":
         summary.running++;
         break;
       case "done":
@@ -361,8 +399,9 @@ export function buildProjectTree(
   >,
   sessionsById: Map<string, SessionInfo>,
   seenTerminalIds?: Set<string>,
-): ProjectGroup[] {
+): ProjectTreeResult {
   const result: ProjectGroup[] = [];
+  const stashed: StashedTerminalItem[] = [];
 
   for (const project of projects) {
     const worktreeGroups: WorktreeGroup[] = [];
@@ -373,13 +412,33 @@ export function buildProjectTree(
       for (const terminal of worktree.terminals) {
         const resolvedTerminal = resolveTerminalWithRuntimeState(terminal);
 
-        if (
-          !isCanvasTerminal(
-            project.collapsed,
-            worktree.collapsed,
+        if (resolvedTerminal.minimized) {
+          continue;
+        }
+
+        if (resolvedTerminal.stashed) {
+          const title = resolveTerminalTitle(
             resolvedTerminal,
-          )
-        ) {
+            worktree.name,
+            project.name,
+            telemetryByTerminalId.get(resolvedTerminal.id)?.provider,
+            telemetryByTerminalId.get(resolvedTerminal.id)?.first_user_prompt,
+          );
+          const originLabel =
+            worktree.name === project.name
+              ? project.name
+              : `${project.name} / ${worktree.name}`;
+          stashed.push({
+            terminalId: resolvedTerminal.id,
+            projectId: project.id,
+            worktreeId: worktree.id,
+            type: resolvedTerminal.type,
+            ptyId: resolvedTerminal.ptyId,
+            status: resolvedTerminal.status,
+            title,
+            originLabel,
+            stashedAt: resolvedTerminal.stashedAt,
+          });
           continue;
         }
 
@@ -397,6 +456,7 @@ export function buildProjectTree(
           worktree.name,
           project.name,
           telemetry?.provider,
+          telemetry?.first_user_prompt,
         );
         const locationLabel =
           worktree.name === project.name
@@ -422,19 +482,15 @@ export function buildProjectTree(
         });
       }
 
-      if (terminals.length === 0) continue;
-
       worktreeGroups.push({
         worktreeId: worktree.id,
         worktreeName: worktree.name,
         worktreePath: worktree.path,
-        isMain: worktree.path === project.path,
+        isPrimary: worktree.isPrimary ?? worktree.path === project.path,
         statusSummary: computeStatusSummary(terminals, seenTerminalIds),
         terminals,
       });
     }
-
-    if (worktreeGroups.length === 0) continue;
 
     const allTerminals = worktreeGroups.flatMap((wt) => wt.terminals);
 
@@ -444,11 +500,12 @@ export function buildProjectTree(
       projectPath: project.path,
       statusSummary: computeStatusSummary(allTerminals, seenTerminalIds),
       worktrees: worktreeGroups,
-      flat: worktreeGroups.length === 1,
     });
   }
 
-  return result;
+  stashed.sort((a, b) => (b.stashedAt ?? 0) - (a.stashedAt ?? 0));
+
+  return { projects: result, stashed };
 }
 
 export function buildCanvasTerminalSections(
@@ -470,13 +527,7 @@ export function buildCanvasTerminalSections(
       for (const terminal of worktree.terminals) {
         const resolvedTerminal = resolveTerminalWithRuntimeState(terminal);
 
-        if (
-          !isCanvasTerminal(
-            project.collapsed,
-            worktree.collapsed,
-            resolvedTerminal,
-          )
-        ) {
+        if (!isCanvasTerminal(resolvedTerminal)) {
           continue;
         }
 
@@ -494,6 +545,7 @@ export function buildCanvasTerminalSections(
           worktree.name,
           project.name,
           telemetry?.provider,
+          telemetry?.first_user_prompt,
         );
         const locationLabel =
           worktree.name === project.name
@@ -527,8 +579,7 @@ export function buildCanvasTerminalSections(
           case "attention":
             attention.push(item);
             break;
-          case "running":
-          case "thinking":
+          case "active":
             progress.push(item);
             break;
           case "done":

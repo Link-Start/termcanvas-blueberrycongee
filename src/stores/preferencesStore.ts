@@ -2,44 +2,94 @@ import { create } from "zustand";
 import type { TerminalType } from "../types/index.ts";
 import type { AgentProviderConfig } from "../agentProviders";
 import { defaultProviderConfig, getPreset, PROVIDER_PRESETS } from "../agentProviders";
+import {
+  DEFAULT_WORKTREE_COMPACT_COLUMNS,
+  sanitizeWorktreeCompactColumns,
+} from "../canvas/worktreeCompactLayout";
 
 const DEFAULT_BLUR = 0;
 const DEFAULT_FONT_SIZE = 13;
 const DEFAULT_MIN_CONTRAST = 1;
 const LEGACY_ENABLED_BLUR = 1.5;
 
+export type TerminalRendererMode = "dom" | "webgl";
+
+export type TerminalEngine = "xterm" | "wterm";
+
 export interface CliCommandConfig {
   command: string;
   args: string[];
+}
+
+export interface StoredTerminalSize {
+  w: number;
+  h: number;
 }
 
 interface PreferencesStore {
   animationBlur: number;
   terminalFontSize: number;
   terminalFontFamily: string;
+  terminalRenderer: TerminalRendererMode;
+  terminalEngine: TerminalEngine;
   composerEnabled: boolean;
   drawingEnabled: boolean;
   browserEnabled: boolean;
   summaryEnabled: boolean;
+  globalSearchEnabled: boolean;
+  petEnabled: boolean;
+  completionGlowEnabled: boolean;
+  activityHeatmapEnabled: boolean;
+  trackpadSwipeFocusEnabled: boolean;
+  worktreeCompactColumns: number;
+  quitOnLastWindowClosed: boolean;
   summaryCli: "claude" | "codex";
   minimumContrastRatio: number;
   cliCommands: Partial<Record<TerminalType, CliCommandConfig>>;
+  /**
+   * User's preferred default size for newly-created terminals. Populated
+   * the first time the user resizes a terminal; null/undefined means
+   * "fall back to the panel-aware computed default". Decoupling the
+   * default from the current sidebar state is the whole point — otherwise
+   * opening the right panel between two `+ Terminal` clicks makes them
+   * different sizes.
+   */
+  defaultTerminalSize: StoredTerminalSize | null;
 
   agentConfig: AgentProviderConfig;
   apiKeyReady: boolean;
+
+  /**
+   * Per-id flag bag for capability discovery cues. A cue is "seen" once
+   * the user has acted on it or dismissed it. We persist only the `true`
+   * side; absence means "not seen yet". Keeping the schema this thin
+   * lets new cue ids drop in without a migration.
+   */
+  seenHints: Record<string, true>;
 
   setAnimationBlur: (value: number) => void;
   setMinimumContrastRatio: (value: number) => void;
   setTerminalFontSize: (value: number) => void;
   setTerminalFontFamily: (fontId: string) => void;
+  setTerminalRenderer: (mode: TerminalRendererMode) => void;
+  setTerminalEngine: (engine: TerminalEngine) => void;
   setComposerEnabled: (value: boolean) => void;
   setDrawingEnabled: (value: boolean) => void;
   setBrowserEnabled: (value: boolean) => void;
   setSummaryEnabled: (value: boolean) => void;
+  setGlobalSearchEnabled: (value: boolean) => void;
+  setPetEnabled: (value: boolean) => void;
+  setCompletionGlowEnabled: (value: boolean) => void;
+  setActivityHeatmapEnabled: (value: boolean) => void;
+  setTrackpadSwipeFocusEnabled: (value: boolean) => void;
+  setWorktreeCompactColumns: (value: number) => void;
+  setQuitOnLastWindowClosed: (value: boolean) => void;
   setSummaryCli: (value: "claude" | "codex") => void;
   setCli: (type: TerminalType, config: CliCommandConfig | null) => void;
   setAgentConfig: (config: AgentProviderConfig) => void;
   patchAgentConfig: (patch: Partial<AgentProviderConfig>) => void;
+  setDefaultTerminalSize: (size: StoredTerminalSize | null) => void;
+  markHintSeen: (hintId: string) => void;
 }
 
 const STORAGE_KEY = "termcanvas-preferences";
@@ -50,14 +100,57 @@ interface SavedPrefs {
   animationBlur: number;
   terminalFontSize: number;
   terminalFontFamily: string;
+  terminalRenderer: TerminalRendererMode;
+  terminalEngine: TerminalEngine;
   composerEnabled: boolean;
   drawingEnabled: boolean;
   browserEnabled: boolean;
   summaryEnabled: boolean;
+  globalSearchEnabled: boolean;
+  petEnabled: boolean;
+  completionGlowEnabled: boolean;
+  activityHeatmapEnabled: boolean;
+  trackpadSwipeFocusEnabled: boolean;
+  worktreeCompactColumns: number;
+  quitOnLastWindowClosed: boolean;
   summaryCli: "claude" | "codex";
   minimumContrastRatio: number;
   cliCommands: Partial<Record<TerminalType, CliCommandConfig>>;
+  defaultTerminalSize: StoredTerminalSize | null;
   agentConfig: AgentProviderConfig;
+  seenHints: Record<string, true>;
+}
+
+function sanitizeSeenHints(value: unknown): Record<string, true> {
+  if (!value || typeof value !== "object") return {};
+  const out: Record<string, true> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v === true) out[k] = true;
+  }
+  return out;
+}
+
+// Sanity bounds for persisted default size — guards against a corrupt
+// localStorage entry, NOT meant to restrict what the user can save from a
+// drag-resize. The user's actual resize handle allows arbitrary sizes;
+// these just reject implausible values like 10 × 10 or 50_000 × 50_000.
+const PREF_SIZE_MIN_W = 200;
+const PREF_SIZE_MAX_W = 4000;
+const PREF_SIZE_MIN_H = 120;
+const PREF_SIZE_MAX_H = 3000;
+
+export function sanitizeStoredTerminalSize(
+  value: unknown,
+): StoredTerminalSize | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const w = raw.w;
+  const h = raw.h;
+  if (typeof w !== "number" || typeof h !== "number") return null;
+  if (!Number.isFinite(w) || !Number.isFinite(h)) return null;
+  if (w < PREF_SIZE_MIN_W || w > PREF_SIZE_MAX_W) return null;
+  if (h < PREF_SIZE_MIN_H || h > PREF_SIZE_MAX_H) return null;
+  return { w: Math.round(w), h: Math.round(h) };
 }
 
 function migrateOldAgentFields(parsed: Record<string, unknown>): AgentProviderConfig {
@@ -113,6 +206,16 @@ function loadPreferences(): SavedPrefs {
       const ff = parsed.terminalFontFamily;
       if (typeof ff === "string" && ff.length > 0) fontFamily = ff;
 
+      let terminalRenderer: TerminalRendererMode = "webgl";
+      if (parsed.terminalRenderer === "dom") {
+        terminalRenderer = "dom";
+      }
+
+      let terminalEngine: TerminalEngine = "xterm";
+      if (parsed.terminalEngine === "wterm") {
+        terminalEngine = "wterm";
+      }
+
       let composerEnabled = false;
       if (parsed.composerEnabled === true) composerEnabled = true;
 
@@ -124,6 +227,28 @@ function loadPreferences(): SavedPrefs {
 
       let summaryEnabled = false;
       if (parsed.summaryEnabled === true) summaryEnabled = true;
+
+      let globalSearchEnabled = false;
+      if (parsed.globalSearchEnabled === true) globalSearchEnabled = true;
+
+      let petEnabled = false;
+      if (parsed.petEnabled === true) petEnabled = true;
+
+      let completionGlowEnabled = false;
+      if (parsed.completionGlowEnabled === true) completionGlowEnabled = true;
+
+      let activityHeatmapEnabled = false;
+      if (parsed.activityHeatmapEnabled === true) activityHeatmapEnabled = true;
+
+      let trackpadSwipeFocusEnabled = false;
+      if (parsed.trackpadSwipeFocusEnabled === true) trackpadSwipeFocusEnabled = true;
+
+      const worktreeCompactColumns = sanitizeWorktreeCompactColumns(
+        parsed.worktreeCompactColumns,
+      );
+
+      let quitOnLastWindowClosed = false;
+      if (parsed.quitOnLastWindowClosed === true) quitOnLastWindowClosed = true;
 
       let summaryCli: "claude" | "codex" = "claude";
       if (parsed.summaryCli === "codex") summaryCli = "codex";
@@ -142,19 +267,34 @@ function loadPreferences(): SavedPrefs {
       }
 
       const agentConfig = loadAgentConfig(parsed);
+      const defaultTerminalSize = sanitizeStoredTerminalSize(
+        parsed.defaultTerminalSize,
+      );
+      const seenHints = sanitizeSeenHints(parsed.seenHints);
 
       return {
         animationBlur: blur,
         terminalFontSize: fontSize,
         terminalFontFamily: fontFamily,
+        terminalRenderer,
+        terminalEngine,
         composerEnabled,
         drawingEnabled,
         browserEnabled,
         summaryEnabled,
+        globalSearchEnabled,
+        petEnabled,
+        completionGlowEnabled,
+        activityHeatmapEnabled,
+        trackpadSwipeFocusEnabled,
+        worktreeCompactColumns,
+        quitOnLastWindowClosed,
         summaryCli,
         minimumContrastRatio,
         cliCommands,
+        defaultTerminalSize,
         agentConfig,
+        seenHints,
       };
     }
   } catch {
@@ -163,14 +303,25 @@ function loadPreferences(): SavedPrefs {
     animationBlur: DEFAULT_BLUR,
     terminalFontSize: DEFAULT_FONT_SIZE,
     terminalFontFamily: "geist-mono",
+    terminalRenderer: "webgl",
+    terminalEngine: "xterm",
     composerEnabled: false,
     drawingEnabled: false,
     browserEnabled: false,
     summaryEnabled: false,
+    globalSearchEnabled: false,
+    petEnabled: false,
+    completionGlowEnabled: false,
+    activityHeatmapEnabled: false,
+    trackpadSwipeFocusEnabled: false,
+    worktreeCompactColumns: DEFAULT_WORKTREE_COMPACT_COLUMNS,
+    quitOnLastWindowClosed: false,
     summaryCli: "claude",
     minimumContrastRatio: DEFAULT_MIN_CONTRAST,
     cliCommands: {},
+    defaultTerminalSize: null,
     agentConfig: defaultProviderConfig(),
+    seenHints: {},
   };
 }
 
@@ -259,14 +410,25 @@ function getSaveState(state: PreferencesStore): SavedPrefs {
     animationBlur: state.animationBlur,
     terminalFontSize: state.terminalFontSize,
     terminalFontFamily: state.terminalFontFamily,
+    terminalRenderer: state.terminalRenderer,
+    terminalEngine: state.terminalEngine,
     composerEnabled: state.composerEnabled,
     drawingEnabled: state.drawingEnabled,
     browserEnabled: state.browserEnabled,
     summaryEnabled: state.summaryEnabled,
+    globalSearchEnabled: state.globalSearchEnabled,
+    petEnabled: state.petEnabled,
+    completionGlowEnabled: state.completionGlowEnabled,
+    activityHeatmapEnabled: state.activityHeatmapEnabled,
+    trackpadSwipeFocusEnabled: state.trackpadSwipeFocusEnabled,
+    worktreeCompactColumns: state.worktreeCompactColumns,
+    quitOnLastWindowClosed: state.quitOnLastWindowClosed,
     summaryCli: state.summaryCli,
     minimumContrastRatio: state.minimumContrastRatio,
     cliCommands: state.cliCommands,
+    defaultTerminalSize: state.defaultTerminalSize,
     agentConfig: state.agentConfig,
+    seenHints: state.seenHints,
   };
 }
 
@@ -276,15 +438,26 @@ export const usePreferencesStore = create<PreferencesStore>((set, get) => ({
   animationBlur: initialPrefs.animationBlur,
   terminalFontSize: initialPrefs.terminalFontSize,
   terminalFontFamily: initialPrefs.terminalFontFamily,
+  terminalRenderer: initialPrefs.terminalRenderer,
+  terminalEngine: initialPrefs.terminalEngine,
   composerEnabled: initialPrefs.composerEnabled,
   drawingEnabled: initialPrefs.drawingEnabled,
   browserEnabled: initialPrefs.browserEnabled,
   summaryEnabled: initialPrefs.summaryEnabled,
+  globalSearchEnabled: initialPrefs.globalSearchEnabled,
+  petEnabled: initialPrefs.petEnabled,
+  completionGlowEnabled: initialPrefs.completionGlowEnabled,
+  activityHeatmapEnabled: initialPrefs.activityHeatmapEnabled,
+  trackpadSwipeFocusEnabled: initialPrefs.trackpadSwipeFocusEnabled,
+  worktreeCompactColumns: initialPrefs.worktreeCompactColumns,
+  quitOnLastWindowClosed: initialPrefs.quitOnLastWindowClosed,
   summaryCli: initialPrefs.summaryCli,
   minimumContrastRatio: initialPrefs.minimumContrastRatio,
   cliCommands: initialPrefs.cliCommands,
+  defaultTerminalSize: initialPrefs.defaultTerminalSize,
   agentConfig: initialPrefs.agentConfig,
   apiKeyReady: false,
+  seenHints: initialPrefs.seenHints,
 
   setAnimationBlur: (value) => {
     const clamped = Math.round(Math.max(0, Math.min(3, value)) * 10) / 10;
@@ -305,6 +478,14 @@ export const usePreferencesStore = create<PreferencesStore>((set, get) => ({
     set({ terminalFontFamily: fontId });
     savePreferences(getSaveState({ ...get(), terminalFontFamily: fontId }));
   },
+  setTerminalRenderer: (mode) => {
+    set({ terminalRenderer: mode });
+    savePreferences(getSaveState({ ...get(), terminalRenderer: mode }));
+  },
+  setTerminalEngine: (engine) => {
+    set({ terminalEngine: engine });
+    savePreferences(getSaveState({ ...get(), terminalEngine: engine }));
+  },
   setComposerEnabled: (value) => {
     set({ composerEnabled: value });
     savePreferences(getSaveState({ ...get(), composerEnabled: value }));
@@ -320,6 +501,36 @@ export const usePreferencesStore = create<PreferencesStore>((set, get) => ({
   setSummaryEnabled: (value) => {
     set({ summaryEnabled: value });
     savePreferences(getSaveState({ ...get(), summaryEnabled: value }));
+  },
+  setGlobalSearchEnabled: (value) => {
+    set({ globalSearchEnabled: value });
+    savePreferences(getSaveState({ ...get(), globalSearchEnabled: value }));
+  },
+  setPetEnabled: (value) => {
+    set({ petEnabled: value });
+    savePreferences(getSaveState({ ...get(), petEnabled: value }));
+  },
+  setCompletionGlowEnabled: (value) => {
+    set({ completionGlowEnabled: value });
+    savePreferences(getSaveState({ ...get(), completionGlowEnabled: value }));
+  },
+  setActivityHeatmapEnabled: (value) => {
+    set({ activityHeatmapEnabled: value });
+    savePreferences(getSaveState({ ...get(), activityHeatmapEnabled: value }));
+  },
+  setTrackpadSwipeFocusEnabled: (value) => {
+    set({ trackpadSwipeFocusEnabled: value });
+    savePreferences(getSaveState({ ...get(), trackpadSwipeFocusEnabled: value }));
+  },
+  setWorktreeCompactColumns: (value) => {
+    const sanitized = sanitizeWorktreeCompactColumns(value);
+    set({ worktreeCompactColumns: sanitized });
+    savePreferences(getSaveState({ ...get(), worktreeCompactColumns: sanitized }));
+  },
+  setQuitOnLastWindowClosed: (value) => {
+    set({ quitOnLastWindowClosed: value });
+    savePreferences(getSaveState({ ...get(), quitOnLastWindowClosed: value }));
+    window.termcanvas?.app.setQuitOnLastWindowClosed(value);
   },
   setSummaryCli: (value) => {
     set({ summaryCli: value });
@@ -345,4 +556,26 @@ export const usePreferencesStore = create<PreferencesStore>((set, get) => ({
     set({ agentConfig: updated });
     savePreferences(getSaveState({ ...get(), agentConfig: updated }));
   },
+  setDefaultTerminalSize: (size) => {
+    const sanitized = size === null ? null : sanitizeStoredTerminalSize(size);
+    set({ defaultTerminalSize: sanitized });
+    savePreferences(
+      getSaveState({ ...get(), defaultTerminalSize: sanitized }),
+    );
+  },
+  markHintSeen: (hintId) => {
+    const current = get().seenHints;
+    if (current[hintId]) return;
+    const next = { ...current, [hintId]: true as const };
+    set({ seenHints: next });
+    savePreferences(getSaveState({ ...get(), seenHints: next }));
+  },
 }));
+
+// Sync the persisted value to the main process once on startup so a user
+// who flipped the toggle in a previous session keeps that behavior on the
+// very first window-close of this session. Guarded because this module is
+// also imported in Node-based unit tests where `window` is not defined.
+if (typeof window !== "undefined") {
+  window.termcanvas?.app.setQuitOnLastWindowClosed?.(initialPrefs.quitOnLastWindowClosed);
+}

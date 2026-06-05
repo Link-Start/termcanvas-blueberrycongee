@@ -1,21 +1,31 @@
 import { HydraError } from "./errors.ts";
-import {
-  findProjectByPath,
-  isTermCanvasRunning,
-  terminalCreate,
-} from "./termcanvas.ts";
+import { getRuntime } from "./runtime/index.ts";
 
 export interface DispatchCreateOnlyRequest {
-  workflowId: string;
-  handoffId: string;
+  workbenchId: string;
+  assignmentId: string;
+  runId: string;
   repoPath: string;
   worktreePath: string;
   agentType: string;
+  /**
+   * Optional model pin (e.g. "opus", "gpt-5"). When set, the underlying CLI
+   * is invoked with its model flag via the CLI adapter.
+   */
+  model?: string;
+  /**
+   * Optional reasoning effort level using the target CLI's native vocabulary
+   * (claude: low|medium|high|max; codex: low|medium|high|xhigh). Validated
+   * against the adapter's capability before launch.
+   */
+  reasoningEffort?: string;
   taskFile: string;
-  doneFile: string;
   resultFile: string;
   autoApprove?: boolean;
   parentTerminalId?: string;
+  // Resume the agent's prior session (e.g., for redispatch after reset).
+  // Only consumed by agents that support session resumption (currently claude).
+  resumeSessionId?: string;
 }
 
 export interface DispatchCreateOnlyResult {
@@ -35,26 +45,50 @@ export interface DispatcherDependencies {
     prompt?: string,
     autoApprove?: boolean,
     parentTerminalId?: string,
-    workflowId?: string,
-    handoffId?: string,
+    workbenchId?: string,
+    assignmentId?: string,
     repoPath?: string,
+    resumeSessionId?: string,
   ): { id: string; type: string; title: string };
 }
 
 const DEFAULT_DEPENDENCIES: DispatcherDependencies = {
-  isTermCanvasRunning,
-  findProjectByPath,
-  terminalCreate,
+  isTermCanvasRunning: () => getRuntime().isAvailable(),
+  findProjectByPath: (repoPath) => getRuntime().findProjectByPath(repoPath),
+  terminalCreate: (
+    worktreePath,
+    type,
+    prompt,
+    autoApprove,
+    parentTerminalId,
+    workbenchId,
+    assignmentId,
+    repoPath,
+    resumeSessionId,
+  ) =>
+    getRuntime().terminalCreate({
+      worktreePath,
+      type,
+      prompt: prompt ?? "",
+      autoApprove,
+      parentTerminalId,
+      workbenchId,
+      assignmentId,
+      repoPath,
+      resumeSessionId,
+    }),
 };
 
 export function buildCreateOnlyPrompt(
   taskFile: string,
-  doneFile: string,
-  handoffId: string,
-  workflowId: string,
+  workbenchId: string,
   resultFile: string,
+  options: {
+    assignmentId: string;
+    runId: string;
+  },
 ): string {
-  return `Read ${taskFile} for the full task contract. Write a valid hydra/v2 result JSON to ${resultFile}. Then write a JSON done marker to ${doneFile} with version=hydra/v2, handoff_id=${handoffId}, workflow_id=${workflowId}, and result_file=${resultFile}.`;
+  return `You MUST read ${taskFile} FIRST — before any other action. It is the single source of truth for your task, context files, output paths, and the result.json contract. Do not write code, run commands, or plan until you have read it.`;
 }
 
 export async function dispatchCreateOnly(
@@ -62,34 +96,36 @@ export async function dispatchCreateOnly(
   dependencies: DispatcherDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<DispatchCreateOnlyResult> {
   if (!dependencies.isTermCanvasRunning()) {
-    throw new HydraError("TermCanvas is not running", {
-      errorCode: "DISPATCH_TERMCANVAS_NOT_RUNNING",
+    throw new HydraError("Hydra runtime is not available (TermCanvas not running and standalone runtime unavailable)", {
+      errorCode: "DISPATCH_RUNTIME_UNAVAILABLE",
       stage: "dispatcher.preflight",
       ids: {
-        workflow_id: request.workflowId,
-        handoff_id: request.handoffId,
+        workbench_id: request.workbenchId,
+        assignment_id: request.assignmentId,
       },
     });
   }
 
   const project = dependencies.findProjectByPath(request.repoPath);
   if (!project) {
-    throw new HydraError(`Repo not found on TermCanvas canvas: ${request.repoPath}`, {
-      errorCode: "DISPATCH_REPO_NOT_ON_CANVAS",
+    throw new HydraError(`Repo not tracked by active runtime: ${request.repoPath}`, {
+      errorCode: "DISPATCH_REPO_NOT_TRACKED",
       stage: "dispatcher.preflight",
       ids: {
-        workflow_id: request.workflowId,
-        handoff_id: request.handoffId,
+        workbench_id: request.workbenchId,
+        assignment_id: request.assignmentId,
       },
     });
   }
 
   const prompt = buildCreateOnlyPrompt(
     request.taskFile,
-    request.doneFile,
-    request.handoffId,
-    request.workflowId,
+    request.workbenchId,
     request.resultFile,
+    {
+      assignmentId: request.assignmentId,
+      runId: request.runId,
+    },
   );
   const terminal = dependencies.terminalCreate(
     request.worktreePath,
@@ -97,9 +133,10 @@ export async function dispatchCreateOnly(
     prompt,
     request.autoApprove,
     request.parentTerminalId,
-    request.workflowId,
-    request.handoffId,
+    request.workbenchId,
+    request.assignmentId,
     request.repoPath,
+    request.resumeSessionId,
   );
 
   return {

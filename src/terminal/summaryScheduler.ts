@@ -6,11 +6,16 @@ import { usePreferencesStore } from "../stores/preferencesStore";
 import { useNotificationStore } from "../stores/notificationStore";
 import { useLocaleStore } from "../stores/localeStore";
 import { resolveTerminalWithRuntimeState } from "../stores/terminalRuntimeStateStore";
+import {
+  AUTO_SUMMARY_SWEEP_MS,
+  TURN_COMPLETE_SUMMARY_DEBOUNCE_MS,
+} from "../../shared/lifecycleThresholds";
+
+const IS_DEV = Boolean((import.meta as { env?: { DEV?: boolean } }).env?.DEV);
 
 type SummaryCli = "claude" | "codex";
 
 const SUMMARY_ELIGIBLE_TYPES = new Set(["claude", "codex"]);
-const AUTO_SUMMARY_INTERVAL_MS = 10 * 60_000; // 10 minutes
 
 const useSummaryFlightStore = create<{ ids: Set<string> }>(() => ({
   ids: new Set(),
@@ -75,7 +80,10 @@ export function requestSummary(
   if (useSummaryFlightStore.getState().ids.has(liveTerminal.id)) return;
 
   addInFlight(liveTerminal.id);
-  console.log(`[SummaryScheduler] requesting summary for ${liveTerminal.id.slice(0, 8)} (${liveTerminal.type})`);
+  if (IS_DEV)
+    console.log(
+      `[SummaryScheduler] requesting summary for ${liveTerminal.id.slice(0, 8)} (${liveTerminal.type})`,
+    );
 
   const locale = useLocaleStore.getState().locale;
   const requestedSessionId = liveTerminal.sessionId;
@@ -92,21 +100,28 @@ export function requestSummary(
     .then((result) => {
       const currentLocation = findTerminalLocationById(liveTerminal.id);
       if (!currentLocation) {
-        console.log(`[SummaryScheduler] ignored result for removed terminal ${liveTerminal.id.slice(0, 8)}`);
+        if (IS_DEV)
+          console.log(
+            `[SummaryScheduler] ignored result for removed terminal ${liveTerminal.id.slice(0, 8)}`,
+          );
         return;
       }
       const currentLiveTerminal = resolveTerminalWithRuntimeState(
         currentLocation.terminal,
       );
       if (currentLiveTerminal.sessionId !== requestedSessionId) {
-        console.log(
-          `[SummaryScheduler] ignored stale result for ${liveTerminal.id.slice(0, 8)} (requested=${requestedSessionId}, current=${currentLiveTerminal.sessionId ?? "none"})`,
-        );
+        if (IS_DEV)
+          console.log(
+            `[SummaryScheduler] ignored stale result for ${liveTerminal.id.slice(0, 8)} (requested=${requestedSessionId}, current=${currentLiveTerminal.sessionId ?? "none"})`,
+          );
         return;
       }
 
       if (result.ok && result.summary) {
-        console.log(`[SummaryScheduler] success for ${liveTerminal.id.slice(0, 8)}: "${result.summary}"`);
+        if (IS_DEV)
+          console.log(
+            `[SummaryScheduler] success for ${liveTerminal.id.slice(0, 8)}: "${result.summary}"`,
+          );
         updateTerminalCustomTitleInScene(
           currentLocation.projectId,
           currentLocation.worktreeId,
@@ -117,13 +132,22 @@ export function requestSummary(
           lastSummarySessionSize.set(liveTerminal.id, result.sessionFileSize);
         }
       } else {
-        console.warn(`[SummaryScheduler] failed for ${liveTerminal.id.slice(0, 8)}: ${result.error}`);
-        useNotificationStore.getState().notify("warn", `Summary failed: ${result.error}`);
+        console.warn(
+          `[SummaryScheduler] failed for ${liveTerminal.id.slice(0, 8)}: ${result.error}`,
+        );
+        useNotificationStore
+          .getState()
+          .notify("warn", `Summary failed: ${result.error}`);
       }
     })
     .catch((err) => {
-      console.error(`[SummaryScheduler] IPC error for ${liveTerminal.id.slice(0, 8)}:`, err);
-      useNotificationStore.getState().notify("error", `Summary error: ${String(err)}`);
+      console.error(
+        `[SummaryScheduler] IPC error for ${liveTerminal.id.slice(0, 8)}:`,
+        err,
+      );
+      useNotificationStore
+        .getState()
+        .notify("error", `Summary error: ${String(err)}`);
     })
     .finally(() => {
       removeInFlight(liveTerminal.id);
@@ -135,7 +159,7 @@ const turnCompletedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 export function onTerminalTurnCompleted(terminalId: string): void {
   if (!usePreferencesStore.getState().summaryEnabled) return;
 
-  // Debounce: wait 5s in case of rapid turn completions
+  // Debounce so rapid turn completions coalesce (see TURN_COMPLETE_SUMMARY_DEBOUNCE_MS)
   if (turnCompletedTimers.has(terminalId)) return;
 
   const timer = setTimeout(() => {
@@ -172,7 +196,7 @@ export function onTerminalTurnCompleted(terminalId: string): void {
         return;
       }
     }
-  }, 5_000);
+  }, TURN_COMPLETE_SUMMARY_DEBOUNCE_MS);
   turnCompletedTimers.set(terminalId, timer);
 }
 
@@ -223,7 +247,7 @@ export function startAutoSummaryWatcher(): () => void {
     }
   };
 
-  const intervalId = setInterval(tick, AUTO_SUMMARY_INTERVAL_MS);
+  const intervalId = setInterval(tick, AUTO_SUMMARY_SWEEP_MS);
 
   return () => {
     disposed = true;

@@ -17,9 +17,21 @@ interface SparklineChartProps {
   buckets: UsageBucket[];
   animate: boolean;
   date?: string;
+  /**
+   * Height of the bar area in pixels. Defaults to 40 for the narrow
+   * sidebar. The overlay uses a taller value so sparkline and
+   * MonthlyTrendChart share the same chart height and their x-axes
+   * land on the same line when rendered side-by-side.
+   */
+  heightPx?: number;
 }
 
-export function SparklineChart({ buckets, animate, date }: SparklineChartProps) {
+export function SparklineChart({
+  buckets,
+  animate,
+  date,
+  heightPx = 40,
+}: SparklineChartProps) {
   const t = useT();
   const [hovered, setHovered] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -32,7 +44,7 @@ export function SparklineChart({ buckets, animate, date }: SparklineChartProps) 
 
   return (
     <div ref={containerRef} className="relative">
-      <div className="flex items-end gap-px h-10">
+      <div className="flex items-end gap-px" style={{ height: heightPx }}>
         {buckets.map((b, i) => {
           const h = max > 0 ? Math.max(0, (b.cost / max) * 100) : 0;
           const isFuture = isToday && b.hourStart > currentHour;
@@ -42,21 +54,27 @@ export function SparklineChart({ buckets, animate, date }: SparklineChartProps) 
 
           return (
             <div
-              key={i}
+              key={`bar-${b.hourStart}`}
               className="flex-1 min-w-0 rounded-t-sm cursor-default relative"
               style={{
                 height: `${barH}%`,
                 backgroundColor: isFuture
                   ? "var(--border)"
                   : isActive
-                    ? "var(--accent)"
+                    ? "var(--usage-primary)"
                     : "var(--border)",
-                opacity: isFuture ? 0.3 : isActive ? 0.5 + (h / 100) * 0.5 : 0.3,
+                opacity: isFuture
+                  ? 0.3
+                  : isActive
+                    ? 0.5 + (h / 100) * 0.5
+                    : 0.3,
                 transformOrigin: "bottom",
                 transform: isHovered && isActive ? "scaleY(1.08)" : "scaleY(1)",
                 filter: isHovered && isActive ? "brightness(1.3)" : "none",
                 transition: "transform 0.15s ease, filter 0.15s ease",
-                animation: animate ? `usage-bar-grow 0.4s ease-out ${i * 15}ms both` : undefined,
+                animation: animate
+                  ? `usage-bar-grow 0.4s ease-out ${i * 15}ms both`
+                  : undefined,
               }}
               onMouseEnter={() => setHovered(i)}
               onMouseLeave={() => setHovered(null)}
@@ -75,10 +93,7 @@ export function SparklineChart({ buckets, animate, date }: SparklineChartProps) 
         />
       )}
 
-      <div
-        className="flex justify-between mt-0.5 text-[9px] text-[var(--text-faint)]"
-        style={{ fontFamily: '"Geist Mono", monospace' }}
-      >
+      <div className="flex justify-between mt-1.5 text-[9px] text-[var(--text-secondary)] font-medium tc-mono tc-num">
         <span>00</span>
         <span>06</span>
         <span>12</span>
@@ -97,7 +112,13 @@ interface SparklineTooltipProps {
   callsLabel: string;
 }
 
-function SparklineTooltip({ bucket, index, totalBars, containerRef, callsLabel }: SparklineTooltipProps) {
+function SparklineTooltip({
+  bucket,
+  index,
+  totalBars,
+  containerRef,
+  callsLabel,
+}: SparklineTooltipProps) {
   const tooltipRef = useRef<HTMLDivElement>(null);
 
   useLayoutEffect(() => {
@@ -117,7 +138,12 @@ function SparklineTooltip({ bucket, index, totalBars, containerRef, callsLabel }
 
   const barWidth = containerRect.width / totalBars;
   const barCenterX = containerRect.left + (index + 0.5) * barWidth;
-  const totalTokens = bucket.input + bucket.output + bucket.cacheRead + bucket.cacheCreate5m + bucket.cacheCreate1h;
+  const totalTokens =
+    bucket.input +
+    bucket.output +
+    bucket.cacheRead +
+    bucket.cacheCreate5m +
+    bucket.cacheCreate1h;
 
   return createPortal(
     <div
@@ -129,19 +155,24 @@ function SparklineTooltip({ bucket, index, totalBars, containerRef, callsLabel }
         transform: "translateX(-50%)",
       }}
     >
-      <div
-        className="rounded-md px-2 py-1.5 border border-[var(--border)] bg-[var(--surface)] shadow-lg whitespace-nowrap"
-        style={{ fontFamily: '"Geist Mono", monospace' }}
-      >
-        <div className="text-[10px] text-[var(--text-secondary)] font-medium">{bucket.label}</div>
+      <div className="rounded-md px-2.5 py-1.5 border border-[var(--border)] bg-[var(--surface)] shadow-lg whitespace-nowrap tc-mono tc-num">
+        <div className="text-[10px] text-[var(--text-secondary)] font-medium">
+          {bucket.label}
+        </div>
         <div className="flex items-center gap-2 mt-0.5">
-          <span className="text-[10px] text-[var(--text-primary)]">{fmtCost(bucket.cost)}</span>
-          <span className="text-[9px] text-[var(--text-muted)]">·</span>
-          <span className="text-[10px] text-[var(--text-muted)]">{bucket.calls} {callsLabel}</span>
+          <span className="text-[10px] text-[var(--text-primary)]">
+            {fmtCost(bucket.cost)}
+          </span>
+          <span className="text-[9px] text-[var(--text-faint)]">·</span>
+          <span className="text-[10px] text-[var(--text-secondary)]">
+            {bucket.calls} {callsLabel}
+          </span>
           {totalTokens > 0 && (
             <>
-              <span className="text-[9px] text-[var(--text-muted)]">·</span>
-              <span className="text-[10px] text-[var(--text-muted)]">{fmtTokens(totalTokens)}t</span>
+              <span className="text-[9px] text-[var(--text-faint)]">·</span>
+              <span className="text-[10px] text-[var(--text-secondary)]">
+                {fmtTokens(totalTokens)}t
+              </span>
             </>
           )}
         </div>

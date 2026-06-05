@@ -5,7 +5,7 @@ import path from "path";
 interface WorktreeInfo {
   path: string;
   branch: string;
-  isMain: boolean;
+  isPrimary: boolean;
 }
 
 interface ProjectInfo {
@@ -21,12 +21,18 @@ export interface ChildGitRepoInfo {
 
 const IGNORED_CHILD_DIRS = new Set([".git", "node_modules"]);
 
-function parseWorktreesOutput(output: string): WorktreeInfo[] {
+function parseWorktreesOutput(
+  output: string,
+  repoPath: string,
+): WorktreeInfo[] {
   const worktrees: WorktreeInfo[] = [];
   let current: Partial<WorktreeInfo> & { prunable?: boolean } = {};
+  const resolvedRepo = path.resolve(repoPath);
 
   // Ensure the final record is flushed even if output doesn't end with '\n'
-  for (const line of (output.endsWith("\n") ? output : `${output}\n`).split("\n")) {
+  for (const line of (output.endsWith("\n") ? output : `${output}\n`).split(
+    "\n",
+  )) {
     if (line.startsWith("worktree ")) {
       current.path = line.slice("worktree ".length);
     } else if (line.startsWith("branch ")) {
@@ -41,11 +47,18 @@ function parseWorktreesOutput(output: string): WorktreeInfo[] {
         worktrees.push({
           path: current.path,
           branch: current.branch ?? "(detached)",
-          isMain: worktrees.length === 0,
+          isPrimary: path.resolve(current.path) === resolvedRepo,
         });
       }
       current = {};
     }
+  }
+
+  // If no worktree matched repoPath (e.g. symlink divergence), fall back to
+  // marking the first entry as main — git always lists the primary worktree
+  // first.
+  if (worktrees.length > 0 && !worktrees.some((w) => w.isPrimary)) {
+    worktrees[0] = { ...worktrees[0], isPrimary: true };
   }
 
   return worktrees;
@@ -101,7 +114,7 @@ export class ProjectScanner {
         {
           path: dirPath,
           branch: "main",
-          isMain: true,
+          isPrimary: true,
         },
       ];
     }
@@ -150,13 +163,24 @@ export class ProjectScanner {
         },
       );
 
-      return parseWorktreesOutput(output);
+      return parseWorktreesOutput(output, dirPath);
     } catch {
+      // Git failed. Disambiguate two cases before falling back:
+      //   (a) dirPath no longer exists — project was deleted
+      //       externally (`rm -rf /path/to/project`). Return [] so
+      //       the 5-second worktree watcher / syncWorktrees prunes
+      //       the project from the store instead of inheriting a
+      //       ghost entry.
+      //   (b) dirPath exists but isn't a git repo — user added a
+      //       plain directory as a project. Keep the legacy
+      //       behaviour of surfacing the dir itself as a single
+      //       "main" worktree so the project stays usable.
+      if (!existsSync(dirPath)) return [];
       return [
         {
           path: dirPath,
           branch: this.getCurrentBranch(dirPath),
-          isMain: true,
+          isPrimary: true,
         },
       ];
     }
@@ -169,13 +193,15 @@ export class ProjectScanner {
         "list",
         "--porcelain",
       ]);
-      return parseWorktreesOutput(output);
+      return parseWorktreesOutput(output, dirPath);
     } catch {
+      // See sync variant above for the two-case rationale.
+      if (!existsSync(dirPath)) return [];
       return [
         {
           path: dirPath,
           branch: await this.getCurrentBranchAsync(dirPath),
-          isMain: true,
+          isPrimary: true,
         },
       ];
     }

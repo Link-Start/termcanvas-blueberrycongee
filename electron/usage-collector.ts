@@ -3,12 +3,86 @@ import path from "path";
 import os from "os";
 import { TERMCANVAS_DIR } from "./state-persistence.ts";
 
-const PRICING: Record<string, { input: number; output: number; cache_read: number; cache_create_5m: number; cache_create_1h: number }> = {
-  "claude-opus-4-6":   { input: 5.00, output: 25.00, cache_read: 0.50, cache_create_5m: 6.25,  cache_create_1h: 10.00 },
-  "claude-sonnet-4-6": { input: 3.00, output: 15.00, cache_read: 0.30, cache_create_5m: 3.75,  cache_create_1h: 6.00 },
-  "claude-haiku-4-5":  { input: 1.00, output:  5.00, cache_read: 0.10, cache_create_5m: 1.25,  cache_create_1h: 2.00 },
-  codex:               { input: 1.50, output:  6.00, cache_read: 0.375, cache_create_5m: 1.50,  cache_create_1h: 1.50 },
-  default:             { input: 5.00, output: 25.00, cache_read: 0.50, cache_create_5m: 6.25,  cache_create_1h: 10.00 },
+interface Pricing {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_create_5m: number;
+  cache_create_1h: number;
+  long_context_threshold_tokens?: number;
+  long_context_input_multiplier?: number;
+  long_context_output_multiplier?: number;
+}
+
+function claudePricing(
+  input: number,
+  output: number,
+  cacheRead: number,
+  cacheCreate5m: number,
+  cacheCreate1h: number,
+): Pricing {
+  return {
+    input,
+    output,
+    cache_read: cacheRead,
+    cache_create_5m: cacheCreate5m,
+    cache_create_1h: cacheCreate1h,
+  };
+}
+
+function openaiPricing(
+  input: number,
+  cacheRead: number,
+  output: number,
+  extras: Pick<
+    Pricing,
+    | "long_context_threshold_tokens"
+    | "long_context_input_multiplier"
+    | "long_context_output_multiplier"
+  > = {},
+): Pricing {
+  return {
+    input,
+    output,
+    cache_read: cacheRead,
+    cache_create_5m: 0,
+    cache_create_1h: 0,
+    ...extras,
+  };
+}
+
+const PRICING: Record<string, Pricing> = {
+  "claude-opus-4-7": claudePricing(5.00, 25.00, 0.50, 6.25, 10.00),
+  "claude-opus-4-6": claudePricing(5.00, 25.00, 0.50, 6.25, 10.00),
+  "claude-sonnet-4-6": claudePricing(3.00, 15.00, 0.30, 3.75, 6.00),
+  "claude-haiku-4-5": claudePricing(1.00, 5.00, 0.10, 1.25, 2.00),
+  "gpt-5.5": openaiPricing(5.00, 0.50, 30.00),
+  "gpt-5.4": openaiPricing(2.50, 0.25, 15.00, {
+    long_context_threshold_tokens: 272_000,
+    long_context_input_multiplier: 2,
+    long_context_output_multiplier: 1.5,
+  }),
+  "gpt-5.4-mini": openaiPricing(0.75, 0.075, 4.50),
+  "gpt-5.4-nano": openaiPricing(0.20, 0.02, 1.25),
+  "gpt-5.3-codex": openaiPricing(1.75, 0.175, 14.00),
+  "gpt-5.2-codex": openaiPricing(1.75, 0.175, 14.00),
+  "gpt-5.2": openaiPricing(1.75, 0.175, 14.00),
+  "gpt-5.1-codex-mini": openaiPricing(0.25, 0.025, 2.00),
+  "gpt-5.1-codex-max": openaiPricing(1.25, 0.125, 10.00),
+  "gpt-5.1-codex": openaiPricing(1.25, 0.125, 10.00),
+  "gpt-5.1": openaiPricing(1.25, 0.125, 10.00),
+  "gpt-5-codex": openaiPricing(1.25, 0.125, 10.00),
+  "gpt-5-mini": openaiPricing(0.25, 0.025, 2.00),
+  "gpt-5-nano": openaiPricing(0.05, 0.005, 0.40),
+  "gpt-5": openaiPricing(1.25, 0.125, 10.00),
+  "gpt-4o-mini": openaiPricing(0.15, 0.075, 0.60),
+  "gpt-4o": openaiPricing(2.50, 1.25, 10.00),
+  "o4-mini": openaiPricing(1.10, 0.275, 4.40),
+  o3: openaiPricing(2.00, 0.50, 8.00),
+  codex: openaiPricing(1.50, 0.375, 6.00),
+  kimi: openaiPricing(0.60, 0.15, 2.50),
+  wuu: openaiPricing(0.60, 0.15, 2.50),
+  default: claudePricing(5.00, 25.00, 0.50, 6.25, 10.00),
 };
 
 export interface UsageRecord {
@@ -72,8 +146,39 @@ export interface UsageSummary {
   models: ModelUsage[];
 }
 
+export interface UsageRangeDay {
+  date: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate5m: number;
+  cacheCreate1h: number;
+  cost: number;
+  calls: number;
+}
+
+export interface UsageRangeSummary {
+  startDate: string;
+  endDate: string;
+  days: UsageRangeDay[];
+  sessions: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCacheRead: number;
+  totalCacheCreate5m: number;
+  totalCacheCreate1h: number;
+  totalCost: number;
+  projects: ProjectUsage[];
+  models: ModelUsage[];
+}
+
 interface CachedUsageSummary {
   summary: UsageSummary;
+  cachedAt: number;
+}
+
+interface CachedUsageRangeSummary {
+  summary: UsageRangeSummary;
   cachedAt: number;
 }
 
@@ -102,6 +207,7 @@ const HEATMAP_DISK_CACHE_FILE = path.join(
 );
 
 const usageSummaryCache = new Map<string, CachedUsageSummary>();
+const usageRangeSummaryCache = new Map<string, CachedUsageRangeSummary>();
 let heatmapCache:
   | { data: Record<string, { tokens: number; cost: number }>; cachedAt: number }
   | null = null;
@@ -111,6 +217,16 @@ function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+function getObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function getString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
 function perfLog(label: string, details: Record<string, unknown>) {
   if (!process.env.VITE_DEV_SERVER_URL) return;
   console.log(`[Perf] ${label}`, details);
@@ -118,19 +234,32 @@ function perfLog(label: string, details: Record<string, unknown>) {
 
 function matchPricing(model: string) {
   if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (key !== "default" && model.startsWith(key)) return PRICING[key];
+  for (const key of Object.keys(PRICING)
+    .filter((candidate) => candidate !== "default")
+    .sort((a, b) => b.length - a.length)) {
+    if (model.startsWith(key)) return PRICING[key];
   }
   return PRICING.default;
 }
 
 export function computeCost(model: string, input: number, output: number, cacheRead: number, cacheCreate5m: number, cacheCreate1h: number): number {
   const p = matchPricing(model);
-  return (input / 1e6) * p.input
-       + (output / 1e6) * p.output
-       + (cacheRead / 1e6) * p.cache_read
-       + (cacheCreate5m / 1e6) * p.cache_create_5m
-       + (cacheCreate1h / 1e6) * p.cache_create_1h;
+  const totalInputTokens = input + cacheRead + cacheCreate5m + cacheCreate1h;
+  const useLongContextRate =
+    p.long_context_threshold_tokens !== undefined &&
+    totalInputTokens > p.long_context_threshold_tokens;
+  const inputMultiplier = useLongContextRate
+    ? (p.long_context_input_multiplier ?? 1)
+    : 1;
+  const outputMultiplier = useLongContextRate
+    ? (p.long_context_output_multiplier ?? 1)
+    : 1;
+
+  return (input / 1e6) * p.input * inputMultiplier
+       + (output / 1e6) * p.output * outputMultiplier
+       + (cacheRead / 1e6) * p.cache_read * inputMultiplier
+       + (cacheCreate5m / 1e6) * p.cache_create_5m * inputMultiplier
+       + (cacheCreate1h / 1e6) * p.cache_create_1h * inputMultiplier;
 }
 
 function toLocalDateString(date: Date): string {
@@ -174,6 +303,27 @@ export function dateToUtcRange(dateStr: string): { utcStart: string; utcEnd: str
   return { utcStart: fmt(startMs), utcEnd: fmt(endMs) };
 }
 
+function dateRangeToUtcRange(
+  startDate: string,
+  endDate: string,
+): { utcStart: string; utcEnd: string } {
+  const startMs = new Date(`${startDate}T00:00:00`).getTime();
+  const endMs = new Date(`${endDate}T00:00:00`).getTime() + 86400_000;
+  const fmt = (ms: number) =>
+    new Date(ms).toISOString().replace("Z", "").split(".")[0];
+  return { utcStart: fmt(startMs), utcEnd: fmt(endMs) };
+}
+
+function localDateFromUtcTimestamp(
+  tsClean: string,
+  tzOffsetHours: number,
+): string {
+  const utcMs = new Date(tsClean + "Z").getTime();
+  const localMs = utcMs + tzOffsetHours * 3600_000;
+  const localDate = new Date(localMs);
+  return `${localDate.getUTCFullYear()}-${String(localDate.getUTCMonth() + 1).padStart(2, "0")}-${String(localDate.getUTCDate()).padStart(2, "0")}`;
+}
+
 function utcToLocalHour(tsClean: string, tzOffsetHours: number): number {
   const utcMs = new Date(tsClean + "Z").getTime();
   const localMs = utcMs + tzOffsetHours * 3600_000;
@@ -213,10 +363,7 @@ function bucketHeatmapRecord(
   record: UsageRecord,
   tzOffsetHours: number,
 ): void {
-  const utcMs = new Date(record.ts + "Z").getTime();
-  const localMs = utcMs + tzOffsetHours * 3600_000;
-  const localDate = new Date(localMs);
-  const dateStr = `${localDate.getUTCFullYear()}-${String(localDate.getUTCMonth() + 1).padStart(2, "0")}-${String(localDate.getUTCDate()).padStart(2, "0")}`;
+  const dateStr = localDateFromUtcTimestamp(record.ts, tzOffsetHours);
 
   const tokens =
     record.input +
@@ -354,6 +501,218 @@ export function findCodexJsonlFiles(): string[] {
   return files;
 }
 
+export function findKimiSessionFiles(): Array<{ sessionId: string; filePath: string }> {
+  const home = os.homedir();
+  const sessionsRoot = path.join(home, ".kimi", "sessions");
+  const results: Array<{ sessionId: string; filePath: string }> = [];
+  if (!fs.existsSync(sessionsRoot)) {
+    return results;
+  }
+
+  try {
+    const hashDirs = fs.readdirSync(sessionsRoot);
+    for (const hashDir of hashDirs) {
+      const fullHashDir = path.join(sessionsRoot, hashDir);
+      try {
+        const stat = fs.statSync(fullHashDir);
+        if (!stat.isDirectory()) continue;
+      } catch { continue; }
+
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(fullHashDir);
+      } catch { continue; }
+
+      for (const entry of entries) {
+        const sessionDir = path.join(fullHashDir, entry);
+        try {
+          const s = fs.statSync(sessionDir);
+          if (!s.isDirectory()) continue;
+        } catch { continue; }
+        const contextFile = path.join(sessionDir, "context.jsonl");
+        if (fs.existsSync(contextFile)) {
+          results.push({ sessionId: entry, filePath: contextFile });
+        }
+      }
+    }
+  } catch { /* skip */ }
+
+  return results;
+}
+
+export function findKimiWireFiles(): string[] {
+  const home = os.homedir();
+  const sessionsRoot = path.join(home, ".kimi", "sessions");
+  const files: string[] = [];
+  if (!fs.existsSync(sessionsRoot)) {
+    return files;
+  }
+
+  try {
+    const hashDirs = fs.readdirSync(sessionsRoot);
+    for (const hashDir of hashDirs) {
+      const fullHashDir = path.join(sessionsRoot, hashDir);
+      try {
+        const stat = fs.statSync(fullHashDir);
+        if (!stat.isDirectory()) continue;
+      } catch { continue; }
+
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(fullHashDir);
+      } catch { continue; }
+
+      for (const entry of entries) {
+        const sessionDir = path.join(fullHashDir, entry);
+        try {
+          const s = fs.statSync(sessionDir);
+          if (!s.isDirectory()) continue;
+        } catch { continue; }
+        const wireFile = path.join(sessionDir, "wire.jsonl");
+        if (fs.existsSync(wireFile)) {
+          files.push(wireFile);
+        }
+      }
+    }
+  } catch { /* skip */ }
+
+  return files;
+}
+
+export function parseKimiWireFile(
+  filePath: string,
+  utcStart: string,
+  utcEnd: string,
+): { records: UsageRecord[]; projectPath: string } {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, "utf-8");
+  } catch {
+    return { records: [], projectPath: "" };
+  }
+
+  const records: UsageRecord[] = [];
+  let eventIndex = 0;
+
+  for (const line of content.split("\n")) {
+    if (!line) continue;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(line);
+    } catch { continue; }
+
+    const message = getObject(obj.message);
+    if (!message) continue;
+    if (message.type !== "StatusUpdate") continue;
+
+    const payload = getObject(message.payload);
+    if (!payload) continue;
+
+    const tokenUsage = getObject(payload.token_usage);
+    if (!tokenUsage) continue;
+
+    const ts = obj.timestamp;
+    if (typeof ts !== "number") continue;
+    const tsClean = new Date(ts * 1000).toISOString().replace("Z", "").split(".")[0];
+    if (tsClean < utcStart || tsClean >= utcEnd) continue;
+
+    const inputOther = (tokenUsage.input_other as number) ?? 0;
+    const output = (tokenUsage.output as number) ?? 0;
+    const cacheRead = (tokenUsage.input_cache_read as number) ?? 0;
+    const cacheCreate = (tokenUsage.input_cache_creation as number) ?? 0;
+
+    records.push({
+      ts: tsClean,
+      msgId: `${path.basename(path.dirname(filePath))}:status:${eventIndex}`,
+      model: "kimi",
+      input: inputOther,
+      output,
+      cacheRead,
+      cacheCreate5m: cacheCreate,
+      cacheCreate1h: 0,
+      projectPath: "",
+    });
+    eventIndex += 1;
+  }
+
+  return { records, projectPath: "" };
+}
+
+export function findWuuSessionFiles(): string[] {
+  const home = os.homedir();
+  const sessionsDir = path.join(home, ".wuu", "sessions");
+  const files: string[] = [];
+  if (!fs.existsSync(sessionsDir)) {
+    return files;
+  }
+
+  try {
+    const entries = fs.readdirSync(sessionsDir);
+    for (const entry of entries) {
+      if (!entry.endsWith(".jsonl")) continue;
+      const filePath = path.join(sessionsDir, entry);
+      try {
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) continue;
+      } catch { continue; }
+      files.push(filePath);
+    }
+  } catch { /* skip */ }
+
+  return files;
+}
+
+export function parseWuuSession(
+  filePath: string,
+  utcStart: string,
+  utcEnd: string,
+): { records: UsageRecord[]; projectPath: string } {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, "utf-8");
+  } catch {
+    return { records: [], projectPath: "" };
+  }
+
+  const records: UsageRecord[] = [];
+  let eventIndex = 0;
+
+  for (const line of content.split("\n")) {
+    if (!line) continue;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(line);
+    } catch { continue; }
+
+    const role = getString(obj.role);
+    const contentType = getString(obj.content);
+    if (role !== "meta" || contentType !== "token_usage") continue;
+
+    const at = getString(obj.at);
+    if (!at) continue;
+    const tsClean = at.replace("Z", "").split(".")[0];
+    if (tsClean < utcStart || tsClean >= utcEnd) continue;
+
+    const inputTokens = (obj.input_tokens as number) ?? 0;
+    const outputTokens = (obj.output_tokens as number) ?? 0;
+
+    records.push({
+      ts: tsClean,
+      msgId: `${path.basename(filePath, ".jsonl")}:usage:${eventIndex}`,
+      model: "wuu",
+      input: inputTokens,
+      output: outputTokens,
+      cacheRead: 0,
+      cacheCreate5m: 0,
+      cacheCreate1h: 0,
+      projectPath: "",
+    });
+    eventIndex += 1;
+  }
+
+  return { records, projectPath: "" };
+}
+
 export function parseClaudeSession(
   filePath: string,
   utcStart: string,
@@ -446,6 +805,7 @@ export function parseCodexSession(
         input: number;
         cached: number;
         output: number;
+        reasoning: number;
       }
     | null = null;
   let tokenEventIndex = 0;
@@ -460,9 +820,6 @@ export function parseCodexSession(
     if (obj.type === "session_meta") {
       const payload = obj.payload as Record<string, unknown> | undefined;
       if (payload?.cwd) projectPath = payload.cwd as string;
-      if (typeof payload?.model_provider === "string" && payload.model_provider) {
-        currentModel = payload.model_provider;
-      }
       continue;
     }
 
@@ -493,25 +850,33 @@ export function parseCodexSession(
     let inputTotal = 0;
     let cachedInput = 0;
     let outputTokens = 0;
+    let reasoningOutputTokens = 0;
 
     if (lastUsage) {
       inputTotal = lastUsage.input_tokens ?? 0;
       cachedInput = lastUsage.cached_input_tokens ?? 0;
       outputTokens = lastUsage.output_tokens ?? 0;
+      reasoningOutputTokens = lastUsage.reasoning_output_tokens ?? 0;
     } else if (totalUsage) {
       const nextTotals = {
         input: totalUsage.input_tokens ?? 0,
         cached: totalUsage.cached_input_tokens ?? 0,
         output: totalUsage.output_tokens ?? 0,
+        reasoning: totalUsage.reasoning_output_tokens ?? 0,
       };
       if (previousTotals) {
         inputTotal = Math.max(0, nextTotals.input - previousTotals.input);
         cachedInput = Math.max(0, nextTotals.cached - previousTotals.cached);
         outputTokens = Math.max(0, nextTotals.output - previousTotals.output);
+        reasoningOutputTokens = Math.max(
+          0,
+          nextTotals.reasoning - previousTotals.reasoning,
+        );
       } else {
         inputTotal = nextTotals.input;
         cachedInput = nextTotals.cached;
         outputTokens = nextTotals.output;
+        reasoningOutputTokens = nextTotals.reasoning;
       }
     }
 
@@ -520,6 +885,7 @@ export function parseCodexSession(
         input: totalUsage.input_tokens ?? 0,
         cached: totalUsage.cached_input_tokens ?? 0,
         output: totalUsage.output_tokens ?? 0,
+        reasoning: totalUsage.reasoning_output_tokens ?? 0,
       };
     }
 
@@ -530,7 +896,8 @@ export function parseCodexSession(
       msgId: `${path.basename(filePath)}:token:${tokenEventIndex}`,
       model: currentModel,
       input: Math.max(0, inputTotal - cachedInput),
-      output: outputTokens,
+      // Reasoning output is billed as output usage for cost accounting.
+      output: outputTokens + reasoningOutputTokens,
       cacheRead: cachedInput,
       cacheCreate5m: 0,
       cacheCreate1h: 0,
@@ -568,6 +935,8 @@ export async function collectHeatmapData(): Promise<Record<string, { tokens: num
 
   const claudeFiles = findClaudeJsonlFiles();
   const codexFiles = findCodexJsonlFiles();
+  const kimiWireFiles = findKimiWireFiles();
+  const wuuFiles = findWuuSessionFiles();
   const diskCache = loadHeatmapDiskCache();
   let cacheDirty = false;
   const livePaths = new Set<string>();
@@ -644,6 +1013,72 @@ export async function collectHeatmapData(): Promise<Record<string, { tokens: num
     cacheDirty = true;
   }
 
+  for (let i = 0; i < kimiWireFiles.length; i++) {
+    if (i > 0) await yieldToEventLoop();
+    const f = kimiWireFiles[i];
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(f);
+      livePaths.add(f);
+      const mtimeLocal = new Date(stat.mtimeMs + tzOffsetHours * 3600_000);
+      const mtimeDate = mtimeLocal.toISOString().split("T")[0];
+      if (mtimeDate < startDateStr) continue;
+    } catch { continue; }
+
+    const cached = diskCache.files[f];
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      mergeHeatmapDays(result, cached.days);
+      reusedFiles += 1;
+      continue;
+    }
+
+    const entry = buildHeatmapEntry(
+      f,
+      (fp, us, ue) => parseKimiWireFile(fp, us, ue),
+      utcStart,
+      utcEnd,
+      tzOffsetHours,
+      stat,
+    );
+    diskCache.files[f] = entry;
+    mergeHeatmapDays(result, entry.days);
+    parsedFiles += 1;
+    cacheDirty = true;
+  }
+
+  for (let i = 0; i < wuuFiles.length; i++) {
+    if (i > 0) await yieldToEventLoop();
+    const f = wuuFiles[i];
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(f);
+      livePaths.add(f);
+      const mtimeLocal = new Date(stat.mtimeMs + tzOffsetHours * 3600_000);
+      const mtimeDate = mtimeLocal.toISOString().split("T")[0];
+      if (mtimeDate < startDateStr) continue;
+    } catch { continue; }
+
+    const cached = diskCache.files[f];
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      mergeHeatmapDays(result, cached.days);
+      reusedFiles += 1;
+      continue;
+    }
+
+    const entry = buildHeatmapEntry(
+      f,
+      (fp, us, ue) => parseWuuSession(fp, us, ue),
+      utcStart,
+      utcEnd,
+      tzOffsetHours,
+      stat,
+    );
+    diskCache.files[f] = entry;
+    mergeHeatmapDays(result, entry.days);
+    parsedFiles += 1;
+    cacheDirty = true;
+  }
+
   for (const filePath of Object.keys(diskCache.files)) {
     if (!livePaths.has(filePath)) {
       delete diskCache.files[filePath];
@@ -660,6 +1095,8 @@ export async function collectHeatmapData(): Promise<Record<string, { tokens: num
     ms: Date.now() - startedAt,
     claudeFiles: claudeFiles.length,
     codexFiles: codexFiles.length,
+    kimiFiles: kimiWireFiles.length,
+    wuuFiles: wuuFiles.length,
     reusedFiles,
     parsedFiles,
   });
@@ -718,6 +1155,42 @@ export async function collectUsage(
     } catch { continue; }
 
     const { records } = parseCodexSession(f, utcStart, utcEnd);
+    if (records.length > 0) {
+      allRecords.push(...records);
+      sessionPaths.add(f);
+    }
+  }
+
+  const kimiWireFiles = findKimiWireFiles();
+  for (let i = 0; i < kimiWireFiles.length; i++) {
+    if (i > 0) await yieldToEventLoop();
+    const f = kimiWireFiles[i];
+    try {
+      const mtime = fs.statSync(f).mtimeMs;
+      const mtimeLocal = new Date(mtime + tzOffsetHours * 3600_000);
+      const mtimeDate = mtimeLocal.toISOString().split("T")[0];
+      if (mtimeDate < dateStr) continue;
+    } catch { continue; }
+
+    const { records } = parseKimiWireFile(f, utcStart, utcEnd);
+    if (records.length > 0) {
+      allRecords.push(...records);
+      sessionPaths.add(f);
+    }
+  }
+
+  const wuuFiles = findWuuSessionFiles();
+  for (let i = 0; i < wuuFiles.length; i++) {
+    if (i > 0) await yieldToEventLoop();
+    const f = wuuFiles[i];
+    try {
+      const mtime = fs.statSync(f).mtimeMs;
+      const mtimeLocal = new Date(mtime + tzOffsetHours * 3600_000);
+      const mtimeDate = mtimeLocal.toISOString().split("T")[0];
+      if (mtimeDate < dateStr) continue;
+    } catch { continue; }
+
+    const { records } = parseWuuSession(f, utcStart, utcEnd);
     if (records.length > 0) {
       allRecords.push(...records);
       sessionPaths.add(f);
@@ -806,5 +1279,212 @@ export async function collectUsage(
     models,
   };
   usageSummaryCache.set(dateStr, { summary, cachedAt: Date.now() });
+  return summary;
+}
+
+async function collectUsageRecordsInRange(
+  startDate: string,
+  endDate: string,
+): Promise<{ records: UsageRecord[]; sessionPaths: Set<string> }> {
+  const tzOffsetHours = getLocalTzOffsetHours();
+  const { utcStart, utcEnd } = dateRangeToUtcRange(startDate, endDate);
+  const records: UsageRecord[] = [];
+  const sessionPaths = new Set<string>();
+
+  const scanFiles = async (
+    files: string[],
+    parse: (
+      filePath: string,
+      utcStart: string,
+      utcEnd: string,
+    ) => { records: UsageRecord[] },
+  ) => {
+    for (let i = 0; i < files.length; i++) {
+      if (i > 0) await yieldToEventLoop();
+      const filePath = files[i];
+      try {
+        const mtime = fs.statSync(filePath).mtimeMs;
+        const mtimeLocal = new Date(mtime + tzOffsetHours * 3600_000);
+        const mtimeDate = mtimeLocal.toISOString().split("T")[0];
+        if (mtimeDate < startDate) continue;
+      } catch {
+        continue;
+      }
+
+      const parsed = parse(filePath, utcStart, utcEnd);
+      if (parsed.records.length > 0) {
+        records.push(...parsed.records);
+        sessionPaths.add(filePath);
+      }
+    }
+  };
+
+  await scanFiles(findClaudeJsonlFiles(), parseClaudeSession);
+  await scanFiles(findCodexJsonlFiles(), parseCodexSession);
+  await scanFiles(findKimiWireFiles(), (filePath, start, end) =>
+    parseKimiWireFile(filePath, start, end),
+  );
+  await scanFiles(findWuuSessionFiles(), (filePath, start, end) =>
+    parseWuuSession(filePath, start, end),
+  );
+
+  return { records, sessionPaths };
+}
+
+function makeEmptyRangeDay(date: string): UsageRangeDay {
+  return {
+    date,
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheCreate5m: 0,
+    cacheCreate1h: 0,
+    cost: 0,
+    calls: 0,
+  };
+}
+
+function enumerateLocalDates(startDate: string, endDate: string): string[] {
+  const start = new Date(`${startDate}T00:00:00`);
+  const end = new Date(`${endDate}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return [];
+  const dates: string[] = [];
+  for (const d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    dates.push(toLocalDateString(d));
+  }
+  return dates;
+}
+
+export async function collectUsageRange(
+  startDate: string,
+  endDate: string,
+): Promise<UsageRangeSummary> {
+  const cacheKey = `${startDate}:${endDate}`;
+  const cached = usageRangeSummaryCache.get(cacheKey);
+  if (cached && shouldReuseUsageSummary(endDate, cached.cachedAt)) {
+    return cached.summary;
+  }
+
+  const dates = enumerateLocalDates(startDate, endDate);
+  if (dates.length === 0 || startDate > endDate) {
+    return {
+      startDate,
+      endDate,
+      days: [],
+      sessions: 0,
+      totalInput: 0,
+      totalOutput: 0,
+      totalCacheRead: 0,
+      totalCacheCreate5m: 0,
+      totalCacheCreate1h: 0,
+      totalCost: 0,
+      projects: [],
+      models: [],
+    };
+  }
+
+  const tzOffsetHours = getLocalTzOffsetHours();
+  const { records, sessionPaths } = await collectUsageRecordsInRange(
+    startDate,
+    endDate,
+  );
+  const dayMap = new Map(dates.map((date) => [date, makeEmptyRangeDay(date)]));
+  const projectMap = new Map<string, ProjectUsage>();
+  const modelMap = new Map<string, ModelUsage>();
+  let totalInput = 0;
+  let totalOutput = 0;
+  let totalCacheRead = 0;
+  let totalCacheCreate5m = 0;
+  let totalCacheCreate1h = 0;
+  let totalCost = 0;
+
+  for (const record of records) {
+    const cost = computeCost(
+      record.model,
+      record.input,
+      record.output,
+      record.cacheRead,
+      record.cacheCreate5m,
+      record.cacheCreate1h,
+    );
+    const date = localDateFromUtcTimestamp(record.ts, tzOffsetHours);
+    const day = dayMap.get(date);
+    if (day) {
+      day.input += record.input;
+      day.output += record.output;
+      day.cacheRead += record.cacheRead;
+      day.cacheCreate5m += record.cacheCreate5m;
+      day.cacheCreate1h += record.cacheCreate1h;
+      day.cost += cost;
+      day.calls += 1;
+    }
+
+    totalInput += record.input;
+    totalOutput += record.output;
+    totalCacheRead += record.cacheRead;
+    totalCacheCreate5m += record.cacheCreate5m;
+    totalCacheCreate1h += record.cacheCreate1h;
+    totalCost += cost;
+
+    const projectKey = record.projectPath || "unknown";
+    if (!projectMap.has(projectKey)) {
+      projectMap.set(projectKey, {
+        path: projectKey,
+        name: projectKey === "unknown" ? "Other" : path.basename(projectKey),
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheCreate5m: 0,
+        cacheCreate1h: 0,
+        cost: 0,
+        calls: 0,
+      });
+    }
+    const project = projectMap.get(projectKey)!;
+    project.input += record.input;
+    project.output += record.output;
+    project.cacheRead += record.cacheRead;
+    project.cacheCreate5m += record.cacheCreate5m;
+    project.cacheCreate1h += record.cacheCreate1h;
+    project.cost += cost;
+    project.calls += 1;
+
+    if (!modelMap.has(record.model)) {
+      modelMap.set(record.model, {
+        model: record.model,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheCreate5m: 0,
+        cacheCreate1h: 0,
+        cost: 0,
+        calls: 0,
+      });
+    }
+    const model = modelMap.get(record.model)!;
+    model.input += record.input;
+    model.output += record.output;
+    model.cacheRead += record.cacheRead;
+    model.cacheCreate5m += record.cacheCreate5m;
+    model.cacheCreate1h += record.cacheCreate1h;
+    model.cost += cost;
+    model.calls += 1;
+  }
+
+  const summary: UsageRangeSummary = {
+    startDate,
+    endDate,
+    days: [...dayMap.values()],
+    sessions: sessionPaths.size,
+    totalInput,
+    totalOutput,
+    totalCacheRead,
+    totalCacheCreate5m,
+    totalCacheCreate1h,
+    totalCost,
+    projects: [...projectMap.values()].sort((a, b) => b.cost - a.cost),
+    models: [...modelMap.values()].sort((a, b) => b.cost - a.cost),
+  };
+  usageRangeSummaryCache.set(cacheKey, { summary, cachedAt: Date.now() });
   return summary;
 }

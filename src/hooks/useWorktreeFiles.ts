@@ -1,70 +1,34 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect } from "react";
+import { useWorktreeFilesStore } from "../stores/worktreeFilesStore";
 
-export interface DirEntry {
-  name: string;
-  isDirectory: boolean;
-}
+// Stable empty references so consumers reading "no entry" state don't get
+// fresh array identities on every render.
+const EMPTY: string[] = [];
 
 export function useWorktreeFiles(worktreePath: string | null) {
-  const [entries, setEntries] = useState<Map<string, DirEntry[]>>(new Map());
-  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(true);
+  const paths = useWorktreeFilesStore((s) =>
+    worktreePath ? (s.byWorktree[worktreePath]?.paths ?? EMPTY) : EMPTY,
+  );
+  const ignoredPaths = useWorktreeFilesStore((s) =>
+    worktreePath ? (s.byWorktree[worktreePath]?.ignoredPaths ?? EMPTY) : EMPTY,
+  );
 
+  // Acquire/release ref counts the worktree in the store so the watcher
+  // subscription is shared across consumers and survives a tab toggle that
+  // unmounts and immediately remounts this component.
   useEffect(() => {
-    if (!worktreePath || !window.termcanvas) {
-      setEntries(new Map());
-      setLoading(false);
-      return;
-    }
-
-    window.termcanvas.fs.unwatchAllDirs();
-
-    setLoading(true);
-    window.termcanvas.fs.listDir(worktreePath).then((items) => {
-      setEntries(new Map([[worktreePath, items]]));
-      setLoading(false);
-    });
-
+    if (!worktreePath) return;
+    const store = useWorktreeFilesStore.getState();
+    store.acquire(worktreePath);
     return () => {
-      window.termcanvas.fs.unwatchAllDirs();
+      useWorktreeFilesStore.getState().release(worktreePath);
     };
   }, [worktreePath]);
 
-  const refreshDir = useCallback(
-    (dirPath: string) => {
-      window.termcanvas.fs.listDir(dirPath).then((items) => {
-        setEntries((prev) => new Map(prev).set(dirPath, items));
-      });
-    },
-    [],
-  );
+  const refresh = useCallback(() => {
+    if (!worktreePath) return Promise.resolve();
+    return useWorktreeFilesStore.getState().refresh(worktreePath);
+  }, [worktreePath]);
 
-  useEffect(() => {
-    if (!window.termcanvas) return;
-    return window.termcanvas.fs.onDirChanged(refreshDir);
-  }, [refreshDir]);
-
-  const toggleDir = useCallback(
-    (dirPath: string) => {
-      setExpandedDirs((prev) => {
-        const next = new Set(prev);
-        if (next.has(dirPath)) {
-          next.delete(dirPath);
-          window.termcanvas.fs.unwatchDir(dirPath);
-        } else {
-          next.add(dirPath);
-          window.termcanvas.fs.watchDir(dirPath);
-          if (!entries.has(dirPath)) {
-            window.termcanvas.fs.listDir(dirPath).then((items) => {
-              setEntries((prev) => new Map(prev).set(dirPath, items));
-            });
-          }
-        }
-        return next;
-      });
-    },
-    [entries]
-  );
-
-  return { entries, expandedDirs, toggleDir, refreshDir, loading };
+  return { paths, ignoredPaths, refresh };
 }

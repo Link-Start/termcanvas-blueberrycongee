@@ -1,13 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import { HandoffManager } from "../hydra/src/handoff/manager.ts";
-import type { Handoff } from "../hydra/src/handoff/types.ts";
+import { AssignmentManager } from "../hydra/src/assignment/manager.ts";
+import type { AssignmentRecord } from "../hydra/src/assignment/types.ts";
+import { validateRunResult } from "../hydra/src/protocol.ts";
 import {
-  validateDoneMarker,
-  validateResultContract,
-} from "../hydra/src/protocol.ts";
-import { loadWorkflow } from "../hydra/src/workflow-store.ts";
+  loadWorkbench,
+  type WorkbenchRecord,
+} from "../hydra/src/workflow-store.ts";
 import { getProcessSnapshot } from "./process-detector.ts";
+import {
+  extractOpenCodeFirstUserPrompt,
+  isOpenCodeProvider,
+  readOpenCodeSessionTelemetry,
+} from "./opencode-session.ts";
 import { parseSessionTelemetryLine } from "./session-watcher.ts";
 import type {
   NormalizedSessionTelemetryEvent,
@@ -24,11 +29,19 @@ import type {
   WorkflowTelemetrySnapshot,
 } from "../shared/telemetry.ts";
 import type { SessionInfo } from "../shared/sessions.ts";
+import {
+  CLAUDE_PRE_TOOL_USE_FALLBACK_MS,
+  CODEX_PRE_TOOL_USE_AWAITING_INPUT_MS,
+  DEFAULT_CLAUDE_STALL_MS,
+  DEFAULT_CODEX_STALL_MS,
+  DEFAULT_KIMI_STALL_MS,
+  DEFAULT_PROCESS_POLL_INTERVAL_MS,
+  DEFAULT_SESSION_HEARTBEAT_MS,
+  DEFAULT_SESSION_POLL_INTERVAL_MS,
+  PRE_TOOL_USE_STALE_RESET_MS,
+} from "../shared/lifecycleThresholds.ts";
 
 const DEFAULT_EVENT_LIMIT = 200;
-const DEFAULT_STALL_THRESHOLD_MS = 45_000;
-const DEFAULT_CODEX_STALL_THRESHOLD_MS = 180_000;
-const DEFAULT_SESSION_HEARTBEAT_MS = 90_000;
 
 interface ActiveToolCall {
   callId: string;
@@ -50,6 +63,7 @@ interface TerminalState {
   pendingPreToolUseAt: number;
   awaitingInputTimer: NodeJS.Timeout | null;
   lastTokenTotal: number | null;
+  openCodeEventKeys: Set<string>;
   processPollTimer: NodeJS.Timeout | null;
   ptyId: number | null;
   sessionFile: string | null;
@@ -67,7 +81,7 @@ interface RegisterTerminalInput {
   worktreePath: string;
   provider?: TelemetryProvider;
   workflowId?: string;
-  handoffId?: string;
+  assignmentId?: string;
   repoPath?: string;
   ptyId?: number | null;
   shellPid?: number | null;
@@ -78,7 +92,7 @@ interface UpdateTerminalInput {
   worktreePath?: string;
   provider?: TelemetryProvider;
   workflowId?: string;
-  handoffId?: string;
+  assignmentId?: string;
   repoPath?: string;
   ptyId?: number | null;
   shellPid?: number | null;
@@ -95,9 +109,7 @@ interface SessionAttachInput {
 
 interface ContractState {
   resultExists: boolean;
-  doneExists: boolean;
   resultValid?: boolean;
-  doneValid?: boolean;
   contractActivityAt?: string;
 }
 
@@ -154,6 +166,65 @@ function isActiveTurnState(state: TelemetryTurnState): boolean {
   );
 }
 
+function isClaudeToolResultEvent(
+  event: NormalizedSessionTelemetryEvent,
+): boolean {
+  return event.event_type === "tool_result" && event.role === "user";
+}
+
+function shouldMarkClaudeNotificationAwaitingInput(
+  event: {
+    notification_type?: unknown;
+    message?: unknown;
+  },
+  pendingPreToolUse: boolean,
+): boolean {
+  const notificationType =
+    typeof event.notification_type === "string"
+      ? event.notification_type
+      : undefined;
+
+  if (
+    notificationType === "permission_prompt" ||
+    notificationType === "elicitation_dialog"
+  ) {
+    return true;
+  }
+
+  if (
+    notificationType === "idle_prompt" ||
+    notificationType === "auth_success"
+  ) {
+    return false;
+  }
+
+  if (pendingPreToolUse) {
+    return true;
+  }
+
+  const message =
+    typeof event.message === "string" ? event.message.toLowerCase() : "";
+  return (
+    message.includes("needs your permission") ||
+    message.includes("requires your permission")
+  );
+}
+
+function toSessionProvider(
+  provider: TelemetryProvider,
+): "claude" | "codex" | "kimi" | "wuu" | "opencode" | null {
+  if (
+    provider === "claude" ||
+    provider === "codex" ||
+    provider === "kimi" ||
+    provider === "wuu" ||
+    provider === "opencode"
+  ) {
+    return provider;
+  }
+  return null;
+}
+
 export function deriveTelemetryStatus(
   snapshot: TerminalTelemetrySnapshot,
   nowMs = Date.now(),
@@ -163,8 +234,10 @@ export function deriveTelemetryStatus(
   const effectiveStallThresholdMs =
     stallThresholdMs ??
     (snapshot.provider === "codex"
-      ? DEFAULT_CODEX_STALL_THRESHOLD_MS
-      : DEFAULT_STALL_THRESHOLD_MS);
+      ? DEFAULT_CODEX_STALL_MS
+      : snapshot.provider === "kimi"
+        ? DEFAULT_KIMI_STALL_MS
+        : DEFAULT_CLAUDE_STALL_MS);
 
   if (!snapshot.pty_alive) {
     return "exited";
@@ -184,11 +257,17 @@ export function deriveTelemetryStatus(
 
   if (
     snapshot.turn_state === "turn_complete" &&
-    snapshot.handoff_id &&
-    !snapshot.done_exists &&
+    snapshot.assignment_id &&
     !snapshot.result_exists
   ) {
     return "awaiting_contract";
+  }
+
+  if (
+    snapshot.turn_state === "turn_complete" ||
+    snapshot.turn_state === "turn_aborted"
+  ) {
+    return "idle";
   }
 
   if (
@@ -258,7 +337,27 @@ export function deriveTelemetryStatus(
     }
   }
 
-  if (snapshot.last_output_at || snapshot.last_input_at) {
+  // PTY output alone isn't evidence of a stall — a freshly-opened Codex
+  // or Claude prints a banner before the user has typed anything, and we
+  // shouldn't fire the yellow "attention / stall" badge on a terminal
+  // that has never even been asked to do work. For agent terminals,
+  // require some signal that the agent actually tried to progress.
+  // Shell terminals keep the looser behaviour: their ps descendants
+  // reliably bump meaningful_progress, and without that, PTY output is
+  // the only stall signal we have.
+  const isAgentSnapshot =
+    snapshot.provider === "claude" ||
+    snapshot.provider === "codex" ||
+    snapshot.provider === "kimi" ||
+    snapshot.provider === "wuu" ||
+    snapshot.provider === "opencode";
+  const hasAgentActivity =
+    !!snapshot.last_session_event_at ||
+    snapshot.active_tool_calls > 0 ||
+    !!snapshot.last_meaningful_progress_at;
+  const stallEligible = !isAgentSnapshot || hasAgentActivity;
+
+  if ((snapshot.last_output_at || snapshot.last_input_at) && stallEligible) {
     return "stall_candidate";
   }
 
@@ -310,6 +409,117 @@ export function deriveTelemetryTaskStatus(
   return { status: "unknown", source: "none" };
 }
 
+const HEAD_LINES_FOR_FIRST_PROMPT = 40;
+const FIRST_PROMPT_MAX_LENGTH = 100;
+
+/**
+ * Pattern that matches auto-injected context messages from both Claude Code
+ * and Codex (AGENTS.md, environment context, skills, etc.).  These are sent
+ * as role:"user" but are not actual user input.
+ */
+const INJECTED_CONTEXT_PATTERN =
+  /^(?:\s*#\s*AGENTS\.md\s|<(?:environment_context|skill|user_instructions|apps_instructions|skills_instructions|plugins_instructions|collaboration_mode|realtime_conversation|system-reminder)[>\s]|\s*<[a-z][\w-]*[\s>]|\[Request interrupted by user)/;
+
+/**
+ * Read the head of a session JSONL file and return the first meaningful
+ * user prompt text.  Handles both Claude (`{type:"user",message:…}`) and
+ * Codex (`{type:"response_item",payload:{type:"message",role:"user",…}}`)
+ * formats.  Provider-agnostic: format is detected per line.
+ */
+function extractFirstUserPrompt(
+  filePath: string,
+  provider?: TelemetryProvider,
+  sessionId?: string,
+): string | undefined {
+  if (provider === "opencode" && sessionId) {
+    return extractOpenCodeFirstUserPrompt(filePath, sessionId);
+  }
+
+  let lines: string[];
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    lines = content.split("\n").slice(0, HEAD_LINES_FOR_FIRST_PROMPT);
+  } catch {
+    return undefined;
+  }
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let raw: Record<string, unknown>;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    // Claude format: { type: "user", message: { role: "user", content: ... } }
+    if (raw.type === "user") {
+      // Skip metadata entries (hook output, IDE context, etc.)
+      if (raw.isMeta === true || raw.isCompactSummary === true) continue;
+      const message = raw.message as Record<string, unknown> | undefined;
+      if (!message) continue;
+      const text = extractTextFromMessageContent(message.content);
+      if (!text || INJECTED_CONTEXT_PATTERN.test(text)) continue;
+      return collapseAndTruncate(text, FIRST_PROMPT_MAX_LENGTH);
+    }
+
+    // Codex event_msg format: { type: "event_msg", payload: { type: "user_message", message: "..." } }
+    if (raw.type === "event_msg") {
+      const payload = raw.payload as Record<string, unknown> | undefined;
+      if (
+        payload?.type === "user_message" &&
+        typeof payload.message === "string" &&
+        payload.message.trim()
+      ) {
+        if (INJECTED_CONTEXT_PATTERN.test(payload.message)) continue;
+        return collapseAndTruncate(payload.message, FIRST_PROMPT_MAX_LENGTH);
+      }
+    }
+
+    // Codex response_item format: { type: "response_item", payload: { type: "message", role: "user", content: [...] } }
+    if (raw.type === "response_item") {
+      const payload = raw.payload as Record<string, unknown> | undefined;
+      if (payload?.type === "message" && payload.role === "user") {
+        const text = extractTextFromMessageContent(payload.content);
+        if (!text || INJECTED_CONTEXT_PATTERN.test(text)) continue;
+        return collapseAndTruncate(text, FIRST_PROMPT_MAX_LENGTH);
+      }
+    }
+
+    if (raw.role === "user") {
+      const text = extractTextFromMessageContent(raw.content);
+      if (!text || INJECTED_CONTEXT_PATTERN.test(text)) continue;
+      return collapseAndTruncate(text, FIRST_PROMPT_MAX_LENGTH);
+    }
+  }
+
+  return undefined;
+}
+
+function extractTextFromMessageContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const entry = block as Record<string, unknown>;
+    // Claude: { type: "text", text: "..." }
+    if (entry.type === "text" && typeof entry.text === "string")
+      return entry.text;
+    // Codex: { type: "input_text", text: "..." }
+    if (entry.type === "input_text" && typeof entry.text === "string")
+      return entry.text;
+    if (entry.type === "tool_result") continue;
+  }
+  return "";
+}
+
+function collapseAndTruncate(value: string, maxLength: number): string {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized) return "";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
 function buildBaseSnapshot(
   input: RegisterTerminalInput,
 ): TerminalTelemetrySnapshot {
@@ -318,17 +528,17 @@ function buildBaseSnapshot(
     worktree_path: input.worktreePath,
     provider: input.provider ?? "unknown",
     workflow_id: input.workflowId,
-    handoff_id: input.handoffId,
+    assignment_id: input.assignmentId,
     repo_path: input.repoPath,
     session_attached: false,
     session_attach_confidence: "none",
     turn_state: "unknown",
     pty_alive: false,
+    shell_pid: null,
     descendant_processes: [],
     active_tool_calls: 0,
     task_status: "unknown",
     task_status_source: "none",
-    done_exists: false,
     result_exists: false,
     derived_status: "starting",
   };
@@ -364,8 +574,10 @@ export class TelemetryService {
   }) {
     this.eventLimit = options?.eventLimit ?? DEFAULT_EVENT_LIMIT;
     this.now = options?.now ?? Date.now;
-    this.processPollIntervalMs = options?.processPollIntervalMs ?? 15_000;
-    this.sessionPollIntervalMs = options?.sessionPollIntervalMs ?? 10_000;
+    this.processPollIntervalMs =
+      options?.processPollIntervalMs ?? DEFAULT_PROCESS_POLL_INTERVAL_MS;
+    this.sessionPollIntervalMs =
+      options?.sessionPollIntervalMs ?? DEFAULT_SESSION_POLL_INTERVAL_MS;
     this.sessionPrimeBytes = options?.sessionPrimeBytes ?? 262_144;
     this.stallThresholdMs = options?.stallThresholdMs;
     this.sessionHeartbeatMs =
@@ -378,7 +590,8 @@ export class TelemetryService {
     state.snapshot.worktree_path = input.worktreePath;
     state.snapshot.provider = input.provider ?? state.snapshot.provider;
     state.snapshot.workflow_id = input.workflowId ?? state.snapshot.workflow_id;
-    state.snapshot.handoff_id = input.handoffId ?? state.snapshot.handoff_id;
+    state.snapshot.assignment_id =
+      input.assignmentId ?? state.snapshot.assignment_id;
     state.snapshot.repo_path = input.repoPath ?? state.snapshot.repo_path;
     if (input.ptyId !== undefined) {
       if (state.ptyId !== null && state.ptyId !== input.ptyId) {
@@ -392,6 +605,7 @@ export class TelemetryService {
     }
     if (input.shellPid !== undefined) {
       state.shellPid = input.shellPid;
+      state.snapshot.shell_pid = input.shellPid;
     }
     return this.getTerminalSnapshot(input.terminalId)!;
   }
@@ -402,10 +616,36 @@ export class TelemetryService {
       state.snapshot.worktree_path = input.worktreePath;
     }
     if (input.provider !== undefined) {
+      const previousProvider = state.snapshot.provider;
+      const upgradingToAgent =
+        previousProvider === "unknown" &&
+        (input.provider === "claude" ||
+          input.provider === "codex" ||
+          input.provider === "kimi" ||
+          input.provider === "wuu" ||
+          input.provider === "opencode");
       state.snapshot.provider = input.provider;
+      if (upgradingToAgent) {
+        // Between terminal creation (provider "unknown") and CLI
+        // detection upgrading us to an agent type, ps-driven state
+        // treats the terminal like a shell: descendant churn bumps
+        // last_meaningful_progress_at, and the descendant command
+        // leaks into foreground_tool. Once we realise this is an
+        // agent, those values are noise — they reflect the agent's
+        // infrastructure booting up (MCP daemons, shell wrapper
+        // process), not the agent doing work. Leaving them in place
+        // persistently traps derived_status in "progressing" even
+        // when the agent never received a prompt. Reset them so the
+        // agent lifecycle starts from a clean slate and only real
+        // signals (session events, hooks) can promote it back to
+        // active states.
+        state.snapshot.last_meaningful_progress_at = undefined;
+        state.snapshot.foreground_tool = undefined;
+      }
     }
     state.snapshot.workflow_id = input.workflowId ?? state.snapshot.workflow_id;
-    state.snapshot.handoff_id = input.handoffId ?? state.snapshot.handoff_id;
+    state.snapshot.assignment_id =
+      input.assignmentId ?? state.snapshot.assignment_id;
     state.snapshot.repo_path = input.repoPath ?? state.snapshot.repo_path;
     if (input.ptyId !== undefined) {
       if (state.ptyId !== null && state.ptyId !== input.ptyId) {
@@ -419,6 +659,7 @@ export class TelemetryService {
     }
     if (input.shellPid !== undefined) {
       state.shellPid = input.shellPid;
+      state.snapshot.shell_pid = input.shellPid;
     }
     this.updateDerivedStatus(state);
     return cloneSnapshot(state.snapshot);
@@ -436,6 +677,7 @@ export class TelemetryService {
     }
     state.ptyId = input.ptyId;
     state.shellPid = input.shellPid ?? state.shellPid;
+    state.snapshot.shell_pid = state.shellPid;
     state.activeToolCalls.clear();
     state.lastTerminalTurnAtMs = null;
     state.snapshot.pty_alive = true;
@@ -518,11 +760,26 @@ export class TelemetryService {
   recordSessionAttached(input: SessionAttachInput): void {
     const state = this.ensureState(input.terminalId);
     const timestamp = input.at ?? isoNow(this.now);
+    const firstAttach = !state.snapshot.session_attached;
     state.snapshot.provider = input.provider;
     state.snapshot.session_attached = true;
     state.snapshot.session_attach_confidence = input.confidence;
     state.snapshot.session_id = input.sessionId;
     state.snapshot.session_file = input.sessionFile;
+    if (firstAttach) {
+      // Until this moment we didn't know the terminal was a real agent,
+      // so ps-driven state treated it like a shell: any descendant
+      // churn between terminal creation and session-attach bumped
+      // last_meaningful_progress_at, and the descendant command leaked
+      // into foreground_tool. Those values are infrastructure noise
+      // (shell wrapper, MCP daemons booting, CLI banner output), not
+      // agent work. Clear them so derived_status starts clean the
+      // instant we recognise this as an agent session; real work will
+      // refill them through primeSessionFromTail / future session
+      // events / hook events.
+      state.snapshot.last_meaningful_progress_at = undefined;
+      state.snapshot.foreground_tool = undefined;
+    }
     this.appendEvent(state, timestamp, "session", "session_attached", {
       provider: input.provider,
       session_id: input.sessionId,
@@ -533,17 +790,36 @@ export class TelemetryService {
   }
 
   attachSessionSource(input: SessionAttachInput): void {
-    this.recordSessionAttached(input);
     const state = this.ensureState(input.terminalId);
+    const sessionChanged =
+      state.snapshot.session_id !== input.sessionId ||
+      state.snapshot.session_file !== input.sessionFile;
+
+    this.recordSessionAttached(input);
     this.stopSessionTracking(state);
     state.sessionFile = input.sessionFile ?? null;
     state.sessionOffset = 0;
     state.sessionRemainder = "";
+    state.openCodeEventKeys.clear();
+    if (sessionChanged) {
+      state.snapshot.first_user_prompt = undefined;
+    }
     if (!state.sessionFile) {
       return;
     }
     this.primeSessionFromTail(state);
     this.startSessionTracking(state);
+
+    // Extract first user prompt for display in the session panel title.
+    const prompt = extractFirstUserPrompt(
+      state.sessionFile,
+      state.snapshot.provider,
+      state.snapshot.session_id,
+    );
+    if (prompt && state.snapshot.first_user_prompt !== prompt) {
+      state.snapshot.first_user_prompt = prompt;
+      this.updateDerivedStatus(state, { force: true });
+    }
   }
 
   recordSessionAttachFailed(
@@ -563,6 +839,31 @@ export class TelemetryService {
     const state = this.terminals.get(terminalId);
     if (!state) return;
     this.stopSessionTracking(state);
+    state.sessionFile = null;
+    state.sessionOffset = 0;
+    state.sessionRemainder = "";
+    state.openCodeEventKeys.clear();
+    state.activeToolCalls.clear();
+    state.pendingPreToolUse = false;
+    state.pendingPreToolUseAt = 0;
+    if (state.awaitingInputTimer) {
+      clearTimeout(state.awaitingInputTimer);
+      state.awaitingInputTimer = null;
+    }
+    state.snapshot.session_attached = false;
+    state.snapshot.session_attach_confidence = "none";
+    state.snapshot.session_id = undefined;
+    state.snapshot.session_file = undefined;
+    state.snapshot.first_user_prompt = undefined;
+    state.snapshot.last_session_event_at = undefined;
+    state.snapshot.last_session_event_kind = undefined;
+    state.snapshot.turn_state = "unknown";
+    state.snapshot.turn_started_at = undefined;
+    state.snapshot.foreground_tool = undefined;
+    state.snapshot.active_tool_calls = 0;
+    state.snapshot.pending_tool_use_at = undefined;
+    state.snapshot.last_tool_event_at = undefined;
+    this.updateDerivedStatus(state, { force: true });
   }
 
   recordSessionTelemetry(
@@ -598,13 +899,47 @@ export class TelemetryService {
       }
       state.snapshot.active_tool_calls = state.activeToolCalls.size;
 
+      if (
+        state.snapshot.provider === "claude" &&
+        state.pendingPreToolUse &&
+        isClaudeToolResultEvent(event)
+      ) {
+        // Claude only writes `tool_result` after the approval gate is
+        // past and the tool has returned (or been launched async). If
+        // PostToolUse never arrives, this session event is still
+        // authoritative enough to retire the pending PreToolUse state.
+        state.pendingPreToolUse = false;
+        state.snapshot.pending_tool_use_at = undefined;
+        if (state.awaitingInputTimer) {
+          clearTimeout(state.awaitingInputTimer);
+          state.awaitingInputTimer = null;
+        }
+        if (
+          state.activeToolCalls.size === 0 &&
+          event.turn_state !== "tool_running"
+        ) {
+          state.snapshot.foreground_tool = undefined;
+        }
+      }
+
       if (event.turn_state) {
-        // Preserve awaiting_input set by the 5s timer — JSONL events
-        // written before the permission dialog can arrive late via the
-        // session poller and would otherwise clobber the state.
+        // Preserve awaiting_input set by the PreToolUse fallback timer
+        // — late-arriving JSONL events written before the permission
+        // dialog showed up would otherwise clobber the state with a
+        // stale `in_turn` / `tool_running`.
+        //
+        // BUT: terminal turn states (`turn_complete` / `turn_aborted`)
+        // are always authoritative. If the session JSONL says the
+        // turn ended, any PreToolUse we had queued is moot — the hook
+        // pipeline may have missed a PostToolUse (Codex path: user
+        // declined exec approval, Codex kept reasoning, never fired
+        // PostToolUse; Stop hook racy or absent). Without this escape
+        // hatch the tile sits at red `awaiting_input` until the 5-
+        // minute `PRE_TOOL_USE_STALE_RESET_MS` safety net clears it.
         const preserveAwaitingInput =
           state.pendingPreToolUse &&
-          state.snapshot.turn_state === "awaiting_input";
+          state.snapshot.turn_state === "awaiting_input" &&
+          !isTerminalTurnState(event.turn_state);
         const preserveTerminalTurnState =
           isTerminalTurnState(state.snapshot.turn_state) &&
           isActiveTurnState(event.turn_state) &&
@@ -618,6 +953,20 @@ export class TelemetryService {
             Number.isFinite(eventAtMs)
           ) {
             state.lastTerminalTurnAtMs = eventAtMs;
+            // The turn is over per JSONL; anything the hook pipeline
+            // left half-open (pendingPreToolUse + its fallback timer,
+            // pending_tool_use_at) will never get reconciled by a
+            // hook because the turn won't emit more hooks. Clean up
+            // now so the next render matches the authoritative "turn
+            // ended" state.
+            if (state.pendingPreToolUse) {
+              state.pendingPreToolUse = false;
+              state.snapshot.pending_tool_use_at = undefined;
+              if (state.awaitingInputTimer) {
+                clearTimeout(state.awaitingInputTimer);
+                state.awaitingInputTimer = null;
+              }
+            }
           }
         }
       }
@@ -713,10 +1062,40 @@ export class TelemetryService {
       }),
     );
 
-    // Don't let ps data overwrite hook-set foreground_tool while a tool is running
-    if (state.pendingPreToolUse) {
-      // Auto-reset if stuck for >5 minutes (CC crashed without PostToolUse)
-      if (this.now() - state.pendingPreToolUseAt > 5 * 60_000) {
+    // Deciding what to do with the process-derived foreground_tool is
+    // subtle because agents (claude/codex/wuu) and plain shell terminals
+    // want opposite behaviour:
+    //
+    //   - Shell terminals have no hook / session signal, so the
+    //     descendant process tree IS the primary source of truth for
+    //     "which tool is the user currently running". We keep that.
+    //
+    //   - Agent terminals get their authoritative foreground_tool from
+    //     hooks (PreToolUse → tool_name) or from session events. Outside
+    //     of an actual tool call, descendant processes are long-lived
+    //     infrastructure (MCP servers like playwright-mcp, and the
+    //     Chromium children they spawn) that aren't tools the agent is
+    //     running — but they'd pollute the session panel into a perma-
+    //     "running <mcp>" yellow state otherwise.
+    const provider = state.snapshot.provider;
+    const isAgentTerminal =
+      provider === "claude" ||
+      provider === "codex" ||
+      provider === "wuu" ||
+      provider === "opencode";
+    const hasActiveHookTool = state.pendingPreToolUse;
+    const hasActiveSessionTool =
+      state.activeToolCalls.size > 0 ||
+      state.snapshot.turn_state === "tool_running" ||
+      state.snapshot.turn_state === "tool_pending";
+
+    if (hasActiveHookTool) {
+      // Hook already knows the exact tool name; ps data is noisier and
+      // can't improve on it. Only intervene on the stale-recovery path.
+      if (
+        this.now() - state.pendingPreToolUseAt >
+        PRE_TOOL_USE_STALE_RESET_MS
+      ) {
         console.warn(
           `[Telemetry] Resetting stale pendingPreToolUse for terminal=${terminalId} (>5min without PostToolUse)`,
         );
@@ -729,11 +1108,33 @@ export class TelemetryService {
           state.awaitingInputTimer = null;
         }
       }
-    } else {
+    } else if (!isAgentTerminal) {
+      // Plain shell — ps is the only signal we have.
       state.snapshot.foreground_tool = snapshot.foregroundTool ?? undefined;
+    } else if (hasActiveSessionTool) {
+      // Agent, session says a tool is running, hook has not claimed one.
+      // ps-derived tool name fills the gap (e.g. hook-less agent flows).
+      state.snapshot.foreground_tool = snapshot.foregroundTool ?? undefined;
+    } else {
+      // Agent, idle: descendants are daemons (MCP servers etc). Drop
+      // anything ps might have picked up so the panel doesn't invent a
+      // running tool where there isn't one.
+      state.snapshot.foreground_tool = undefined;
     }
 
-    if (hasMeaningfulChange) {
+    // Whether ps churn counts as "meaningful progress" depends on the
+    // same gate as foreground_tool. A shell's descendant processes ARE
+    // the signal, but an agent's descendants (MCP servers spawning
+    // their own children, Playwright's Chromium tree churning, etc.)
+    // would otherwise keep `last_meaningful_progress_at` refreshed
+    // forever, which feeds derived_status="progressing" and paints the
+    // panel green "thinking" on a freshly opened Codex that literally
+    // hasn't been asked to do anything. Genuine agent work still gets
+    // tracked through session events and hook-set timestamps — those
+    // don't flow through this branch.
+    const processChangeCountsAsProgress =
+      !isAgentTerminal || hasActiveHookTool || hasActiveSessionTool;
+    if (hasMeaningfulChange && processChangeCountsAsProgress) {
       state.snapshot.last_meaningful_progress_at = timestamp;
     }
 
@@ -797,51 +1198,63 @@ export class TelemetryService {
     repoPath: string,
     workflowId: string,
   ): WorkflowTelemetrySnapshot | null {
-    const workflow = loadWorkflow(repoPath, workflowId);
+    const workflow = loadWorkbench(repoPath, workflowId);
     if (!workflow) return null;
 
-    const handoffManager = new HandoffManager(repoPath);
-    const handoff = handoffManager.load(workflow.current_handoff_id);
-    if (!handoff) return null;
+    // Dispatch ids and assignment ids are the same in the current Hydra
+    // schema, so derive the active assignment from the current dispatch map.
+    const activeDispatchId = Object.entries(workflow.dispatches ?? {}).find(
+      ([, dispatch]) => dispatch.status === "dispatched",
+    )?.[0];
+    const assignmentId = activeDispatchId
+      ?? Object.keys(workflow.dispatches ?? {}).at(-1);
+    if (!assignmentId) return null;
 
-    const terminalId = handoff.dispatch?.active_terminal_id ?? null;
+    const assignment = new AssignmentManager(repoPath, workflowId).load(
+      assignmentId,
+    );
+    if (!assignment) return null;
+
+    const run = assignment.active_run_id
+      ? assignment.runs.find((r) => r.id === assignment.active_run_id)
+      : assignment.runs[assignment.runs.length - 1];
+    const terminalId = run?.terminal_id ?? null;
     const terminal = terminalId ? this.getTerminalSnapshot(terminalId) : null;
-    const contract = this.probeContractState(handoff);
+    const contract = this.probeContractState(assignment, workflowId);
     const lastMeaningfulProgressAt = latestIso(
       terminal?.last_meaningful_progress_at,
       contract.contractActivityAt,
     );
 
-    const startedAt =
-      handoff.dispatch?.attempts.at(-1)?.started_at ?? workflow.updated_at;
+    const startedAt = run?.started_at ?? workflow.updated_at;
     const startedMs = new Date(startedAt).getTime();
+    const timeoutMinutes =
+      assignment.timeout_minutes ?? workflow.default_timeout_minutes;
     const deadlineMs =
-      Number.isFinite(startedMs) && typeof handoff.timeout_minutes === "number"
-        ? startedMs + handoff.timeout_minutes * 60_000
+      Number.isFinite(startedMs) && typeof timeoutMinutes === "number"
+        ? startedMs + timeoutMinutes * 60_000
         : undefined;
 
     return {
       workflow_id: workflow.id,
       repo_path: workflow.repo_path,
       workflow_status: workflow.status,
-      current_handoff_id: handoff.id,
+      current_assignment_id: assignment.id,
       terminal_id: terminalId,
       terminal,
       contract: {
         result_exists: contract.resultExists,
-        done_exists: contract.doneExists,
         result_valid: contract.resultValid,
-        done_valid: contract.doneValid,
         contract_activity_at: contract.contractActivityAt,
       },
       last_meaningful_progress_at: lastMeaningfulProgressAt,
       retry_budget: {
-        used: handoff.retry_count,
-        max: handoff.max_retries,
-        remaining: Math.max(0, handoff.max_retries - handoff.retry_count),
+        used: assignment.retry_count,
+        max: assignment.max_retries,
+        remaining: Math.max(0, assignment.max_retries - assignment.retry_count),
       },
       timeout_budget: {
-        minutes: handoff.timeout_minutes ?? workflow.timeout_minutes,
+        minutes: timeoutMinutes,
         started_at: startedAt,
         deadline_at: deadlineMs
           ? new Date(deadlineMs).toISOString()
@@ -946,7 +1359,7 @@ export class TelemetryService {
         });
         break;
 
-      case "PreToolUse":
+      case "PreToolUse": {
         if (state.pendingPreToolUse) {
           console.warn(
             `[Telemetry] Missed PostToolUse for terminal=${terminalId} (new PreToolUse arrived while pending)`,
@@ -963,17 +1376,62 @@ export class TelemetryService {
         state.snapshot.last_meaningful_progress_at = at;
         state.snapshot.foreground_tool = event.tool_name as string | undefined;
         state.lastHookToolAt = this.now();
+        // Provider-specific fallback timer. For Claude Code the primary
+        // signal is the Notification hook (see below); for Codex there is
+        // no approval hook, so the timer is the heuristic we rely on.
+        const fallbackMs =
+          state.snapshot.provider === "codex"
+            ? CODEX_PRE_TOOL_USE_AWAITING_INPUT_MS
+            : CLAUDE_PRE_TOOL_USE_FALLBACK_MS;
         state.awaitingInputTimer = setTimeout(() => {
           state.awaitingInputTimer = null;
           if (state.pendingPreToolUse) {
             state.snapshot.turn_state = "awaiting_input";
             this.updateDerivedStatus(state, { force: true });
           }
-        }, 5_000);
+        }, fallbackMs);
         this.appendEvent(state, at, "session", "hook_pre_tool", {
           tool_name: event.tool_name ?? null,
         });
         break;
+      }
+
+      case "Notification": {
+        // Claude Code multiplexes several notification flavors through
+        // the same hook. Only the ones that actually block on user
+        // action should surface as awaiting_input; generic completion /
+        // auth notices must not resurrect a finished turn into a red
+        // attention state.
+        //
+        // Codex does not emit this hook, so Codex paths never reach
+        // here; it relies on the PreToolUse fallback timer instead.
+        const message =
+          typeof event.message === "string" ? event.message : undefined;
+        const notificationType =
+          typeof event.notification_type === "string"
+            ? event.notification_type
+            : undefined;
+        const awaitingInput = shouldMarkClaudeNotificationAwaitingInput(
+          event,
+          state.pendingPreToolUse,
+        );
+        if (awaitingInput) {
+          if (state.awaitingInputTimer) {
+            clearTimeout(state.awaitingInputTimer);
+            state.awaitingInputTimer = null;
+          }
+          state.snapshot.turn_state = "awaiting_input";
+          state.snapshot.last_meaningful_progress_at = at;
+        }
+        this.appendEvent(state, at, "session", "hook_notification", {
+          message: message ?? null,
+          notification_type: notificationType ?? null,
+        });
+        if (awaitingInput) {
+          this.updateDerivedStatus(state, { force: true });
+        }
+        break;
+      }
 
       case "PostToolUse":
         if (state.awaitingInputTimer) {
@@ -1019,11 +1477,25 @@ export class TelemetryService {
         break;
 
       case "SessionEnd":
+        if (state.awaitingInputTimer) {
+          clearTimeout(state.awaitingInputTimer);
+          state.awaitingInputTimer = null;
+        }
         state.pendingPreToolUse = false;
         state.snapshot.pending_tool_use_at = undefined;
         state.activeToolCalls.clear();
         state.snapshot.active_tool_calls = 0;
         state.snapshot.foreground_tool = undefined;
+        // If the session ends while we were still flagged
+        // `awaiting_input` (timer fired before a tool completed, then
+        // the session wrapped without Stop/PostToolUse), that signal
+        // is now stale — no user approval is reachable with the
+        // session gone. Drive the turn state to a terminal value so
+        // the session panel drops the red attention badge.
+        if (state.snapshot.turn_state === "awaiting_input") {
+          state.snapshot.turn_state = "turn_aborted";
+          state.lastTerminalTurnAtMs = this.now();
+        }
         this.appendEvent(state, at, "session", "hook_session_end", {
           reason: event.reason ?? null,
         });
@@ -1097,6 +1569,7 @@ export class TelemetryService {
       pendingPreToolUseAt: 0,
       awaitingInputTimer: null,
       lastTokenTotal: null,
+      openCodeEventKeys: new Set<string>(),
       processPollTimer: null,
       ptyId: registration?.ptyId ?? null,
       sessionFile: null,
@@ -1132,7 +1605,7 @@ export class TelemetryService {
       at: at ?? isoNow(this.now),
       terminal_id: state.snapshot.terminal_id,
       workflow_id: state.snapshot.workflow_id,
-      handoff_id: state.snapshot.handoff_id,
+      assignment_id: state.snapshot.assignment_id,
       source,
       kind,
       data,
@@ -1143,77 +1616,65 @@ export class TelemetryService {
     }
   }
 
-  private probeContractState(handoff: Handoff): ContractState {
-    const artifacts = handoff.artifacts;
-    if (!artifacts) {
-      return {
-        resultExists: false,
-        doneExists: false,
-      };
+  private probeContractState(
+    assignment: AssignmentRecord,
+    workflowId: string,
+  ): ContractState {
+    const run = assignment.active_run_id
+      ? assignment.runs.find((r) => r.id === assignment.active_run_id)
+      : assignment.runs[assignment.runs.length - 1];
+    if (!run) {
+      return { resultExists: false };
     }
 
-    const resultExists = fs.existsSync(artifacts.result_file);
-    const doneExists = fs.existsSync(artifacts.done_file);
+    const resultExists = fs.existsSync(run.result_file);
     let resultValid: boolean | undefined;
-    let doneValid: boolean | undefined;
-    const handoffContract = {
-      handoff_id: handoff.id,
-      workflow_id: handoff.workflow_id,
-      artifacts,
-    };
 
     if (resultExists) {
       try {
-        const raw = JSON.parse(fs.readFileSync(artifacts.result_file, "utf-8"));
-        validateResultContract(raw, handoffContract);
+        const raw = JSON.parse(fs.readFileSync(run.result_file, "utf-8"));
+        validateRunResult(raw, {
+          workbench_id: workflowId,
+          assignment_id: assignment.id,
+          run_id: run.id,
+        });
         resultValid = true;
       } catch {
         resultValid = false;
       }
     }
 
-    if (doneExists) {
-      try {
-        const raw = JSON.parse(fs.readFileSync(artifacts.done_file, "utf-8"));
-        validateDoneMarker(raw, handoffContract);
-        doneValid = true;
-      } catch {
-        doneValid = false;
-      }
-    }
-
     return {
       resultExists,
-      doneExists,
       resultValid,
-      doneValid,
-      contractActivityAt: latestIso(
-        safeMtime(artifacts.result_file),
-        safeMtime(artifacts.done_file),
-      ),
+      contractActivityAt: safeMtime(run.result_file),
     };
   }
 
   private syncContractState(state: TerminalState): void {
-    if (!state.snapshot.repo_path || !state.snapshot.handoff_id) {
+    if (
+      !state.snapshot.repo_path ||
+      !state.snapshot.assignment_id ||
+      !state.snapshot.workflow_id
+    ) {
       return;
     }
 
-    const handoff = new HandoffManager(state.snapshot.repo_path).load(
-      state.snapshot.handoff_id,
+    const assignment = new AssignmentManager(
+      state.snapshot.repo_path,
+      state.snapshot.workflow_id,
+    ).load(state.snapshot.assignment_id);
+    if (!assignment) return;
+
+    const contract = this.probeContractState(
+      assignment,
+      state.snapshot.workflow_id,
     );
-    if (!handoff) {
-      return;
-    }
-
-    const contract = this.probeContractState(handoff);
     const contractKey = JSON.stringify(contract);
     const previousActivityAt = state.snapshot.contract_activity_at;
 
     state.snapshot.result_exists = contract.resultExists;
-    state.snapshot.done_exists = contract.doneExists;
     state.snapshot.result_valid = contract.resultValid;
-    state.snapshot.done_valid = contract.doneValid;
     state.snapshot.contract_activity_at = contract.contractActivityAt;
 
     if (contractKey !== state.lastContractKey) {
@@ -1232,35 +1693,24 @@ export class TelemetryService {
           {},
         );
       }
-      if (contract.doneExists) {
-        this.appendEvent(
-          state,
-          contract.contractActivityAt,
-          "contract",
-          "done_written",
-          {},
-        );
-      }
-      if (contract.resultValid === false || contract.doneValid === false) {
+      if (contract.resultValid === false) {
         this.appendEvent(
           state,
           contract.contractActivityAt,
           "contract",
           "contract_invalid",
           {
-            result_valid: contract.resultValid ?? null,
-            done_valid: contract.doneValid ?? null,
+            result_valid: false,
           },
         );
-      } else if (contract.resultValid || contract.doneValid) {
+      } else if (contract.resultValid) {
         this.appendEvent(
           state,
           contract.contractActivityAt,
           "contract",
           "contract_validated",
           {
-            result_valid: contract.resultValid ?? null,
-            done_valid: contract.doneValid ?? null,
+            result_valid: true,
           },
         );
       }
@@ -1317,6 +1767,7 @@ export class TelemetryService {
     const state = this.ensureState(terminalId);
     this.stopProcessPolling(state);
     state.shellPid = shellPid;
+    state.snapshot.shell_pid = shellPid;
     const poll = async () => {
       try {
         const snapshot = await getProcessSnapshot(shellPid);
@@ -1354,7 +1805,14 @@ export class TelemetryService {
       const directory = path.dirname(state.sessionFile);
       const basename = path.basename(state.sessionFile);
       state.sessionWatcher = fs.watch(directory, (_event, changedFile) => {
-        if (changedFile && changedFile !== basename) return;
+        if (changedFile) {
+          const changed = String(changedFile);
+          if (isOpenCodeProvider(state.snapshot.provider)) {
+            if (!changed.startsWith(basename)) return;
+          } else if (changed !== basename) {
+            return;
+          }
+        }
         read();
       });
     } catch {
@@ -1376,6 +1834,10 @@ export class TelemetryService {
 
   private primeSessionFromTail(state: TerminalState): void {
     if (!state.sessionFile) return;
+    if (isOpenCodeProvider(state.snapshot.provider)) {
+      this.readOpenCodeSessionDelta(state);
+      return;
+    }
     try {
       const stat = fs.statSync(state.sessionFile);
       const size = stat.size;
@@ -1395,12 +1857,11 @@ export class TelemetryService {
       const completeLines = trailing === "" ? lines : lines.slice(0, -1);
       for (const line of completeLines) {
         if (!line.trim()) continue;
+        const provider = toSessionProvider(state.snapshot.provider);
+        if (!provider) continue;
         this.recordSessionTelemetry(
           state.snapshot.terminal_id,
-          parseSessionTelemetryLine(
-            line,
-            state.snapshot.provider === "claude" ? "claude" : "codex",
-          ),
+          parseSessionTelemetryLine(line, provider),
         );
       }
       state.sessionRemainder = trailing === "" ? "" : trailing;
@@ -1409,8 +1870,34 @@ export class TelemetryService {
     } catch {}
   }
 
+  private readOpenCodeSessionDelta(state: TerminalState): void {
+    if (!state.sessionFile || !state.snapshot.session_id) return;
+    const read = readOpenCodeSessionTelemetry({
+      dbPath: state.sessionFile,
+      sessionId: state.snapshot.session_id,
+      seenEventKeys: state.openCodeEventKeys,
+    });
+    for (const key of read.eventKeys) {
+      state.openCodeEventKeys.add(key);
+    }
+    if (read.events.length > 0) {
+      this.recordSessionTelemetry(state.snapshot.terminal_id, read.events);
+    }
+    if (
+      read.firstUserPrompt &&
+      state.snapshot.first_user_prompt !== read.firstUserPrompt
+    ) {
+      state.snapshot.first_user_prompt = read.firstUserPrompt;
+      this.updateDerivedStatus(state, { force: true });
+    }
+  }
+
   private async readSessionDelta(state: TerminalState): Promise<void> {
     if (!state.sessionFile || state.sessionReadInFlight) return;
+    if (isOpenCodeProvider(state.snapshot.provider)) {
+      this.readOpenCodeSessionDelta(state);
+      return;
+    }
     if (this.now() - state.lastHookToolAt < 2_000) return;
     state.sessionReadInFlight = true;
     try {
@@ -1442,13 +1929,25 @@ export class TelemetryService {
 
       for (const line of lines) {
         if (!line.trim()) continue;
+        const provider = toSessionProvider(state.snapshot.provider);
+        if (!provider) continue;
         this.recordSessionTelemetry(
           state.snapshot.terminal_id,
-          parseSessionTelemetryLine(
-            line,
-            state.snapshot.provider === "claude" ? "claude" : "codex",
-          ),
+          parseSessionTelemetryLine(line, provider),
         );
+      }
+
+      // Retry first-user-prompt extraction if the initial attempt
+      // during attachSessionSource missed it (e.g. file was empty).
+      if (!state.snapshot.first_user_prompt && state.sessionFile) {
+        const prompt = extractFirstUserPrompt(
+          state.sessionFile,
+          state.snapshot.provider,
+          state.snapshot.session_id,
+        );
+        if (prompt) {
+          state.snapshot.first_user_prompt = prompt;
+        }
       }
     } finally {
       state.sessionReadInFlight = false;

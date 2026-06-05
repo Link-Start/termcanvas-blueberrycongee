@@ -2,19 +2,33 @@ import type { DrawingElement } from "../stores/drawingStore";
 import type { ProjectData } from "../types";
 import type { AnnotationAnchor } from "../types/scene";
 import { getTerminalGeometry } from "../terminal/terminalGeometryRegistry";
-import {
-  packTerminals,
-  PROJ_PAD,
-  PROJ_TITLE_H,
-  WT_PAD,
-  WT_TITLE_H,
-} from "../layout";
 
 interface Rect {
   x: number;
   y: number;
   w: number;
   h: number;
+}
+
+function readPosition(
+  value: unknown,
+): { x: number; y: number } | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const candidate = value as { position?: { x?: unknown; y?: unknown } };
+  if (
+    typeof candidate.position?.x !== "number" ||
+    typeof candidate.position?.y !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    x: candidate.position.x,
+    y: candidate.position.y,
+  };
 }
 
 function translateAnchor(
@@ -83,7 +97,9 @@ function shiftDrawingElement(
   }
 }
 
-function getDrawingElementOrigin(element: DrawingElement): { x: number; y: number } | null {
+function getDrawingElementOrigin(
+  element: DrawingElement,
+): { x: number; y: number } | null {
   switch (element.type) {
     case "pen":
       return element.points[0]
@@ -113,51 +129,34 @@ function resolveEntityAnchorWorldPoint(
 
   for (const project of projects) {
     if (project.id === entityId) {
+      const projectPosition = readPosition(project);
+      if (!projectPosition) {
+        return null;
+      }
       return {
-        x: project.position.x + offset.x,
-        y: project.position.y + offset.y,
+        x: projectPosition.x + offset.x,
+        y: projectPosition.y + offset.y,
       };
     }
 
     for (const worktree of project.worktrees) {
       if (worktree.id === entityId) {
+        const projectPosition = readPosition(project);
+        const worktreePosition = readPosition(worktree);
+        if (!projectPosition || !worktreePosition) {
+          return null;
+        }
         return {
-          x: project.position.x + PROJ_PAD + worktree.position.x + offset.x,
-          y:
-            project.position.y +
-            PROJ_TITLE_H +
-            PROJ_PAD +
-            worktree.position.y +
-            offset.y,
+          x: projectPosition.x + worktreePosition.x + offset.x,
+          y: projectPosition.y + worktreePosition.y + offset.y,
         };
       }
 
-      const visibleTerminals = worktree.terminals.filter(
-        (terminal) => !terminal.stashed,
-      );
-      const packed = packTerminals(visibleTerminals.map((terminal) => terminal.span));
-      const terminalIndex = visibleTerminals.findIndex(
-        (terminal) => terminal.id === entityId,
-      );
-      const item = terminalIndex >= 0 ? packed[terminalIndex] : null;
-      if (item) {
+      const terminal = worktree.terminals.find((t) => t.id === entityId);
+      if (terminal) {
         return {
-          x:
-            project.position.x +
-            PROJ_PAD +
-            worktree.position.x +
-            WT_PAD +
-            item.x +
-            offset.x,
-          y:
-            project.position.y +
-            PROJ_TITLE_H +
-            PROJ_PAD +
-            worktree.position.y +
-            WT_TITLE_H +
-            WT_PAD +
-            item.y +
-            offset.y,
+          x: terminal.x + offset.x,
+          y: terminal.y + offset.y,
         };
       }
     }
@@ -216,7 +215,10 @@ export function getDrawingElementBounds(element: DrawingElement): Rect {
         (max, line) => Math.max(max, line.length),
         0,
       );
-      const width = Math.max(element.fontSize, maxLineLength * element.fontSize * 0.62);
+      const width = Math.max(
+        element.fontSize,
+        maxLineLength * element.fontSize * 0.62,
+      );
       const height = Math.max(
         element.fontSize * 1.4,
         lines.length * element.fontSize * 1.4,

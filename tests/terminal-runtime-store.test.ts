@@ -119,10 +119,12 @@ function createMockXterm() {
     blurCalls: 0,
     disposeCalls: 0,
     fitCalls: 0,
+    focusCalls: 0,
     inputBindingDisposeCalls: 0,
     loadAddonCalls: 0,
     refreshCalls: 0,
     resizeBindingDisposeCalls: 0,
+    selectAllCalls: 0,
     selectionBindingDisposeCalls: 0,
     selectionPointerCleanupCalls: 0,
     selectionSubscriptions: 0,
@@ -138,7 +140,9 @@ function createMockXterm() {
     dispose() {
       stats.disposeCalls += 1;
     },
-    focus() {},
+    focus() {
+      stats.focusCalls += 1;
+    },
     getSelection() {
       return "";
     },
@@ -169,6 +173,9 @@ function createMockXterm() {
     },
     refresh() {
       stats.refreshCalls += 1;
+    },
+    selectAll() {
+      stats.selectAllCalls += 1;
     },
     scrollToBottom() {},
     write() {},
@@ -513,6 +520,132 @@ test("parked runtimes apply font preference updates without fitting against the 
   }
 });
 
+test("terminal renderer preference can release and reacquire WebGL on a live runtime", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { usePreferencesStore } = await import("../src/stores/preferencesStore.ts");
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const { releaseWebGL } = await import("../src/terminal/webglContextPool.ts");
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+    getTerminalRuntime,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousProjectState = useProjectStore.getState();
+  const previousPreferencesState = usePreferencesStore.getState();
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore);
+    mockWindow.termcanvas = {
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        notifyThemeChanged() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+      session: {
+        onTurnComplete() {
+          return () => {};
+        },
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    const runtime = getTerminalRuntime("terminal-1");
+    assert.ok(runtime);
+    if (!runtime) {
+      return;
+    }
+
+    const { stats, xterm } = createMockXterm();
+    runtime.xterm = xterm as unknown as typeof runtime.xterm;
+
+    usePreferencesStore.getState().setTerminalRenderer("dom");
+    usePreferencesStore.getState().setTerminalRenderer("webgl");
+    assert.equal(stats.loadAddonCalls, 1);
+
+    usePreferencesStore.getState().setTerminalRenderer("dom");
+    usePreferencesStore.getState().setTerminalRenderer("webgl");
+    assert.equal(stats.loadAddonCalls, 2);
+  } finally {
+    destroyAllTerminalRuntimes();
+    useProjectStore.setState(previousProjectState);
+    usePreferencesStore.setState(previousPreferencesState);
+    releaseWebGL("terminal-1");
+  }
+});
+
+test("resetWebGL recreates the addon and refreshes the terminal viewport", async () => {
+  installRuntimeGlobals();
+  const { acquireWebGL, releaseWebGL, resetWebGL } = await import("../src/terminal/webglContextPool.ts");
+  const { stats, xterm } = createMockXterm();
+
+  try {
+    assert.equal(acquireWebGL("terminal-1", xterm as never), true);
+    assert.equal(stats.loadAddonCalls, 1);
+
+    resetWebGL("terminal-1", "test_reset");
+
+    assert.equal(stats.loadAddonCalls, 2);
+    assert.equal(stats.refreshCalls, 1);
+  } finally {
+    releaseWebGL("terminal-1");
+  }
+});
+
+test("acquireWebGL warns users to switch renderers when WebGL is unavailable", async () => {
+  installRuntimeGlobals();
+  const { useLocaleStore } = await import("../src/stores/localeStore.ts");
+  const { useNotificationStore } = await import("../src/stores/notificationStore.ts");
+  const { acquireWebGL, releaseWebGL } = await import("../src/terminal/webglContextPool.ts");
+  const previousLocaleState = useLocaleStore.getState();
+  const previousNotificationState = useNotificationStore.getState();
+  let notified: { message: string; type: "error" | "info" | "warn" } | null = null;
+
+  try {
+    useLocaleStore.setState({ locale: "en" });
+    useNotificationStore.setState({
+      notifications: [],
+      notify: (type, message) => {
+        notified = { type, message };
+      },
+    });
+
+    const xterm = {
+      cols: 80,
+      rows: 24,
+      loadAddon() {
+        throw new Error("WebGL unsupported");
+      },
+    };
+
+    assert.equal(acquireWebGL("terminal-1", xterm as never), false);
+    assert.deepEqual(notified, {
+      type: "warn",
+      message:
+        "WebGL terminal rendering is unavailable. Switch to DOM in Settings > Appearance.",
+    });
+  } finally {
+    releaseWebGL("terminal-1");
+    useLocaleStore.setState(previousLocaleState);
+    useNotificationStore.setState(previousNotificationState);
+  }
+});
+
 test("starting a parked runtime does not fit or resize the hidden terminal host", async () => {
   const mockWindow = installRuntimeGlobals();
   const { useProjectStore } = await import("../src/stores/projectStore.ts");
@@ -612,8 +745,143 @@ test("starting a parked runtime does not fit or resize the hidden terminal host"
   }
 });
 
+test("selectAllTerminalRuntime selects the focused xterm buffer", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+    getTerminalRuntime,
+    selectAllTerminalRuntime,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousState = useProjectStore.getState();
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore);
+    mockWindow.termcanvas = {
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+      session: {
+        onTurnComplete() {
+          return () => {};
+        },
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    const runtime = getTerminalRuntime("terminal-1");
+    assert.ok(runtime);
+    if (!runtime) {
+      return;
+    }
+
+    const { stats, xterm } = createMockXterm();
+    runtime.xterm = xterm as unknown as typeof runtime.xterm;
+
+    assert.equal(selectAllTerminalRuntime("terminal-1"), true);
+    assert.equal(stats.selectAllCalls, 1);
+    assert.equal(selectAllTerminalRuntime("missing-terminal"), false);
+  } finally {
+    destroyAllTerminalRuntimes();
+    useProjectStore.setState(previousState);
+  }
+});
+
+test("focusTerminalRuntime focuses without refresh", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { useCanvasStore } = await import("../src/stores/canvasStore.ts");
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+    focusTerminalRuntime,
+    getTerminalRuntime,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousProjectState = useProjectStore.getState();
+  const previousCanvasState = useCanvasStore.getState();
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore);
+    useCanvasStore.setState({
+      isAnimating: false,
+      viewport: { x: 0, y: 0, scale: 0.6 },
+    });
+
+    mockWindow.termcanvas = {
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+      session: {
+        onTurnComplete() {
+          return () => {};
+        },
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    const runtime = getTerminalRuntime("terminal-1");
+    assert.ok(runtime);
+    if (!runtime) {
+      return;
+    }
+
+    const { stats, xterm } = createMockXterm();
+    runtime.rendererMode = "webgl";
+    runtime.xterm = xterm as unknown as typeof runtime.xterm;
+
+    assert.equal(focusTerminalRuntime("terminal-1"), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(stats.focusCalls, 1);
+    assert.equal(stats.refreshCalls, 0);
+  } finally {
+    destroyAllTerminalRuntimes();
+    useProjectStore.setState(previousProjectState);
+    useCanvasStore.setState({
+      isAnimating: previousCanvasState.isAnimating,
+      viewport: previousCanvasState.viewport,
+    });
+  }
+});
+
 test("reattaching a parked runtime reacquires WebGL after the pool evicts it", async () => {
   const mockWindow = installRuntimeGlobals();
+  const { usePreferencesStore } = await import("../src/stores/preferencesStore.ts");
   const { useProjectStore } = await import("../src/stores/projectStore.ts");
   const { acquireWebGL, releaseWebGL } = await import("../src/terminal/webglContextPool.ts");
   const {
@@ -625,10 +893,12 @@ test("reattaching a parked runtime reacquires WebGL after the pool evicts it", a
     setTerminalRuntimeMode,
   } = await import("../src/terminal/terminalRuntimeStore.ts");
   const previousState = useProjectStore.getState();
+  const previousPreferencesState = usePreferencesStore.getState();
 
   destroyAllTerminalRuntimes();
 
   try {
+    usePreferencesStore.getState().setTerminalRenderer("webgl");
     seedProjectState(useProjectStore);
 
     ensureTerminalRuntime({
@@ -690,6 +960,620 @@ test("reattaching a parked runtime reacquires WebGL after the pool evicts it", a
   } finally {
     destroyAllTerminalRuntimes();
     useProjectStore.setState(previousState);
+    usePreferencesStore.setState(previousPreferencesState);
     releaseWebGL("terminal-1");
+  }
+});
+
+test("manual terminal viewport refresh redraws registered xterms immediately", async () => {
+  const {
+    registerTerminal,
+    refreshRegisteredTerminalViewports,
+    unregisterTerminal,
+  } = await import("../src/terminal/terminalRegistry.ts");
+  const first = createMockXterm();
+  const second = createMockXterm();
+  const serializeAddon = {
+    serialize() {
+      return "live buffer";
+    },
+  };
+
+  try {
+    registerTerminal(
+      "terminal-1",
+      first.xterm as unknown as import("@xterm/xterm").Terminal,
+      serializeAddon as unknown as import("@xterm/addon-serialize").SerializeAddon,
+    );
+    registerTerminal(
+      "terminal-2",
+      second.xterm as unknown as import("@xterm/xterm").Terminal,
+      serializeAddon as unknown as import("@xterm/addon-serialize").SerializeAddon,
+    );
+
+    refreshRegisteredTerminalViewports("terminal-1");
+    assert.equal(first.stats.refreshCalls, 1);
+    assert.equal(second.stats.refreshCalls, 0);
+
+    refreshRegisteredTerminalViewports();
+    assert.equal(first.stats.refreshCalls, 2);
+    assert.equal(second.stats.refreshCalls, 1);
+
+    refreshRegisteredTerminalViewports("missing-terminal");
+    assert.equal(first.stats.refreshCalls, 2);
+    assert.equal(second.stats.refreshCalls, 1);
+  } finally {
+    unregisterTerminal("terminal-1");
+    unregisterTerminal("terminal-2");
+  }
+});
+
+test("codex SessionStart hook cancels fallback polling and preserves the exact session", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const { useTerminalRuntimeStateStore } = await import(
+    "../src/stores/terminalRuntimeStateStore.ts"
+  );
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousProjectState = useProjectStore.getState();
+  let sessionStartListener: ((
+    payload: {
+      terminalId: string;
+      sessionId: string;
+      transcriptPath: string | null;
+      cwd: string | null;
+    },
+  ) => void) | null = null;
+  let findCodexCalls = 0;
+  const watchCalls: Array<{
+    cwd: string;
+    sessionId: string;
+    type: string;
+  }> = [];
+  const attachCalls: Array<{
+    confidence: string;
+    cwd: string;
+    provider: string;
+    sessionId: string;
+    terminalId: string;
+  }> = [];
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore, {
+      ...createTerminal(),
+      ptyId: null,
+      status: "idle",
+      title: "codex",
+      type: "codex",
+    });
+
+    mockWindow.termcanvas = {
+      hooks: {
+        getHealth: async () => ({
+          eventsReceived: 0,
+          lastEventAt: null,
+          parseErrors: 0,
+          socketPath: null,
+        }),
+        getSocketPath: async () => null,
+        onSessionStarted(
+          callback: (payload: {
+            terminalId: string;
+            sessionId: string;
+            transcriptPath: string | null;
+            cwd: string | null;
+          }) => void,
+        ) {
+          sessionStartListener = callback;
+          return () => {
+            if (sessionStartListener === callback) {
+              sessionStartListener = null;
+            }
+          };
+        },
+        onStopFailure() {
+          return () => {};
+        },
+        onTurnComplete() {
+          return () => {};
+        },
+      },
+      session: {
+        findCodex: async () => {
+          findCodexCalls += 1;
+          return { confidence: "medium", sessionId: "wrong-session" };
+        },
+        getBypassState: async () => false,
+        getCodexLatest: async () => "baseline-session",
+        onTurnComplete() {
+          return () => {};
+        },
+        unwatch: async () => {},
+        watch: async (type: string, sessionId: string, cwd: string) => {
+          watchCalls.push({ cwd, sessionId, type });
+          return { ok: true };
+        },
+      },
+      telemetry: {
+        attachSession: async (input: {
+          confidence: string;
+          cwd: string;
+          provider: string;
+          sessionId: string;
+          terminalId: string;
+        }) => {
+          attachCalls.push(input);
+          return { ok: true, sessionFile: `/tmp/${input.sessionId}.jsonl` };
+        },
+        detachSession: async () => {},
+        getTerminal: async () => null,
+        onSnapshotChanged() {
+          return () => {};
+        },
+      },
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        notifyThemeChanged() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.ok(
+      sessionStartListener,
+      "codex runtime should register a SessionStart hook listener",
+    );
+
+    sessionStartListener?.({
+      cwd: "/tmp/project-1",
+      sessionId: "correct-session",
+      terminalId: "terminal-1",
+      transcriptPath: "/tmp/correct-session.jsonl",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 650));
+
+    assert.equal(findCodexCalls, 0);
+    assert.deepEqual(watchCalls, [
+      {
+        cwd: "/tmp/project-1",
+        sessionId: "correct-session",
+        type: "codex",
+      },
+    ]);
+    assert.deepEqual(attachCalls, [
+      {
+        confidence: "strong",
+        cwd: "/tmp/project-1",
+        provider: "codex",
+        sessionId: "correct-session",
+        terminalId: "terminal-1",
+      },
+    ]);
+    assert.equal(
+      useTerminalRuntimeStateStore.getState().terminals["terminal-1"]?.sessionId,
+      "correct-session",
+    );
+  } finally {
+    destroyAllTerminalRuntimes();
+    useTerminalRuntimeStateStore.getState().reset();
+    useProjectStore.setState(previousProjectState);
+  }
+});
+
+test("wuu polling attaches the discovered session to telemetry", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const { useTerminalRuntimeStateStore } = await import(
+    "../src/stores/terminalRuntimeStateStore.ts"
+  );
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousProjectState = useProjectStore.getState();
+  const watchCalls: Array<{
+    cwd: string;
+    sessionId: string;
+    type: string;
+  }> = [];
+  const attachCalls: Array<{
+    confidence: string;
+    cwd: string;
+    provider: string;
+    sessionId: string;
+    terminalId: string;
+  }> = [];
+  let findWuuCalls = 0;
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore, {
+      ...createTerminal(),
+      ptyId: null,
+      status: "idle",
+      title: "wuu",
+      type: "wuu",
+    });
+
+    mockWindow.termcanvas = {
+      session: {
+        findWuu: async () => {
+          findWuuCalls += 1;
+          return {
+            confidence: "medium",
+            filePath: "/tmp/project-1/.wuu/sessions/wuu-session.jsonl",
+            sessionId: "wuu-session",
+          };
+        },
+        onTurnComplete() {
+          return () => {};
+        },
+        unwatch: async () => {},
+        watch: async (type: string, sessionId: string, cwd: string) => {
+          watchCalls.push({ cwd, sessionId, type });
+          return { ok: true };
+        },
+      },
+      telemetry: {
+        attachSession: async (input: {
+          confidence: string;
+          cwd: string;
+          provider: string;
+          sessionId: string;
+          terminalId: string;
+        }) => {
+          attachCalls.push(input);
+          return { ok: true, sessionFile: `/tmp/${input.sessionId}.jsonl` };
+        },
+        detachSession: async () => {},
+        getTerminal: async () => null,
+        onSnapshotChanged() {
+          return () => {};
+        },
+      },
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        notifyThemeChanged() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    assert.ok(findWuuCalls > 0);
+    assert.deepEqual(watchCalls, [
+      {
+        cwd: "/tmp/project-1",
+        sessionId: "wuu-session",
+        type: "wuu",
+      },
+    ]);
+    assert.deepEqual(attachCalls, [
+      {
+        confidence: "medium",
+        cwd: "/tmp/project-1",
+        provider: "wuu",
+        sessionId: "wuu-session",
+        terminalId: "terminal-1",
+      },
+    ]);
+    assert.equal(
+      useTerminalRuntimeStateStore.getState().terminals["terminal-1"]?.sessionId,
+      "wuu-session",
+    );
+  } finally {
+    destroyAllTerminalRuntimes();
+    useTerminalRuntimeStateStore.getState().reset();
+    useProjectStore.setState(previousProjectState);
+  }
+});
+
+test("opencode polling attaches the discovered session to telemetry", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const { useTerminalRuntimeStateStore } = await import(
+    "../src/stores/terminalRuntimeStateStore.ts"
+  );
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousProjectState = useProjectStore.getState();
+  const watchCalls: Array<{
+    cwd: string;
+    sessionId: string;
+    type: string;
+  }> = [];
+  const attachCalls: Array<{
+    confidence: string;
+    cwd: string;
+    provider: string;
+    sessionId: string;
+    terminalId: string;
+  }> = [];
+  let findOpenCodeCalls = 0;
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore, {
+      ...createTerminal(),
+      ptyId: null,
+      status: "idle",
+      title: "opencode",
+      type: "opencode",
+    });
+
+    mockWindow.termcanvas = {
+      session: {
+        findOpenCode: async () => {
+          findOpenCodeCalls += 1;
+          return {
+            confidence: "medium",
+            filePath: "/tmp/opencode.db",
+            sessionId: "ses_opencode",
+          };
+        },
+        onTurnComplete() {
+          return () => {};
+        },
+        unwatch: async () => {},
+        watch: async (type: string, sessionId: string, cwd: string) => {
+          watchCalls.push({ cwd, sessionId, type });
+          return { ok: true };
+        },
+      },
+      telemetry: {
+        attachSession: async (input: {
+          confidence: string;
+          cwd: string;
+          provider: string;
+          sessionId: string;
+          terminalId: string;
+        }) => {
+          attachCalls.push(input);
+          return { ok: true, sessionFile: "/tmp/opencode.db" };
+        },
+        detachSession: async () => {},
+        getTerminal: async () => null,
+        onSnapshotChanged() {
+          return () => {};
+        },
+      },
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        notifyThemeChanged() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    assert.ok(findOpenCodeCalls > 0);
+    assert.deepEqual(watchCalls, [
+      {
+        cwd: "/tmp/project-1",
+        sessionId: "ses_opencode",
+        type: "opencode",
+      },
+    ]);
+    assert.deepEqual(attachCalls, [
+      {
+        confidence: "medium",
+        cwd: "/tmp/project-1",
+        provider: "opencode",
+        sessionId: "ses_opencode",
+        terminalId: "terminal-1",
+      },
+    ]);
+    assert.equal(
+      useTerminalRuntimeStateStore.getState().terminals["terminal-1"]?.sessionId,
+      "ses_opencode",
+    );
+  } finally {
+    destroyAllTerminalRuntimes();
+    useTerminalRuntimeStateStore.getState().reset();
+    useProjectStore.setState(previousProjectState);
+  }
+});
+
+test("push telemetry updates replace a live terminal's first_user_prompt when the session changes", async () => {
+  const mockWindow = installRuntimeGlobals();
+  const { useProjectStore } = await import("../src/stores/projectStore.ts");
+  const {
+    destroyAllTerminalRuntimes,
+    ensureTerminalRuntime,
+    useTerminalRuntimeStore,
+  } = await import("../src/terminal/terminalRuntimeStore.ts");
+  const previousProjectState = useProjectStore.getState();
+  let snapshotListener:
+    | ((payload: { terminalId: string; snapshot: Record<string, unknown> }) => void)
+    | null = null;
+
+  destroyAllTerminalRuntimes();
+
+  try {
+    seedProjectState(useProjectStore, {
+      ...createTerminal(),
+      title: "codex",
+      type: "codex",
+    });
+
+    mockWindow.termcanvas = {
+      hooks: {
+        onSessionStarted() {
+          return () => {};
+        },
+        onStopFailure() {
+          return () => {};
+        },
+        onTurnComplete() {
+          return () => {};
+        },
+      },
+      session: {
+        getBypassState: async () => false,
+        getCodexLatest: async () => "baseline-session",
+        onTurnComplete() {
+          return () => {};
+        },
+        unwatch: async () => {},
+        watch: async () => ({ ok: true }),
+      },
+      telemetry: {
+        attachSession: async () => ({ ok: true, sessionFile: null }),
+        detachSession: async () => {},
+        getTerminal: async () => null,
+        onSnapshotChanged(
+          callback: (payload: {
+            terminalId: string;
+            snapshot: Record<string, unknown>;
+          }) => void,
+        ) {
+          snapshotListener = callback;
+          return () => {
+            if (snapshotListener === callback) {
+              snapshotListener = null;
+            }
+          };
+        },
+      },
+      terminal: {
+        create: async () => 42,
+        destroy: async () => {},
+        input() {},
+        notifyThemeChanged() {},
+        onExit() {
+          return () => {};
+        },
+        onOutput() {
+          return () => {};
+        },
+        resize() {},
+      },
+    };
+
+    ensureTerminalRuntime({
+      projectId: "project-1",
+      terminal: useProjectStore.getState().projects[0].worktrees[0].terminals[0],
+      worktreeId: "worktree-1",
+      worktreePath: "/tmp/project-1",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.ok(snapshotListener, "runtime should subscribe to telemetry push updates");
+
+    snapshotListener?.({
+      terminalId: "terminal-1",
+      snapshot: {
+        terminal_id: "terminal-1",
+        worktree_path: "/tmp/project-1",
+        provider: "codex",
+        session_attached: true,
+        session_attach_confidence: "strong",
+        session_id: "session-old",
+        session_file: "/tmp/session-old.jsonl",
+        first_user_prompt: "旧会话标题",
+        turn_state: "turn_complete",
+        pty_alive: true,
+        descendant_processes: [],
+        active_tool_calls: 0,
+        task_status: "idle",
+        task_status_source: "turn_state",
+        result_exists: false,
+        derived_status: "idle",
+      },
+    });
+
+    assert.equal(
+      useTerminalRuntimeStore.getState().terminals["terminal-1"]?.telemetry
+        ?.first_user_prompt,
+      "旧会话标题",
+    );
+
+    snapshotListener?.({
+      terminalId: "terminal-1",
+      snapshot: {
+        terminal_id: "terminal-1",
+        worktree_path: "/tmp/project-1",
+        provider: "codex",
+        session_attached: true,
+        session_attach_confidence: "strong",
+        session_id: "session-new",
+        session_file: "/tmp/session-new.jsonl",
+        first_user_prompt: "新会话标题",
+        turn_state: "turn_complete",
+        pty_alive: true,
+        descendant_processes: [],
+        active_tool_calls: 0,
+        task_status: "idle",
+        task_status_source: "turn_state",
+        result_exists: false,
+        derived_status: "idle",
+      },
+    });
+
+    const telemetry =
+      useTerminalRuntimeStore.getState().terminals["terminal-1"]?.telemetry;
+    assert.equal(telemetry?.session_id, "session-new");
+    assert.equal(telemetry?.session_file, "/tmp/session-new.jsonl");
+    assert.equal(telemetry?.first_user_prompt, "新会话标题");
+  } finally {
+    destroyAllTerminalRuntimes();
+    useProjectStore.setState(previousProjectState);
   }
 });

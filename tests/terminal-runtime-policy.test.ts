@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 import {
   clampPreviewAnsi,
   resolveTerminalMountMode,
-  shouldRenderTerminalTile,
   toPreviewText,
 } from "../src/terminal/terminalRuntimePolicy.ts";
 
@@ -28,37 +27,13 @@ test("visible non-focused terminals stay live", () => {
   );
 });
 
-test("offscreen non-focused terminals are parked instead of unmounted", () => {
+test("offscreen non-focused terminals stay live while still in the scene", () => {
   assert.equal(
     resolveTerminalMountMode({
       focused: false,
       visible: false,
     }),
-    "parked",
-  );
-});
-
-test("tile rendering follows viewport and focus instead of mount mode", () => {
-  assert.equal(
-    shouldRenderTerminalTile({
-      focused: false,
-      visible: false,
-    }),
-    false,
-  );
-  assert.equal(
-    shouldRenderTerminalTile({
-      focused: false,
-      visible: true,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldRenderTerminalTile({
-      focused: true,
-      visible: false,
-    }),
-    true,
+    "live",
   );
 });
 

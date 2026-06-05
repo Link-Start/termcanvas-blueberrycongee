@@ -8,6 +8,9 @@ import path from "node:path";
 import {
   findBestClaudeSession,
   findBestCodexSession,
+  findBestKimiSession,
+  findBestOpenCodeSession,
+  findBestWuuSession,
   readLatestCodexSessionId,
 } from "../electron/session-discovery.ts";
 
@@ -132,6 +135,39 @@ function writeStateDbThreads(
         row.cwd,
         row.archived ?? 0,
       );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function writeOpenCodeDbSessions(
+  homeDir: string,
+  rows: Array<{
+    id: string;
+    cwd: string;
+    createdAtMs: number;
+    updatedAtMs: number;
+  }>,
+): void {
+  const dbPath = path.join(homeDir, ".local", "share", "opencode", "opencode.db");
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE session (
+        id TEXT PRIMARY KEY,
+        directory TEXT NOT NULL,
+        time_created INTEGER NOT NULL,
+        time_updated INTEGER NOT NULL
+      )
+    `);
+    const stmt = db.prepare(`
+      INSERT INTO session (id, directory, time_created, time_updated)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const row of rows) {
+      stmt.run(row.id, row.cwd, row.createdAtMs, row.updatedAtMs);
     }
   } finally {
     db.close();
@@ -295,6 +331,104 @@ test("findBestCodexSession prefers state db matches before file fallback", () =>
   });
 });
 
+test("findBestOpenCodeSession resolves from opencode db by cwd and start time", () => {
+  withTempHome((homeDir) => {
+    const previousXdgData = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = path.join(homeDir, ".local", "share");
+    try {
+      writeOpenCodeDbSessions(homeDir, [
+        {
+          id: "ses_older",
+          cwd: "/tmp/project",
+          createdAtMs: 1775339000000,
+          updatedAtMs: 1775339001000,
+        },
+        {
+          id: "ses_match",
+          cwd: "/tmp/project",
+          createdAtMs: 1775339238000,
+          updatedAtMs: 1775339239000,
+        },
+        {
+          id: "ses_other",
+          cwd: "/tmp/other",
+          createdAtMs: 1775339238000,
+          updatedAtMs: 1775339239000,
+        },
+      ]);
+
+      const found = findBestOpenCodeSession(
+        "/tmp/project",
+        new Date(1775339237000).toISOString(),
+        homeDir,
+      );
+      assert.deepEqual(found, {
+        sessionId: "ses_match",
+        filePath: path.join(
+          homeDir,
+          ".local",
+          "share",
+          "opencode",
+          "opencode.db",
+        ),
+        confidence: "medium",
+      });
+    } finally {
+      if (previousXdgData === undefined) {
+        delete process.env.XDG_DATA_HOME;
+      } else {
+        process.env.XDG_DATA_HOME = previousXdgData;
+      }
+    }
+  });
+});
+
+test("findBestOpenCodeSession ignores stale cwd sessions before launch", () => {
+  withTempHome((homeDir) => {
+    const previousXdgData = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = path.join(homeDir, ".local", "share");
+    try {
+      writeOpenCodeDbSessions(homeDir, [
+        {
+          id: "ses_old",
+          cwd: "/tmp/project",
+          createdAtMs: 1775339000000,
+          updatedAtMs: 1775339001000,
+        },
+        {
+          id: "ses_fresh",
+          cwd: "/tmp/project",
+          createdAtMs: 1775338000000,
+          updatedAtMs: 1775339239000,
+        },
+      ]);
+
+      assert.equal(
+        findBestOpenCodeSession(
+          "/tmp/project",
+          new Date(1775339237000).toISOString(),
+          homeDir,
+        )?.sessionId,
+        "ses_fresh",
+      );
+      assert.equal(
+        findBestOpenCodeSession(
+          "/tmp/project",
+          new Date(1775339245000).toISOString(),
+          homeDir,
+        ),
+        null,
+      );
+    } finally {
+      if (previousXdgData === undefined) {
+        delete process.env.XDG_DATA_HOME;
+      } else {
+        process.env.XDG_DATA_HOME = previousXdgData;
+      }
+    }
+  });
+});
+
 test("findBestCodexSession prefers recent indexed sessions that match cwd", () => {
   withTempHome((homeDir) => {
     const now = new Date();
@@ -350,7 +484,7 @@ test("findBestCodexSession falls back to a bounded recent file scan when index i
   });
 });
 
-test("findBestCodexSession keeps a weak latest-id fallback when no cwd match is available", () => {
+test("findBestCodexSession returns null when no cwd match is available", () => {
   withTempHome((homeDir) => {
     const now = new Date().toISOString();
 
@@ -361,10 +495,137 @@ test("findBestCodexSession keeps a weak latest-id fallback when no cwd match is 
 
     const found = findBestCodexSession("/tmp/missing-project", now, homeDir);
 
-    assert.deepEqual(found, {
-      sessionId: "latest-session",
-      filePath: latestFile,
-      confidence: "weak",
-    });
+    assert.equal(found, null);
+    assert.ok(latestFile);
   });
+});
+
+test("findBestWuuSession ignores sessions created before the terminal started", () => {
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "termcanvas-wuu-session-"));
+  try {
+    const sessionsDir = path.join(workspaceDir, ".wuu", "sessions");
+    const staleSessionId = "20260411-100000-abcd";
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "index.jsonl"),
+      `${JSON.stringify({
+        id: staleSessionId,
+        created_at: "2026-04-11T10:00:00.000Z",
+      })}\n`,
+      "utf-8",
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, `${staleSessionId}.jsonl`),
+      JSON.stringify({ role: "user", content: "old" }),
+      "utf-8",
+    );
+
+    const found = findBestWuuSession(
+      workspaceDir,
+      "2026-04-11T10:05:00.000Z",
+    );
+
+    assert.equal(found, null);
+  } finally {
+    fs.rmSync(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+test("findBestWuuSession picks the newest indexed session created after launch", () => {
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "termcanvas-wuu-session-"));
+  try {
+    const sessionsDir = path.join(workspaceDir, ".wuu", "sessions");
+    const olderSessionId = "20260411-100000-abcd";
+    const freshSessionId = "20260411-100502-beef";
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "index.jsonl"),
+      [
+        JSON.stringify({
+          id: olderSessionId,
+          created_at: "2026-04-11T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          id: freshSessionId,
+          created_at: "2026-04-11T10:05:02.000Z",
+        }),
+      ].join("\n"),
+      "utf-8",
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, `${olderSessionId}.jsonl`),
+      JSON.stringify({ role: "user", content: "older" }),
+      "utf-8",
+    );
+    const freshFile = path.join(sessionsDir, `${freshSessionId}.jsonl`);
+    fs.writeFileSync(
+      freshFile,
+      JSON.stringify({ role: "user", content: "fresh" }),
+      "utf-8",
+    );
+
+    const found = findBestWuuSession(
+      workspaceDir,
+      "2026-04-11T10:05:00.000Z",
+    );
+
+    assert.deepEqual(found, {
+      sessionId: freshSessionId,
+      filePath: freshFile,
+      confidence: "medium",
+    });
+  } finally {
+    fs.rmSync(workspaceDir, { recursive: true, force: true });
+  }
+});
+
+import { createHash } from "node:crypto";
+test("findBestKimiSession resolves from metadata and filters by startedAt", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "termcanvas-kimi-discovery-"));
+  try {
+    const sessionsRoot = path.join(homeDir, ".kimi", "sessions");
+    const cwd = "/Users/test/project";
+    const cwdHash = createHash("md5").update(cwd).digest("hex");
+    const sessionsDir = path.join(sessionsRoot, cwdHash);
+
+    // Write metadata
+    const metadataPath = path.join(homeDir, ".kimi", "kimi.json");
+    fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+    fs.writeFileSync(
+      metadataPath,
+      JSON.stringify({
+        work_dirs: [{ path: cwd, sessions_dir: sessionsDir }],
+      }),
+      "utf-8",
+    );
+
+    // Create two sessions
+    const oldSessionDir = path.join(sessionsDir, "old-session-uuid");
+    const newSessionDir = path.join(sessionsDir, "new-session-uuid");
+    fs.mkdirSync(oldSessionDir, { recursive: true });
+    fs.mkdirSync(newSessionDir, { recursive: true });
+
+    const oldContext = path.join(oldSessionDir, "context.jsonl");
+    const newContext = path.join(newSessionDir, "context.jsonl");
+    fs.writeFileSync(oldContext, JSON.stringify({ role: "user", content: "hi" }) + "\n", "utf-8");
+    fs.writeFileSync(newContext, JSON.stringify({ role: "user", content: "hello" }) + "\n", "utf-8");
+
+    // Make old file older
+    const oldTime = Date.now() - 60_000;
+    fs.utimesSync(oldContext, oldTime / 1000, oldTime / 1000);
+
+    const found = findBestKimiSession(cwd, undefined, homeDir);
+    assert.ok(found);
+    assert.equal(found?.sessionId, "new-session-uuid");
+    assert.equal(found?.confidence, "weak");
+
+    // With startedAt filter
+    const startedAt = new Date(oldTime + 30_000).toISOString();
+    const found2 = findBestKimiSession(cwd, startedAt, homeDir);
+    assert.ok(found2);
+    assert.equal(found2?.sessionId, "new-session-uuid");
+    assert.equal(found2?.confidence, "medium");
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
 });

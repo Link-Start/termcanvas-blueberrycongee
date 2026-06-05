@@ -1,21 +1,25 @@
 import {
   app,
   BrowserWindow,
+  crashReporter,
   ipcMain,
   dialog,
   nativeImage,
   shell,
   safeStorage,
+  protocol,
+  net,
 } from "electron";
 import https from "https";
 import path from "path";
 import fs from "fs";
 import AdmZip from "adm-zip";
 import os from "os";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { PtyManager, OutputBatcher } from "./pty-manager";
 import { ProjectScanner } from "./project-scanner";
 import { StatePersistence, TERMCANVAS_DIR } from "./state-persistence";
+import { SnapshotHistory } from "./snapshot-history";
 import { GitFileWatcher } from "./git-watcher";
 import { FileTreeWatcher } from "./file-tree-watcher";
 import {
@@ -24,9 +28,11 @@ import {
   type SessionType,
 } from "./session-watcher";
 import { ApiServer } from "./api-server";
+import { PinStore } from "./pin-store";
 import { sendToWindow } from "./window-events";
 import { detectCli } from "./process-detector";
 import { ensureCliLauncher } from "./cli-launchers";
+import { getAgentShimDir, getTerminalExtraPathEntries } from "./agent-shims";
 import {
   isCliRegistered,
   registerCli,
@@ -51,7 +57,12 @@ import {
   createDefaultComposerSubmitDeps,
   submitComposerRequest,
 } from "./composer-submit";
-import { collectUsage, collectHeatmapData } from "./usage-collector";
+import {
+  collectUsage,
+  collectUsageRange,
+  collectHeatmapData,
+} from "./usage-collector";
+import { buildGitWorktreeRemoveArgs } from "../hydra/src/cleanup";
 import {
   installDownloadedUpdate,
   setupAutoUpdater,
@@ -70,13 +81,30 @@ import {
 import { toFileUrl } from "./file-url";
 import {
   queryCloudUsage,
+  queryCloudUsageRange,
   queryCloudHeatmap,
   backfillHistory,
   flushSyncQueue,
   syncRecentRecords,
 } from "./usage-sync";
-import type { ComposerSubmitRequest } from "../src/types";
+import type {
+  ComposerSubmitRequest,
+  ComposerSupportedTerminalType,
+} from "../src/types";
+import { buildPinComposerPayload } from "./pin-dispatch";
 import { getProjectDiff } from "./git-diff";
+import { searchFileContents, searchSessionContents } from "./search-handlers";
+import {
+  invalidateSessionIndexForFile,
+  listSessionsForProjects,
+  listSessionsForProjectsPaged,
+  type SessionSearchEntry,
+} from "./session-search-index";
+import {
+  buildSessionHistoryScope,
+  diffSessionHistoryScopes,
+} from "./session-history-events.ts";
+import type { SessionHistoryChangedEvent } from "../shared/sessions.ts";
 import {
   checkoutGitRef,
   createCommit,
@@ -91,13 +119,52 @@ import {
   isGitRepo,
   stageFiles,
   unstageFiles,
+  amendCommit,
+  listStashes,
+  createStash,
+  applyStash,
+  popStash,
+  dropStash,
+  createBranch,
+  deleteBranch,
+  renameBranch,
+  listTags,
+  createTag,
+  deleteTag,
+  listRemotes,
+  addRemote,
+  removeRemote,
+  renameRemote,
+  gitFetch,
+  gitMerge,
+  gitMergeAbort,
+  gitRebase,
+  gitRebaseAbort,
+  gitRebaseContinue,
+  gitCherryPick,
+  gitCherryPickAbort,
+  getMergeState,
+  getFileDiff,
+  stageHunk,
+  unstageHunk,
+  getBlame,
 } from "./git-info";
+import { parseNulSeparatedGitPaths } from "./git-paths";
 import { createMenu } from "./menu";
+import { isSelectAllShortcutInput } from "./select-all-shortcut";
+import { isReloadShortcutInput } from "./reload-shortcut";
 import { TelemetryService } from "./telemetry-service";
+import { createRenderDiagnosticsLogger } from "./render-diagnostics";
+import { RenderThrottlingCoordinator } from "./render-throttling-coordinator";
 import { HookReceiver } from "./hook-receiver";
+import { isSafeExternalUrl } from "./external-url";
+import { WorkspaceSavePathRegistry } from "./workspace-save-path";
 import {
   findBestClaudeSession,
   findBestCodexSession,
+  findBestKimiSession,
+  findBestOpenCodeSession,
+  findBestWuuSession,
   readClaudeSessionPermissionMode,
   readCodexSessionBypassState,
   readLatestCodexSessionId,
@@ -105,6 +172,8 @@ import {
 import { AgentService, type AgentConfig } from "./agent-service";
 import { SessionScanner } from "./session-scanner.ts";
 import { mergeAndDedupeSessions } from "./session-list.ts";
+import { buildPinRenderHtml } from "./pin-render-utils";
+import type { RenderDiagnosticEventInput } from "../shared/render-diagnostics";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -113,6 +182,33 @@ const isDev = !!process.env.VITE_DEV_SERVER_URL;
 if (isDev) {
   app.setPath("userData", path.join(app.getPath("appData"), "termcanvas-dev"));
 }
+
+// Capture main / renderer / GPU process crashes into local minidumps. Required
+// before any window opens so main-process crashes are still recorded. We do
+// not upload anywhere — dumps live under app.getPath('crashDumps') for users
+// (or us) to attach to bug reports manually.
+crashReporter.start({
+  productName: "TermCanvas",
+  uploadToServer: false,
+  compress: true,
+});
+
+// Custom scheme for serving pin image attachments from disk. Renderer-side
+// `<img src="tc-attachment://local/<abs-path>">` resolves through the handler
+// registered after app.whenReady. Must be declared as privileged BEFORE the
+// app is ready, otherwise Chromium treats it as opaque and blocks subresources.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "tc-attachment",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      bypassCSP: true,
+    },
+  },
+]);
 const skipLock = isDev || !!process.env.TERMCANVAS_SKIP_LOCK;
 const gotLock = skipLock || app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -131,7 +227,7 @@ function perfLog(label: string, details: Record<string, unknown>) {
 }
 
 function writePortFile(port: number) {
-  fs.writeFileSync(PORT_FILE, String(port), "utf-8");
+  fs.writeFileSync(PORT_FILE, `${port}\n${process.pid}`, "utf-8");
 }
 
 function cleanupPortFile() {
@@ -140,16 +236,30 @@ function cleanupPortFile() {
   } catch {}
 }
 
+function emitSessionHistoryChanged(payload: SessionHistoryChangedEvent) {
+  const projectDirs = payload.projectDirs
+    .map((dir) => dir.trim())
+    .filter(Boolean);
+  if (projectDirs.length === 0) {
+    return;
+  }
+
+  sendToWindow(mainWindow, "session-history:changed", {
+    ...payload,
+    projectDirs,
+  });
+}
+
 const HIDDEN_DIRS = new Set([".git"]);
 
 let mainWindow: BrowserWindow | null = null;
-let forceClose = false;
 const ptyManager = new PtyManager();
 const outputBatcher = new OutputBatcher((ptyId, data) => {
   sendToWindow(mainWindow, "terminal:output", ptyId, data);
 });
 const projectScanner = new ProjectScanner();
 const statePersistence = new StatePersistence();
+const snapshotHistory = new SnapshotHistory();
 const gitWatcher = new GitFileWatcher();
 const fileTreeWatcher = new FileTreeWatcher(HIDDEN_DIRS, (dirPath) => {
   sendToWindow(mainWindow, "fs:dir-changed", dirPath);
@@ -165,6 +275,13 @@ const telemetryService = new TelemetryService({
 });
 const agentService = new AgentService();
 const sessionScanner = new SessionScanner();
+const renderDiagnostics = createRenderDiagnosticsLogger(
+  app.getPath("userData"),
+);
+const workspaceSavePaths = new WorkspaceSavePathRegistry((filePath) =>
+  path.resolve(filePath),
+);
+let throttlingCoordinator: RenderThrottlingCoordinator | null = null;
 let hookSocketPath: string | null = null;
 const hookReceiver = new HookReceiver((event) => {
   telemetryService.recordHookEvent(event.terminal_id, event);
@@ -190,15 +307,72 @@ const hookReceiver = new HookReceiver((event) => {
     });
   }
 });
+const taskStore = new PinStore(path.join(TERMCANVAS_DIR, "pins"));
+
+taskStore.on("pin:created", (payload: { pin: unknown; repo: string }) => {
+  sendToWindow(mainWindow, "pin:event", { type: "pin:created", ...payload });
+});
+taskStore.on("pin:updated", (payload: { pin: unknown; repo: string }) => {
+  sendToWindow(mainWindow, "pin:event", { type: "pin:updated", ...payload });
+});
+taskStore.on("pin:removed", (payload: { id: string; repo: string }) => {
+  sendToWindow(mainWindow, "pin:event", { type: "pin:removed", ...payload });
+});
+
 const apiServer = new ApiServer({
   getWindow: () => mainWindow,
   ptyManager,
   projectScanner,
   telemetryService,
+  taskStore,
 });
 
+function openPinPreviewWindow(repo: string, pinId: string): void {
+  const pin = taskStore.get(repo, pinId);
+  if (!pin) {
+    throw new Error(`Pin not found: ${pinId}`);
+  }
+
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 900,
+    useContentSize: true,
+    minWidth: 480,
+    minHeight: 360,
+    show: false,
+    title: pin.title.trim() || "Pin Preview",
+    backgroundColor: "#ffffff",
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
+  });
+
+  let initialUrl: string | null = null;
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
+    return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (event, url) => {
+    if (initialUrl && url === initialUrl) return;
+    event.preventDefault();
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
+  });
+  win.once("ready-to-show", () => {
+    if (!win.isDestroyed()) win.show();
+  });
+
+  const html = buildPinRenderHtml(pin);
+  initialUrl = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+  void win.loadURL(initialUrl);
+}
+
 function createWindow() {
-  forceClose = false;
   const isMac = process.platform === "darwin";
   const isWin = process.platform === "win32";
 
@@ -230,9 +404,16 @@ function createWindow() {
         titleBarStyle: "hidden" as const,
       }),
   });
+  const windowId = mainWindow.id;
+  renderDiagnostics.recordMainEvent("browser_window_created", {
+    isDev,
+    window_id: windowId,
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
     return { action: "deny" };
   });
 
@@ -242,21 +423,104 @@ function createWindow() {
     delete webPreferences.preload;
   });
 
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (!isDev && isReloadShortcutInput(input)) {
+      event.preventDefault();
+      return;
+    }
+
+    if (!isSelectAllShortcutInput(input)) {
+      return;
+    }
+
+    event.preventDefault();
+    mainWindow?.webContents.send("menu:select-all");
+  });
+
   mainWindow.once("ready-to-show", () => {
     mainWindow?.show();
   });
   mainWindow.on("closed", () => {
+    renderDiagnostics.recordMainEvent("browser_window_closed", {
+      window_id: windowId,
+    });
     mainWindow = null;
     rendererReady = false;
   });
   mainWindow.on("focus", () => {
+    renderDiagnostics.recordMainEvent("browser_window_focus", {
+      window_id: windowId,
+      visible: mainWindow?.isVisible() ?? null,
+    });
+    // macOS re-activation can leave compositor-backed sidebar layers stale
+    // until the next input-driven repaint. Force a full redraw on focus so
+    // fixed/overflow-hidden panels repaint immediately.
+    mainWindow?.webContents.invalidate();
     for (const dirPath of fileTreeWatcher.getWatchedDirs()) {
       sendToWindow(mainWindow, "fs:dir-changed", dirPath);
     }
+    // macOS Space switching does not reliably fire `visibilitychange` on the
+    // renderer side, so the renderer's existing recovery path can miss the
+    // return-from-Space transition entirely. Push a lifecycle ping from the
+    // main process (which is never throttled) so the renderer can repaint
+    // its terminals regardless of whether visibilitychange fired.
+    sendToWindow(mainWindow, "tc:lifecycle:visible", {
+      reason: "browser_window_focus",
+      timestamp: Date.now(),
+    });
+  });
+  mainWindow.on("blur", () => {
+    renderDiagnostics.recordMainEvent("browser_window_blur", {
+      window_id: windowId,
+      visible: mainWindow?.isVisible() ?? null,
+    });
+  });
+  mainWindow.on("show", () => {
+    renderDiagnostics.recordMainEvent("browser_window_show", {
+      window_id: windowId,
+    });
+    sendToWindow(mainWindow, "tc:lifecycle:visible", {
+      reason: "browser_window_show",
+      timestamp: Date.now(),
+    });
+  });
+  mainWindow.on("hide", () => {
+    renderDiagnostics.recordMainEvent("browser_window_hide", {
+      window_id: windowId,
+    });
+  });
+  mainWindow.on("minimize", () => {
+    renderDiagnostics.recordMainEvent("browser_window_minimize", {
+      window_id: windowId,
+    });
+  });
+  mainWindow.on("restore", () => {
+    renderDiagnostics.recordMainEvent("browser_window_restore", {
+      window_id: windowId,
+    });
   });
 
   createMenu(mainWindow);
   agentService.setWindow(mainWindow);
+
+  // Disable Chromium's background-occluded throttling whenever there is
+  // active work (PTY output within the last 30s). Idle stays throttled so
+  // battery isn't burned when the user genuinely switched away.
+  if (!throttlingCoordinator) {
+    throttlingCoordinator = new RenderThrottlingCoordinator({
+      target: {
+        setBackgroundThrottling: (allowed) => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.setBackgroundThrottling(allowed);
+          }
+        },
+      },
+      recordDiagnostic: (event) => {
+        renderDiagnostics.recordMainEvent(event.kind, event.data ?? {});
+      },
+    });
+    throttlingCoordinator.start();
+  }
 
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -266,6 +530,10 @@ function createWindow() {
 
   let rendererReady = false;
   mainWindow.webContents.on("did-finish-load", async () => {
+    renderDiagnostics.recordMainEvent("renderer_did_finish_load", {
+      renderer_ready_before_load: rendererReady,
+      window_id: windowId,
+    });
     if (rendererReady) {
       console.warn("[PtyManager] renderer reloaded – destroying orphaned PTYs");
       await ptyManager.destroyAll();
@@ -274,15 +542,16 @@ function createWindow() {
     try {
       const port = await apiServer.start();
       writePortFile(port);
-      console.log(`[TermCanvas API] http://127.0.0.1:${port}`);
+      if (isDev) console.log(`[TermCanvas API] http://127.0.0.1:${port}`);
     } catch (err) {
       console.error("[TermCanvas API] Failed to start:", err);
     }
   });
-  mainWindow.on("close", (e) => {
-    if (forceClose || !mainWindow || !rendererReady) return;
-    e.preventDefault();
-    sendToWindow(mainWindow, "app:before-close");
+  mainWindow.on("close", () => {
+    renderDiagnostics.recordMainEvent("browser_window_close_requested", {
+      renderer_ready: rendererReady,
+      window_id: windowId,
+    });
   });
 }
 
@@ -309,16 +578,20 @@ function setupIpc() {
         terminalType?: string;
         theme?: "dark" | "light";
         workflowId?: string;
-        handoffId?: string;
+        assignmentId?: string;
         repoPath?: string;
       },
     ) => {
       dbg(
         `terminal:create shell=${options.shell ?? "(default)"} args=${JSON.stringify(options.args)} cwd=${options.cwd}`,
       );
+      const cliDir = getCliDir();
       const ptyId = await ptyManager.create({
         ...options,
-        extraPathEntries: [getCliDir()],
+        extraPathEntries: getTerminalExtraPathEntries(
+          cliDir,
+          options.terminalType,
+        ),
         ...(hookSocketPath
           ? { envOverrides: { TERMCANVAS_SOCKET: hookSocketPath } }
           : {}),
@@ -330,11 +603,13 @@ function setupIpc() {
         terminalId,
         worktreePath: options.cwd,
         provider:
-          options.terminalType === "claude" || options.terminalType === "codex"
+          options.terminalType === "claude" ||
+          options.terminalType === "codex" ||
+          options.terminalType === "wuu"
             ? options.terminalType
             : "unknown",
         workflowId: options.workflowId,
-        handoffId: options.handoffId,
+        assignmentId: options.assignmentId,
         repoPath: options.repoPath,
         ptyId,
         shellPid: pid ?? null,
@@ -348,6 +623,7 @@ function setupIpc() {
         ptyManager.captureOutput(ptyId, data);
         telemetryService.recordPtyOutputByPtyId(ptyId, data);
         outputBatcher.push(ptyId, data);
+        throttlingCoordinator?.markActivity("pty");
       });
       ptyManager.onExit(ptyId, (exitCode: number) => {
         dbg(
@@ -452,6 +728,27 @@ function setupIpc() {
   );
 
   ipcMain.handle(
+    "session:find-wuu",
+    (_event, cwd: string, startedAt?: string) => {
+      return findBestWuuSession(cwd, startedAt);
+    },
+  );
+
+  ipcMain.handle(
+    "session:find-kimi",
+    (_event, cwd: string, startedAt?: string) => {
+      return findBestKimiSession(cwd, startedAt);
+    },
+  );
+
+  ipcMain.handle(
+    "session:find-opencode",
+    (_event, cwd: string, startedAt?: string) => {
+      return findBestOpenCodeSession(cwd, startedAt);
+    },
+  );
+
+  ipcMain.handle(
     "session:get-permission-mode",
     (_event, sessionId: string, cwd: string) => {
       return readClaudeSessionPermissionMode(sessionId, cwd);
@@ -473,25 +770,6 @@ function setupIpc() {
       return false;
     },
   );
-
-  ipcMain.handle("session:get-kimi-latest", (_event, cwd: string) => {
-    try {
-      // Kimi stores sessions under ~/.kimi/sessions/{cwd_hash}/{session_uuid}/
-      const sessionsDir = path.join(os.homedir(), ".kimi", "sessions");
-      if (!fs.existsSync(sessionsDir)) return null;
-      const hashDirs = fs.readdirSync(sessionsDir);
-      for (const hashDir of hashDirs.reverse()) {
-        const fullPath = path.join(sessionsDir, hashDir);
-        const uuids = fs.readdirSync(fullPath);
-        if (uuids.length > 0) {
-          return uuids[uuids.length - 1];
-        }
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  });
 
   ipcMain.handle("project:select-directory", async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {
@@ -582,7 +860,7 @@ function setupIpc() {
 
   ipcMain.handle(
     "project:remove-worktree",
-    async (_event, repoPath: string, worktreePath: string) => {
+    async (_event, repoPath: string, worktreePath: string, force?: boolean) => {
       const resolvedRepo = path.resolve(repoPath);
       const resolvedWorktree = path.resolve(worktreePath);
 
@@ -590,12 +868,49 @@ function setupIpc() {
         const { execFile } = await import("child_process");
         const { promisify } = await import("util");
         const execFileAsync = promisify(execFile);
-        await execFileAsync("git", ["worktree", "remove", resolvedWorktree], {
+        // Reuse the shared --force builder so the renderer/IPC path matches
+        // the CLI, hydra, and headless paths exactly. Without --force, git
+        // refuses to remove worktrees containing modified or untracked files
+        // — which is exactly what worker worktrees produce by design.
+        const args = force
+          ? buildGitWorktreeRemoveArgs(resolvedWorktree)
+          : ["worktree", "remove", resolvedWorktree];
+        await execFileAsync("git", args, {
           cwd: resolvedRepo,
           maxBuffer: 10 * 1024 * 1024,
         });
         const worktrees = await projectScanner.listWorktreesAsync(resolvedRepo);
         return { ok: true as const, worktrees };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false as const, error: message };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "project:delete-folder",
+    async (_event, projectPath: string) => {
+      try {
+        const resolved = path.resolve(projectPath);
+        const home = os.homedir();
+        const root = path.parse(resolved).root;
+        // Safety: refuse to delete obviously dangerous paths.
+        if (
+          !path.isAbsolute(resolved) ||
+          resolved === root ||
+          resolved === home ||
+          home.startsWith(resolved + path.sep) ||
+          resolved.split(path.sep).filter(Boolean).length < 2
+        ) {
+          return {
+            ok: false as const,
+            error: `Refusing to delete unsafe path: ${resolved}`,
+          };
+        }
+        const { rm } = await import("fs/promises");
+        await rm(resolved, { recursive: true, force: true });
+        return { ok: true as const };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return { ok: false as const, error: message };
@@ -721,6 +1036,280 @@ function setupIpc() {
     return gitPull(worktreePath);
   });
 
+  // ── New git handlers ──
+
+  ipcMain.handle(
+    "git:amend",
+    async (_event, worktreePath: string, message: string) => {
+      return amendCommit(worktreePath, message);
+    },
+  );
+
+  ipcMain.handle("git:stash-list", async (_event, worktreePath: string) => {
+    try {
+      return await listStashes(worktreePath);
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle(
+    "git:stash-create",
+    async (
+      _event,
+      worktreePath: string,
+      message: string,
+      includeUntracked: boolean,
+    ) => {
+      return createStash(worktreePath, message, includeUntracked);
+    },
+  );
+
+  ipcMain.handle(
+    "git:stash-apply",
+    async (_event, worktreePath: string, index: number) => {
+      return applyStash(worktreePath, index);
+    },
+  );
+
+  ipcMain.handle(
+    "git:stash-pop",
+    async (_event, worktreePath: string, index: number) => {
+      return popStash(worktreePath, index);
+    },
+  );
+
+  ipcMain.handle(
+    "git:stash-drop",
+    async (_event, worktreePath: string, index: number) => {
+      return dropStash(worktreePath, index);
+    },
+  );
+
+  ipcMain.handle(
+    "git:branch-create",
+    async (_event, worktreePath: string, name: string, startPoint?: string) => {
+      return createBranch(worktreePath, name, startPoint);
+    },
+  );
+
+  ipcMain.handle(
+    "git:branch-delete",
+    async (_event, worktreePath: string, name: string, force: boolean) => {
+      return deleteBranch(worktreePath, name, force);
+    },
+  );
+
+  ipcMain.handle(
+    "git:branch-rename",
+    async (_event, worktreePath: string, oldName: string, newName: string) => {
+      return renameBranch(worktreePath, oldName, newName);
+    },
+  );
+
+  ipcMain.handle("git:tag-list", async (_event, worktreePath: string) => {
+    try {
+      return await listTags(worktreePath);
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle(
+    "git:tag-create",
+    async (
+      _event,
+      worktreePath: string,
+      name: string,
+      ref: string,
+      message?: string,
+    ) => {
+      return createTag(worktreePath, name, ref, message);
+    },
+  );
+
+  ipcMain.handle(
+    "git:tag-delete",
+    async (_event, worktreePath: string, name: string) => {
+      return deleteTag(worktreePath, name);
+    },
+  );
+
+  ipcMain.handle("git:remote-list", async (_event, worktreePath: string) => {
+    try {
+      return await listRemotes(worktreePath);
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle(
+    "git:remote-add",
+    async (_event, worktreePath: string, name: string, url: string) => {
+      return addRemote(worktreePath, name, url);
+    },
+  );
+
+  ipcMain.handle(
+    "git:remote-remove",
+    async (_event, worktreePath: string, name: string) => {
+      return removeRemote(worktreePath, name);
+    },
+  );
+
+  ipcMain.handle(
+    "git:remote-rename",
+    async (_event, worktreePath: string, oldName: string, newName: string) => {
+      return renameRemote(worktreePath, oldName, newName);
+    },
+  );
+
+  ipcMain.handle(
+    "git:fetch",
+    async (_event, worktreePath: string, remote?: string) => {
+      return gitFetch(worktreePath, remote);
+    },
+  );
+
+  ipcMain.handle(
+    "git:merge",
+    async (_event, worktreePath: string, ref: string) => {
+      return gitMerge(worktreePath, ref);
+    },
+  );
+
+  ipcMain.handle("git:merge-abort", async (_event, worktreePath: string) => {
+    return gitMergeAbort(worktreePath);
+  });
+
+  ipcMain.handle(
+    "git:rebase",
+    async (_event, worktreePath: string, ref: string) => {
+      return gitRebase(worktreePath, ref);
+    },
+  );
+
+  ipcMain.handle("git:rebase-abort", async (_event, worktreePath: string) => {
+    return gitRebaseAbort(worktreePath);
+  });
+
+  ipcMain.handle(
+    "git:rebase-continue",
+    async (_event, worktreePath: string) => {
+      return gitRebaseContinue(worktreePath);
+    },
+  );
+
+  ipcMain.handle(
+    "git:cherry-pick",
+    async (_event, worktreePath: string, hash: string) => {
+      return gitCherryPick(worktreePath, hash);
+    },
+  );
+
+  ipcMain.handle(
+    "git:cherry-pick-abort",
+    async (_event, worktreePath: string) => {
+      return gitCherryPickAbort(worktreePath);
+    },
+  );
+
+  ipcMain.handle("git:merge-state", async (_event, worktreePath: string) => {
+    return getMergeState(worktreePath);
+  });
+
+  ipcMain.handle(
+    "git:file-diff",
+    async (_event, worktreePath: string, filePath: string, staged: boolean) => {
+      return getFileDiff(worktreePath, filePath, staged);
+    },
+  );
+
+  ipcMain.handle(
+    "git:stage-hunk",
+    async (
+      _event,
+      worktreePath: string,
+      filePath: string,
+      hunkHeader: string,
+    ) => {
+      return stageHunk(worktreePath, filePath, hunkHeader);
+    },
+  );
+
+  ipcMain.handle(
+    "git:unstage-hunk",
+    async (
+      _event,
+      worktreePath: string,
+      filePath: string,
+      hunkHeader: string,
+    ) => {
+      return unstageHunk(worktreePath, filePath, hunkHeader);
+    },
+  );
+
+  ipcMain.handle(
+    "git:blame",
+    async (_event, worktreePath: string, filePath: string) => {
+      return getBlame(worktreePath, filePath);
+    },
+  );
+
+  // ── Search handlers ──
+
+  ipcMain.handle(
+    "search:file-contents",
+    async (_event, query: string, worktreePath?: string) => {
+      try {
+        return await searchFileContents(worktreePath ?? "", query);
+      } catch {
+        return [];
+      }
+    },
+  );
+
+  ipcMain.handle("search:session-contents", async (_event, query: string) => {
+    try {
+      return await searchSessionContents(query);
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle(
+    "search:sessions:list",
+    async (_event, projectDirs: string[]): Promise<SessionSearchEntry[]> => {
+      try {
+        return await listSessionsForProjects(projectDirs ?? []);
+      } catch (err) {
+        // Surface to main-process logs rather than silently returning
+        // an empty list — a bug in listSessionsForProjects used to
+        // look exactly like "no history exists", which made the
+        // `findKimiSessionFiles` missing-import regression in v0.31.0
+        // almost impossible to track down.
+        console.error("[search:sessions:list] failed", err);
+        return [];
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "search:sessions:list-page",
+    async (
+      _event,
+      projectDirs: string[],
+      options: { limit: number; offset?: number },
+    ): Promise<{ entries: SessionSearchEntry[]; total: number }> => {
+      try {
+        return await listSessionsForProjectsPaged(projectDirs ?? [], options);
+      } catch (err) {
+        console.error("[search:sessions:list-page] failed", err);
+        return { entries: [], total: 0 };
+      }
+    },
+  );
+
   ipcMain.handle(
     "session:watch",
     (_event, type: SessionType, sessionId: string, cwd: string) => {
@@ -740,7 +1329,7 @@ function setupIpc() {
       _event,
       input: {
         terminalId: string;
-        provider: "claude" | "codex";
+        provider: "claude" | "codex" | "kimi" | "wuu" | "opencode";
         sessionId: string;
         cwd: string;
         confidence: "strong" | "medium" | "weak";
@@ -758,6 +1347,13 @@ function setupIpc() {
         confidence: input.confidence,
         sessionFile: sessionFile ?? undefined,
       });
+      if (sessionFile) {
+        invalidateSessionIndexForFile(sessionFile);
+        emitSessionHistoryChanged({
+          reason: "session_attached",
+          projectDirs: [input.cwd],
+        });
+      }
       return {
         ok: sessionFile !== null,
         sessionFile,
@@ -766,7 +1362,15 @@ function setupIpc() {
   );
 
   ipcMain.handle("telemetry:detach-session", (_event, terminalId: string) => {
+    const snapshot = telemetryService.getTerminalSnapshot(terminalId);
     telemetryService.detachSessionSource(terminalId);
+    if (snapshot?.session_file) {
+      invalidateSessionIndexForFile(snapshot.session_file);
+    }
+    emitSessionHistoryChanged({
+      reason: "session_detached",
+      projectDirs: snapshot?.worktree_path ? [snapshot.worktree_path] : [],
+    });
   });
 
   ipcMain.handle(
@@ -776,7 +1380,7 @@ function setupIpc() {
       input: {
         terminalId: string;
         worktreePath?: string;
-        provider?: "claude" | "codex" | "unknown";
+        provider?: "claude" | "codex" | "wuu" | "unknown";
         ptyId?: number | null;
         shellPid?: number | null;
       },
@@ -810,12 +1414,36 @@ function setupIpc() {
     },
   );
 
+  ipcMain.handle(
+    "diagnostics:record-render-event",
+    (_event, input: RenderDiagnosticEventInput) => {
+      renderDiagnostics.recordRendererEvent(input);
+    },
+  );
+
+  ipcMain.handle("diagnostics:get-render-log-info", () => {
+    return renderDiagnostics.getLogInfo();
+  });
+
   ipcMain.handle("hook:get-socket-path", () => hookSocketPath);
   ipcMain.handle("hook:get-health", () => hookReceiver.getHealth());
 
   ipcMain.handle("sessions:load-replay", async (_event, filePath: string) => {
     return sessionScanner.loadReplay(filePath);
   });
+
+  ipcMain.handle(
+    "sessions:fork",
+    async (
+      _event,
+      sourceFilePath: string,
+      turnIndex: number,
+      targetProvider?: "claude" | "codex",
+    ) => {
+      const { forkSession } = await import("./session-fork.js");
+      return forkSession(sourceFilePath, turnIndex, targetProvider);
+    },
+  );
 
   ipcMain.handle("state:load", () => {
     return statePersistence.load();
@@ -824,6 +1452,30 @@ function setupIpc() {
   ipcMain.handle("state:save", (_event, state: unknown) => {
     statePersistence.save(state);
   });
+
+  ipcMain.handle("snapshots:list", () => {
+    return snapshotHistory.list();
+  });
+
+  ipcMain.handle("snapshots:read", (_event, id: string) => {
+    return snapshotHistory.read(id);
+  });
+
+  ipcMain.handle(
+    "snapshots:append",
+    (
+      _event,
+      args: {
+        savedAt: number;
+        terminalCount: number;
+        projectCount: number;
+        label?: string;
+        body: unknown;
+      },
+    ) => {
+      return snapshotHistory.append(args);
+    },
+  );
 
   ipcMain.handle("memory:scan", async (_event, worktreePath: string) => {
     const { getMemoryDirForWorktree, scanMemoryDir } =
@@ -866,14 +1518,15 @@ function setupIpc() {
       filters: [{ name: "TermCanvas Workspace", extensions: ["termcanvas"] }],
     });
     if (result.canceled || !result.filePath) return null;
-    fs.writeFileSync(result.filePath, data, "utf-8");
-    return result.filePath;
+    const filePath = workspaceSavePaths.register(result.filePath);
+    fs.writeFileSync(filePath, data, "utf-8");
+    return filePath;
   });
 
   ipcMain.handle(
     "workspace:save-to-path",
     (_event, filePath: string, data: string) => {
-      fs.writeFileSync(filePath, data, "utf-8");
+      fs.writeFileSync(workspaceSavePaths.assertAllowed(filePath), data, "utf-8");
     },
   );
 
@@ -900,6 +1553,10 @@ function setupIpc() {
     ".gif",
     ".svg",
     ".webp",
+    ".bmp",
+    ".ico",
+    ".avif",
+    ".apng",
   ]);
   const MIME_MAP_FS: Record<string, string> = {
     ".png": "image/png",
@@ -908,8 +1565,17 @@ function setupIpc() {
     ".gif": "image/gif",
     ".svg": "image/svg+xml",
     ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".avif": "image/avif",
+    ".apng": "image/apng",
   };
+  // 512 KB is fine for text files but tiny for images — a typical
+  // screenshot is 1-2 MB and GIFs easily hit 5-10 MB. Use a separate
+  // larger cap for images so clicking an image in the file tree
+  // isn't silently blocked most of the time.
   const MAX_FILE_SIZE = 512 * 1024;
+  const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
 
   ipcMain.handle("fs:list-dir", (_event, dirPath: string) => {
     try {
@@ -930,13 +1596,19 @@ function setupIpc() {
   ipcMain.handle("fs:read-file", (_event, filePath: string) => {
     try {
       const stat = fs.statSync(filePath);
-      if (stat.size > MAX_FILE_SIZE) {
+      const ext = path.extname(filePath).toLowerCase();
+      const isImage = IMAGE_EXTS_FS.has(ext);
+      // Image files get a 10-MB ceiling since a 5-MB GIF or
+      // 2-MB screenshot is perfectly normal and rejecting those
+      // just makes the editor look broken. Text keeps the tight
+      // 512-KB cap.
+      const ceiling = isImage ? MAX_IMAGE_SIZE : MAX_FILE_SIZE;
+      if (stat.size > ceiling) {
         const sizeMB = (stat.size / (1024 * 1024)).toFixed(1);
         return { error: "too-large", size: `${sizeMB} MB` };
       }
 
-      const ext = path.extname(filePath).toLowerCase();
-      if (IMAGE_EXTS_FS.has(ext)) {
+      if (isImage) {
         const buf = fs.readFileSync(filePath);
         const mime = MIME_MAP_FS[ext] ?? "image/png";
         return {
@@ -988,6 +1660,12 @@ function setupIpc() {
     fs.renameSync(oldPath, newPath);
   });
 
+  ipcMain.handle("fs:move", (_event, oldPath: string, newPath: string) => {
+    if (!oldPath || !newPath) throw new Error("Invalid path");
+    if (fs.existsSync(newPath)) throw new Error("Destination already exists");
+    fs.renameSync(oldPath, newPath);
+  });
+
   ipcMain.handle("fs:delete", (_event, targetPath: string) => {
     fs.rmSync(targetPath, { recursive: true, force: true });
   });
@@ -1020,14 +1698,107 @@ function setupIpc() {
     fileTreeWatcher.unwatchAll();
   });
 
+  ipcMain.handle("fs:list-all-files", async (_event, dirPath: string) => {
+    const { execFile } = await import("child_process");
+    let trackedOutput: string;
+    try {
+      // Tracked + non-ignored untracked. Small (~1k paths in typical repos)
+      // so the tree can paint immediately. Ignored files are fetched
+      // separately via fs:list-ignored-files and streamed into the tree by
+      // the renderer's chunked batch-add so the UI stays responsive on
+      // huge node_modules trees.
+      trackedOutput = await new Promise<string>((resolve, reject) => {
+        execFile(
+          "git",
+          ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+          { cwd: dirPath, timeout: 10000, maxBuffer: 64 * 1024 * 1024 },
+          (err, stdout) => (err ? reject(err) : resolve(stdout)),
+        );
+      });
+    } catch {
+      // Non-git repo: walk the directory tree recursively
+      const paths: string[] = [];
+      const visited = new Set<string>();
+      // Returns number of file entries added from this subtree. When a
+      // directory subtree is entirely empty, emit the directory itself with a
+      // trailing "/" so @pierre/trees can still display it.
+      const collect = (dir: string, prefix: string): number => {
+        let added = 0;
+        try {
+          const realDir = fs.realpathSync(dir);
+          if (visited.has(realDir)) return 0;
+          visited.add(realDir);
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (HIDDEN_DIRS.has(entry.name)) continue;
+            const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+            if (entry.isDirectory()) {
+              added += collect(path.join(dir, entry.name), relPath);
+            } else {
+              paths.push(relPath);
+              added++;
+            }
+          }
+          if (added === 0 && prefix) paths.push(`${prefix}/`);
+        } catch (err) {
+          console.error(`[fs:list-all-files] failed to read ${dir}:`, err);
+        }
+        return added;
+      };
+      collect(dirPath, "");
+      return { type: "dir" as const, paths };
+    }
+
+    return {
+      type: "git" as const,
+      paths: parseNulSeparatedGitPaths(trackedOutput),
+    };
+  });
+
+  ipcMain.handle("fs:list-ignored-files", async (_event, dirPath: string) => {
+    const { execFile } = await import("child_process");
+    const runGit = (args: string[]) =>
+      new Promise<string>((resolve, reject) => {
+        execFile(
+          "git",
+          args,
+          { cwd: dirPath, timeout: 10000, maxBuffer: 64 * 1024 * 1024 },
+          (err, out) => (err ? reject(err) : resolve(out)),
+        );
+      });
+    try {
+      const [filesOutput, dirsOutput] = await Promise.all([
+        runGit(["ls-files", "-z", "--others", "--ignored", "--exclude-standard"]),
+        runGit([
+          "ls-files",
+          "-z",
+          "--others",
+          "--ignored",
+          "--exclude-standard",
+          "--directory",
+        ]),
+      ]);
+      return [
+        ...new Set([
+          ...parseNulSeparatedGitPaths(dirsOutput),
+          ...parseNulSeparatedGitPaths(filesOutput),
+        ]),
+      ];
+    } catch (err) {
+      console.warn(`[fs:list-ignored-files] failed:`, err);
+      return [] as string[];
+    }
+  });
+
   ipcMain.handle("cli:is-registered", () => isCliRegistered(getCliDir()));
   ipcMain.handle("cli:register", () => {
-    const ok = registerCli(getCliDir());
-    if (ok) {
-      writeCliIntegrationState({ autoRegister: true });
-      installSkill();
+    const cliOk = registerCli(getCliDir());
+    if (!cliOk) {
+      return { ok: false, skillInstalled: false };
     }
-    return ok;
+    writeCliIntegrationState({ autoRegister: true });
+    const skillInstalled = installSkill();
+    return { ok: true, skillInstalled };
   });
   ipcMain.handle("cli:unregister", () => {
     const ok = unregisterCli(getCliDir());
@@ -1140,6 +1911,22 @@ function setupIpc() {
     return result;
   });
 
+  ipcMain.handle(
+    "usage:query-range",
+    async (_event, startDate: string, endDate: string) => {
+      const startedAt = Date.now();
+      const result = await collectUsageRange(startDate, endDate);
+      perfLog("usage:query-range", {
+        startDate,
+        endDate,
+        ms: Date.now() - startedAt,
+        sessions: result.sessions,
+        totalCost: result.totalCost,
+      });
+      return result;
+    },
+  );
+
   ipcMain.handle("usage:heatmap", async () => {
     const startedAt = Date.now();
     const result = await collectHeatmapData();
@@ -1153,6 +1940,13 @@ function setupIpc() {
   ipcMain.handle("usage:query-cloud", async (_event, dateStr: string) => {
     return await queryCloudUsage(dateStr);
   });
+
+  ipcMain.handle(
+    "usage:query-range-cloud",
+    async (_event, startDate: string, endDate: string) => {
+      return await queryCloudUsageRange(startDate, endDate);
+    },
+  );
 
   ipcMain.handle("usage:heatmap-cloud", async () => {
     return await queryCloudHeatmap();
@@ -1365,26 +2159,6 @@ function setupIpc() {
     }
   });
 
-  ipcMain.on(
-    "app:close-confirmed",
-    async (_event, options?: { installUpdate?: boolean }) => {
-      outputBatcher.dispose();
-      await ptyManager.destroyAll();
-      gitWatcher.unwatchAll();
-      fileTreeWatcher.unwatchAll();
-      sessionWatcher.unwatchAll();
-      forceClose = true;
-      if (mainWindow) {
-        mainWindow.close();
-      }
-      if (options?.installUpdate) {
-        installDownloadedUpdate();
-        return;
-      }
-      app.quit();
-    },
-  );
-
   ipcMain.handle(
     "agent:send",
     async (
@@ -1455,6 +2229,153 @@ function setupIpc() {
     }
     return safeStorage.decryptString(Buffer.from(base64, "base64"));
   });
+
+  ipcMain.handle("pin:list", (_event, repo: string) => {
+    return taskStore.list(repo);
+  });
+
+  ipcMain.handle(
+    "pin:create",
+    (_event, input: Parameters<typeof taskStore.create>[0]) => {
+      return taskStore.create(input);
+    },
+  );
+
+  ipcMain.handle(
+    "pin:update",
+    (
+      _event,
+      repo: string,
+      id: string,
+      patch: Parameters<typeof taskStore.update>[2],
+    ) => {
+      return taskStore.update(repo, id, patch);
+    },
+  );
+
+  ipcMain.handle("pin:remove", (_event, repo: string, id: string) => {
+    taskStore.remove(repo, id);
+  });
+
+  ipcMain.handle("pin:open-preview", (_event, repo: string, id: string) => {
+    openPinPreviewWindow(repo, id);
+  });
+
+  ipcMain.handle(
+    "pin:save-attachment",
+    (
+      _event,
+      repo: string,
+      id: string,
+      fileName: string,
+      data: ArrayBuffer | Uint8Array,
+    ) => {
+      const buffer = Buffer.from(
+        data instanceof Uint8Array ? data : new Uint8Array(data),
+      );
+      return taskStore.saveAttachment(repo, id, fileName, buffer);
+    },
+  );
+
+  // Inject a pin's body + image attachments into a terminal via the existing
+  // composer-submit pipeline. We deliberately do not mutate pin.status here:
+  // dispatching the same pin to multiple terminals is a supported flow, and
+  // status changes stay manual.
+  ipcMain.handle(
+    "pin:dispatch-to-terminal",
+    async (
+      _event,
+      repo: string,
+      pinId: string,
+      target: {
+        terminalId: string;
+        ptyId: number;
+        terminalType: ComposerSupportedTerminalType;
+        worktreePath: string;
+      },
+    ) => {
+      const pin = taskStore.get(repo, pinId);
+      if (!pin) {
+        return {
+          ok: false,
+          code: "internal-error" as const,
+          stage: "validate" as const,
+          error: `Pin not found: ${pinId}`,
+          detail: `Pin not found: ${pinId}`,
+        };
+      }
+
+      if (!ptyManager.getPid(target.ptyId)) {
+        return {
+          ok: false,
+          code: "target-not-running" as const,
+          stage: "target" as const,
+          error: "Target terminal is not running.",
+          detail: "Target terminal is not running.",
+        };
+      }
+
+      const { text, images } = await buildPinComposerPayload(
+        pin,
+        taskStore.attachmentsDir(repo, pinId),
+      );
+
+      // Paste-only — fill the agent's input buffer with the title + body
+      // (and stage attachments) but leave submission to the user. They
+      // review the prompt in context, edit if needed, and hit Enter
+      // themselves.
+      const request: ComposerSubmitRequest = {
+        terminalId: target.terminalId,
+        ptyId: target.ptyId,
+        terminalType: target.terminalType,
+        worktreePath: target.worktreePath,
+        text,
+        images,
+        submit: false,
+      };
+
+      try {
+        const result = await submitComposerRequest(
+          request,
+          createDefaultComposerSubmitDeps(
+            process.platform as "darwin" | "win32" | "linux",
+            dataUrlToPngBuffer,
+            (ptyId: number, data: string) => {
+              ptyManager.write(ptyId, data);
+            },
+          ),
+        );
+
+        if (!result.ok) {
+          console.error("[Pin] Dispatch failed:", {
+            pinId,
+            terminalId: target.terminalId,
+            ptyId: target.ptyId,
+            terminalType: target.terminalType,
+            stage: result.stage,
+            code: result.code,
+            detail: result.detail ?? result.error,
+          });
+        }
+
+        return result;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error("[Pin] Dispatch crashed:", {
+          pinId,
+          terminalId: target.terminalId,
+          detail,
+        });
+        return {
+          ok: false,
+          code: "internal-error" as const,
+          stage: "submit" as const,
+          error: detail,
+          detail,
+        };
+      }
+    },
+  );
 }
 
 function getCliDir(): string {
@@ -1472,6 +2393,7 @@ function dataUrlToPngBuffer(dataUrl: string): Buffer {
 }
 
 const CLI_NAMES = ["termcanvas", "hydra", "browse"];
+const AGENT_SHIM_NAMES = ["codex", "claude"];
 
 function ensureCliLinks(): void {
   const cliDir = getCliDir();
@@ -1479,6 +2401,15 @@ function ensureCliLinks(): void {
 
   for (const name of CLI_NAMES) {
     const jsFile = path.join(cliDir, `${name}.js`);
+    try {
+      ensureCliLauncher(jsFile);
+    } catch {}
+  }
+
+  const shimDir = getAgentShimDir(cliDir);
+  if (!fs.existsSync(shimDir)) return;
+  for (const name of AGENT_SHIM_NAMES) {
+    const jsFile = path.join(shimDir, `${name}.js`);
     try {
       ensureCliLauncher(jsFile);
     } catch {}
@@ -1514,10 +2445,42 @@ if (process.defaultApp) {
 }
 
 app.whenReady().then(async () => {
+  renderDiagnostics.recordMainEvent("app_ready", {
+    app_version: app.getVersion(),
+    isDev,
+    platform: process.platform,
+    user_data_path: app.getPath("userData"),
+  });
+
+  // Serve pin attachment images. Path-traversal guard: resolved disk path
+  // must stay under TERMCANVAS_DIR/pins/. Renderer constructs URLs as
+  // tc-attachment://local/<abs-path>; handler decodes pathname back to a
+  // real path and streams the file via Electron's net.fetch.
+  const ATTACHMENTS_ROOT = path.join(TERMCANVAS_DIR, "pins");
+  protocol.handle("tc-attachment", async (request) => {
+    try {
+      const url = new URL(request.url);
+      const requestedPath = decodeURIComponent(url.pathname);
+      const resolved = path.resolve(requestedPath);
+      if (
+        resolved !== ATTACHMENTS_ROOT &&
+        !resolved.startsWith(ATTACHMENTS_ROOT + path.sep)
+      ) {
+        return new Response("forbidden", { status: 403 });
+      }
+      return await net.fetch(pathToFileURL(resolved).toString());
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return new Response(message, { status: 500 });
+    }
+  });
+
   app.on("web-contents-created", (_event, contents) => {
     if (contents.getType() === "webview") {
       contents.setWindowOpenHandler(({ url }) => {
-        shell.openExternal(url);
+        if (isSafeExternalUrl(url)) {
+          void shell.openExternal(url);
+        }
         return { action: "deny" };
       });
       // Strip Electron/app identifiers from UA to avoid being blocked by sites
@@ -1535,10 +2498,25 @@ app.whenReady().then(async () => {
     hookSocketPath = null;
     console.error("[HookReceiver] Startup disabled:", error);
   }
+  let previousSessionHistoryScope = new Map<string, string>();
   sessionScanner.start((sessions) => {
+    const nextSessionHistoryScope = buildSessionHistoryScope(sessions);
+    const { projectDirs, invalidatedFilePaths } = diffSessionHistoryScopes(
+      previousSessionHistoryScope,
+      nextSessionHistoryScope,
+    );
+    previousSessionHistoryScope = nextSessionHistoryScope;
+    for (const filePath of invalidatedFilePaths) {
+      invalidateSessionIndexForFile(filePath);
+    }
+
     const managed = telemetryService.getManagedSessions();
     const merged = mergeAndDedupeSessions(managed, sessions);
     sendToWindow(mainWindow, "sessions:list-changed", merged);
+    emitSessionHistoryChanged({
+      reason: "session_scan_changed",
+      projectDirs,
+    });
   });
   ensureCliLinks();
   syncCliIntegrationOnStartup({
@@ -1604,13 +2582,40 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on("will-quit", () => {
-  hookReceiver.stop();
-  stopAutoUpdater();
-  apiServer.stop();
-  cleanupPortFile();
+let isQuitting = false;
+app.on("will-quit", (event) => {
+  if (isQuitting) return;
+  event.preventDefault();
+  isQuitting = true;
+  renderDiagnostics.recordMainEvent("app_will_quit", {
+    platform: process.platform,
+  });
+  void (async () => {
+    outputBatcher.dispose();
+    await ptyManager.destroyAll();
+    gitWatcher.unwatchAll();
+    fileTreeWatcher.unwatchAll();
+    sessionWatcher.unwatchAll();
+    hookReceiver.stop();
+    stopAutoUpdater();
+    apiServer.stop();
+    cleanupPortFile();
+    app.quit();
+  })();
+});
+
+// macOS convention: keep the process alive in the dock when the last window
+// closes; the `activate` handler above re-creates a window when the user
+// clicks the dock icon. Other platforms still quit. The preference is set
+// from the renderer via `app:set-quit-on-last-window-closed` and lets the
+// user opt out of the macOS behavior.
+let quitOnLastWindowClosed = false;
+ipcMain.on("app:set-quit-on-last-window-closed", (_event, value: unknown) => {
+  quitOnLastWindowClosed = value === true;
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  if (process.platform !== "darwin" || quitOnLastWindowClosed) {
+    app.quit();
+  }
 });

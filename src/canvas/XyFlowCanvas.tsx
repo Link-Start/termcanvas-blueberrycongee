@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
-  PanOnScrollMode,
   ReactFlow,
   ReactFlowProvider,
   useNodesState,
+  useReactFlow,
   type OnMove,
   type NodeMouseHandler,
   type OnNodeDrag,
@@ -12,25 +12,33 @@ import {
 } from "@xyflow/react";
 import {
   addProjectFromDirectoryPath,
-  activateProjectInScene,
-  activateWorktreeInScene,
   clearSceneFocusAndSelection,
   promptAndAddProjectToScene,
 } from "./sceneCommands";
-import {
-  getRenderableTerminalLayouts,
-  getStashedTerminalIds,
-} from "./sceneState";
+import { CanvasDragoverCue } from "./CanvasDragoverCue";
+import { CanvasEmptyState } from "../components/CanvasEmptyState";
+import { useCanvasDragOver } from "./useCanvasDragOver";
+import { getStashedTerminalIds } from "./sceneState";
 import { useProjectStore } from "../stores/projectStore";
 import { useCanvasStore } from "../stores/canvasStore";
+import { usePinStore } from "../stores/pinStore";
 import { useDrawingStore } from "../stores/drawingStore";
+import { useCanvasToolStore } from "../stores/canvasToolStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
+import { useSidebarDragStore } from "../stores/sidebarDragStore";
+import {
+  PANEL_TRANSITION_DURATION_MS,
+  PANEL_TRANSITION_EASING_CSS,
+} from "../utils/panelAnimation";
 import { useT } from "../i18n/useT";
 import { FamilyTreeOverlay } from "../components/FamilyTreeOverlay";
+import { FocusCaretOverlay } from "../components/FocusCaretOverlay";
 import { BoxSelectOverlay } from "./BoxSelectOverlay";
 import { CanvasCardLayer } from "./CanvasCardLayer";
 import { DrawingLayer } from "./DrawingLayer";
+import { PetOverlay } from "../pet/PetOverlay";
 import { useBoxSelect } from "../hooks/useBoxSelect";
+import { useTrackpadSwipeFocus } from "./trackpadSwipeFocus";
 import {
   publishTerminalGeometry,
   unpublishTerminalGeometry,
@@ -43,18 +51,23 @@ import {
 } from "../terminal/terminalRuntimeStore";
 import { fromFlowViewport, toFlowViewport } from "./viewportAdapter";
 import { buildCanvasFlowNodes } from "./nodeProjection";
-import { useTileDimensionsStore } from "../stores/tileDimensionsStore";
 import { xyflowNodeTypes, type CanvasFlowNode } from "./xyflowNodes";
 import {
   getCanvasLeftInset,
   rectIntersectsCanvasViewport,
 } from "./viewportBounds";
 import { clampScale, zoomAtClientPoint } from "./viewportZoom";
-import { WT_PAD, WT_TITLE_H, PROJ_PAD, PROJ_TITLE_H } from "../layout";
-import { getVisibleWorktreeTerminals } from "../utils/worktreeLayout";
+import { resolveCollisions } from "./collisionResolver";
+import { WorktreeLabelLayer } from "./WorktreeLabelLayer";
+import { ClusterLinkLayer } from "./ClusterLinkLayer";
+import { SpatialWaypointsLayer } from "./SpatialWaypointsLayer";
+import { ContextMenu } from "../components/ContextMenu";
+import { createTerminalInScene } from "../actions/terminalSceneActions";
+import type { TerminalType } from "../types";
 
 const EMPTY_EDGES: never[] = [];
-const WHEEL_ZOOM_SENSITIVITY = 0.002;
+const WHEEL_ZOOM_SENSITIVITY = 0.005;
+const SNAP_GRID: [number, number] = [10, 10];
 
 function normalizeWheelDelta(event: React.WheelEvent): number {
   switch (event.deltaMode) {
@@ -67,28 +80,26 @@ function normalizeWheelDelta(event: React.WheelEvent): number {
   }
 }
 
-function buildProjectLayoutKey(
+/**
+ * Build a stable cache key for the terminal layout.
+ * In the flat canvas model, each terminal's own position and size
+ * determines the layout (no project/worktree container offsets).
+ */
+function buildLayoutKey(
   projects: ReturnType<typeof useProjectStore.getState>["projects"],
 ) {
   return projects
     .map((project) =>
       [
         project.id,
-        project.position.x,
-        project.position.y,
-        project.collapsed ? 1 : 0,
-        project.zIndex ?? 0,
         project.worktrees
           .map((worktree) =>
             [
               worktree.id,
-              worktree.position.x,
-              worktree.position.y,
-              worktree.collapsed ? 1 : 0,
-              getVisibleWorktreeTerminals(worktree)
+              worktree.terminals
                 .map(
-                  (terminal) =>
-                    `${terminal.id}:${terminal.span.cols}x${terminal.span.rows}:${terminal.stashed ? 1 : 0}`,
+                  (t) =>
+                    `${t.id}:${t.x},${t.y},${t.width}x${t.height}:${t.stashed ? 1 : 0}:${t.minimized ? 1 : 0}`,
                 )
                 .join(","),
             ].join(":"),
@@ -100,36 +111,25 @@ function buildProjectLayoutKey(
 }
 
 function TerminalRuntimeLayer({
-  nodes,
   projects,
   viewport,
   rightPanelCollapsed,
+  rightPanelWidth,
   leftPanelCollapsed,
   leftPanelWidth,
+  taskDrawerOpen,
 }: {
-  nodes: CanvasFlowNode[];
   projects: ReturnType<typeof useProjectStore.getState>["projects"];
   viewport: ReturnType<typeof useCanvasStore.getState>["viewport"];
   rightPanelCollapsed: boolean;
+  rightPanelWidth: number;
   leftPanelCollapsed: boolean;
   leftPanelWidth: number;
+  taskDrawerOpen: boolean;
 }) {
   const managedTerminalIdsRef = useRef<Set<string>>(new Set());
   const publishedTerminalIdsRef = useRef<Set<string>>(new Set());
-  const projectedPositions = useMemo(() => {
-    const projectOffsets = new Map<string, { x: number; y: number }>();
-    const worktreeOffsets = new Map<string, { x: number; y: number }>();
 
-    for (const node of nodes) {
-      if (node.type === "project") {
-        projectOffsets.set(node.data.projectId, node.position);
-      } else if (node.type === "worktree") {
-        worktreeOffsets.set(node.data.worktreeId, node.position);
-      }
-    }
-
-    return { projectOffsets, worktreeOffsets };
-  }, [nodes]);
   const runtimeMetas = useMemo(
     () =>
       projects.flatMap((project) =>
@@ -144,48 +144,28 @@ function TerminalRuntimeLayer({
       ),
     [projects],
   );
+
+  // Flat terminal entries — no project/worktree offset calculation needed
   const terminalEntries = useMemo(
     () =>
       projects.flatMap((project) =>
-        project.worktrees.flatMap((worktree) => {
-          const layouts = getRenderableTerminalLayouts(worktree);
-          const projectOffset =
-            projectedPositions.projectOffsets.get(project.id) ??
-            project.position;
-          const worktreeOffset = projectedPositions.worktreeOffsets.get(
-            worktree.id,
-          ) ?? {
-            x: PROJ_PAD + worktree.position.x,
-            y: PROJ_TITLE_H + PROJ_PAD + worktree.position.y,
-          };
-
-          return layouts.map(({ item, terminal }) => {
-            const absoluteRect = {
-              h: item.h,
-              w: item.w,
-              x: projectOffset.x + worktreeOffset.x + WT_PAD + item.x,
-              y:
-                projectOffset.y +
-                worktreeOffset.y +
-                WT_TITLE_H +
-                WT_PAD +
-                item.y,
-            };
-
-            return {
-              absoluteRect,
+        project.worktrees.flatMap((worktree) =>
+          worktree.terminals
+            .filter((t) => !t.stashed)
+            .map((terminal) => ({
+              absoluteRect: {
+                x: terminal.x,
+                y: terminal.y,
+                w: terminal.width,
+                h: terminal.height,
+              },
               project,
               terminal,
               worktree,
-            };
-          });
-        }),
+            })),
+        ),
       ),
-    [
-      projects,
-      projectedPositions.projectOffsets,
-      projectedPositions.worktreeOffsets,
-    ],
+    [projects],
   );
 
   useEffect(() => {
@@ -199,7 +179,10 @@ function TerminalRuntimeLayer({
     const stashedIds = getStashedTerminalIds(projects);
     for (const terminalId of managedTerminalIdsRef.current) {
       if (!nextTerminalIds.has(terminalId) && !stashedIds.has(terminalId)) {
-        destroyTerminalRuntime(terminalId);
+        destroyTerminalRuntime(terminalId, {
+          caller: "TerminalRuntimeLayer.runtimeMetasEffect",
+          reason: "terminal_removed_from_runtime_metas",
+        });
       }
     }
 
@@ -210,10 +193,6 @@ function TerminalRuntimeLayer({
     const nextTerminalIds = new Set<string>();
 
     for (const entry of terminalEntries) {
-      if (entry.project.collapsed || entry.worktree.collapsed) {
-        continue;
-      }
-
       nextTerminalIds.add(entry.terminal.id);
       publishTerminalGeometry({
         h: entry.absoluteRect.h,
@@ -244,29 +223,38 @@ function TerminalRuntimeLayer({
       for (const worktree of project.worktrees) {
         for (const terminal of worktree.terminals) {
           if (!visibleEntryIds.has(terminal.id)) {
-            setTerminalRuntimeMode(terminal.id, "parked");
+            setTerminalRuntimeMode(terminal.id, "parked", {
+              caller: "TerminalRuntimeLayer.visibilityEffect",
+              reason: "terminal_missing_from_visible_entries",
+            });
           }
         }
       }
     }
 
     for (const entry of terminalEntries) {
-      const visible =
-        !entry.project.collapsed &&
-        !entry.worktree.collapsed &&
-        rectIntersectsCanvasViewport(
-          entry.absoluteRect,
-          viewport,
-          rightPanelCollapsed,
-          leftPanelCollapsed,
-          leftPanelWidth,
-        );
+      const visible = rectIntersectsCanvasViewport(
+        entry.absoluteRect,
+        viewport,
+        rightPanelCollapsed,
+        leftPanelCollapsed,
+        leftPanelWidth,
+        rightPanelWidth,
+        taskDrawerOpen,
+      );
       setTerminalRuntimeMode(
         entry.terminal.id,
         resolveTerminalMountMode({
           focused: entry.terminal.focused,
           visible,
         }),
+        {
+          caller: "TerminalRuntimeLayer.visibilityEffect",
+          detail: {
+            visible,
+          },
+          reason: "viewport_visibility_recomputed",
+        },
       );
     }
   }, [
@@ -274,6 +262,8 @@ function TerminalRuntimeLayer({
     leftPanelWidth,
     projects,
     rightPanelCollapsed,
+    rightPanelWidth,
+    taskDrawerOpen,
     terminalEntries,
     viewport,
   ]);
@@ -281,7 +271,10 @@ function TerminalRuntimeLayer({
   useEffect(
     () => () => {
       for (const terminalId of managedTerminalIdsRef.current) {
-        destroyTerminalRuntime(terminalId);
+        destroyTerminalRuntime(terminalId, {
+          caller: "TerminalRuntimeLayer.cleanup",
+          reason: "terminal_runtime_layer_unmount",
+        });
       }
 
       for (const terminalId of publishedTerminalIdsRef.current) {
@@ -305,23 +298,92 @@ function XyFlowCanvasInner() {
     (state) => state.leftPanelCollapsed,
   );
   const leftPanelWidth = useCanvasStore((state) => state.leftPanelWidth);
+  const rightPanelWidth = useCanvasStore((state) => state.rightPanelWidth);
+  const taskDrawerOpen = usePinStore(
+    (state) => state.openProjectPath !== null,
+  );
   const projects = useProjectStore((state) => state.projects);
   const drawingEnabled = usePreferencesStore((state) => state.drawingEnabled);
+  const petEnabled = usePreferencesStore((state) => state.petEnabled);
+  const activityHeatmapEnabled = usePreferencesStore(
+    (state) => state.activityHeatmapEnabled,
+  );
   const animationBlur = usePreferencesStore((state) => state.animationBlur);
   const drawingTool = useDrawingStore((state) => state.tool);
+  const canvasTool = useCanvasToolStore((state) => state.tool);
+  const spaceHeld = useCanvasToolStore((state) => state.spaceHeld);
   const { handleMouseDown: handleBoxSelectMouseDown } = useBoxSelect();
-  const projectLayoutKey = useMemo(
-    () => buildProjectLayoutKey(projects),
-    [projects],
+  const layoutKey = useMemo(() => buildLayoutKey(projects), [projects]);
+  const leftOffset = getCanvasLeftInset(
+    leftPanelCollapsed,
+    leftPanelWidth,
+    taskDrawerOpen,
   );
-  const tileW = useTileDimensionsStore((s) => s.w);
-  const tileH = useTileDimensionsStore((s) => s.h);
-  const leftOffset = getCanvasLeftInset(leftPanelCollapsed, leftPanelWidth);
+  const sidebarDragging = useSidebarDragStore((s) => s.active);
   const isDrawing = drawingEnabled && drawingTool !== "select";
-  // Keep local drag state stable across focus/status/session churn in projectStore.
+  const isPanMode = canvasTool === "hand" || spaceHeld;
+  const [isPanning, setIsPanning] = useState(false);
+  const previousAnimatingRef = useRef(isAnimating);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+  useTrackpadSwipeFocus(canvasContainerRef);
+
+  const reactFlow = useReactFlow();
+  const [contextMenu, setContextMenu] = useState<{
+    clientX: number;
+    clientY: number;
+    flowX: number;
+    flowY: number;
+  } | null>(null);
+
+  const handlePaneContextMenu = useCallback(
+    (event: React.MouseEvent | MouseEvent) => {
+      event.preventDefault();
+      const flow = reactFlow.screenToFlowPosition({
+        x: event.clientX,
+        y: event.clientY,
+      });
+      setContextMenu({
+        clientX: event.clientX,
+        clientY: event.clientY,
+        flowX: flow.x,
+        flowY: flow.y,
+      });
+    },
+    [reactFlow],
+  );
+
+  const handleContextMenuPick = useCallback(
+    (type: TerminalType) => {
+      if (!contextMenu) return;
+      const {
+        focusedProjectId,
+        focusedWorktreeId,
+        projects: currentProjects,
+      } = useProjectStore.getState();
+      let projectId = focusedProjectId;
+      let worktreeId = focusedWorktreeId;
+      if (!projectId || !worktreeId) {
+        const fallbackProject = currentProjects[0];
+        const fallbackWorktree = fallbackProject?.worktrees[0];
+        if (!fallbackProject || !fallbackWorktree) {
+          return;
+        }
+        projectId = fallbackProject.id;
+        worktreeId = fallbackWorktree.id;
+      }
+      createTerminalInScene({
+        projectId,
+        worktreeId,
+        type,
+        position: { x: contextMenu.flowX, y: contextMenu.flowY },
+      });
+    },
+    [contextMenu],
+  );
+
   const projectedNodes = useMemo(
     () => buildCanvasFlowNodes(projects),
-    [projectLayoutKey, tileW, tileH],
+    [layoutKey],
   );
   const [nodes, setNodes, onNodesChange] =
     useNodesState<CanvasFlowNode>(projectedNodes);
@@ -362,16 +424,41 @@ function XyFlowCanvasInner() {
     [],
   );
 
-  const handleMove = useCallback<OnMove>((_event, nextViewport) => {
-    useCanvasStore
-      .getState()
-      .syncViewportFromRenderer(fromFlowViewport(nextViewport));
-  }, []);
+  const handleMove = useCallback<OnMove>(
+    (_event, nextViewport) => {
+      const vp = fromFlowViewport(nextViewport);
+      const snapped = {
+        x: Math.round(vp.x),
+        y: Math.round(vp.y),
+        scale: vp.scale,
+      };
+
+      // Snap viewport translation to integer pixels during pan. When the
+      // transform has fractional coordinates, 1px borders / background dots /
+      // text edges render across sub-pixel boundaries and snap between pixel
+      // grids frame-to-frame. This produces the "stutter" and eye-strain the
+      // user describes as "low grid adhesion". Rounding forces the GPU
+      // compositor to align to physical pixels, eliminating the jitter.
+      if (snapped.x !== vp.x || snapped.y !== vp.y) {
+        reactFlow.setViewport(
+          { x: snapped.x, y: snapped.y, zoom: snapped.scale },
+          { duration: 0 },
+        );
+      }
+
+      useCanvasStore.getState().syncViewportFromRenderer(snapped);
+    },
+    [reactFlow],
+  );
 
   const handleMoveEnd = useCallback<OnMove>((_event, nextViewport) => {
-    useCanvasStore
-      .getState()
-      .commitViewportFromRenderer(fromFlowViewport(nextViewport));
+    const vp = fromFlowViewport(nextViewport);
+    const snapped = {
+      x: Math.round(vp.x),
+      y: Math.round(vp.y),
+      scale: vp.scale,
+    };
+    useCanvasStore.getState().commitViewportFromRenderer(snapped);
   }, []);
 
   const handlePaneClick = useCallback(() => {
@@ -380,65 +467,75 @@ function XyFlowCanvasInner() {
 
   const handleNodeClick = useCallback<NodeMouseHandler<CanvasFlowNode>>(
     (_event, node) => {
-      if (node.type === "project") {
-        activateProjectInScene(node.data.projectId, { bringToFront: true });
-        return;
-      }
-
-      if (node.type === "worktree") {
-        const { projectId, worktreeId } = node.data;
-        activateWorktreeInScene(projectId, worktreeId, { bringToFront: true });
-      }
+      // Space-held panning is a transient override on top of whatever
+      // tool is active — a click that lands while Space is down is the
+      // tail of a pan gesture, so suppress the activate. Persistent
+      // Hand mode is different: clicking a terminal there is the user's
+      // way of getting *into* a terminal without leaving Hand. Without
+      // this distinction the now-default Hand tool can't focus a
+      // worktree by clicking, which made the canvas feel inert.
+      if (spaceHeld) return;
+      const { projectId, worktreeId } = node.data;
+      useProjectStore.getState().setFocusedWorktree(projectId, worktreeId);
     },
-    [],
+    [spaceHeld],
   );
 
-  const handleNodeDragStart = useCallback<OnNodeDrag<CanvasFlowNode>>(
-    (_event, node) => {
-      if (node.type === "project") {
-        useProjectStore.getState().bringToFront(node.data.projectId);
-        return;
-      }
-
-      if (node.type === "worktree") {
-        useProjectStore.getState().bringToFront(node.data.projectId);
-      }
-    },
-    [],
-  );
+  const handleNodeDragStart = useCallback<OnNodeDrag<CanvasFlowNode>>(() => {
+    // No-op in flat canvas — no bringToFront needed
+  }, []);
 
   const handleNodeDragStop = useCallback<OnNodeDrag<CanvasFlowNode>>(
     (_event, node) => {
-      if (node.type === "project") {
-        useProjectStore
-          .getState()
-          .updateProjectPosition(
-            node.data.projectId,
-            node.position.x,
-            node.position.y,
-          );
-        return;
-      }
+      // Write terminal position back to store
+      const { projectId, worktreeId, terminalId } = node.data;
+      const snappedX =
+        Math.round(node.position.x / SNAP_GRID[0]) * SNAP_GRID[0];
+      const snappedY =
+        Math.round(node.position.y / SNAP_GRID[1]) * SNAP_GRID[1];
+      useProjectStore
+        .getState()
+        .updateTerminalPosition(
+          projectId,
+          worktreeId,
+          terminalId,
+          snappedX,
+          snappedY,
+        );
 
-      if (node.type === "worktree") {
-        const { projectId, worktreeId } = node.data;
-        useProjectStore
-          .getState()
-          .updateWorktreePosition(
-            projectId,
-            worktreeId,
-            Math.max(0, node.position.x - PROJ_PAD),
-            Math.max(0, node.position.y - (PROJ_TITLE_H + PROJ_PAD)),
-          );
+      // Resolve collisions after drag
+      const allProjects = useProjectStore.getState().projects;
+      const allRects = allProjects.flatMap((p) =>
+        p.worktrees.flatMap((w) =>
+          w.terminals
+            .filter((t) => !t.stashed)
+            .map((t) => ({
+              id: t.id,
+              x: t.id === terminalId ? snappedX : t.x,
+              y: t.id === terminalId ? snappedY : t.y,
+              width: t.width,
+              height: t.height,
+            })),
+        ),
+      );
+      const resolved = resolveCollisions(allRects, 8, terminalId);
+      const updatePos = useProjectStore.getState().updateTerminalPosition;
+      for (const rect of resolved) {
+        if (rect.id === terminalId) continue;
+        const original = allRects.find((r) => r.id === rect.id);
+        if (original && (original.x !== rect.x || original.y !== rect.y)) {
+          for (const p of allProjects) {
+            for (const w of p.worktrees) {
+              if (w.terminals.some((t) => t.id === rect.id)) {
+                updatePos(p.id, w.id, rect.id, rect.x, rect.y);
+              }
+            }
+          }
+        }
       }
     },
     [],
   );
-
-  const handleDragOver = useCallback((event: React.DragEvent) => {
-    event.preventDefault();
-    event.stopPropagation();
-  }, []);
 
   const handleDrop = useCallback(
     async (event: React.DragEvent) => {
@@ -461,65 +558,156 @@ function XyFlowCanvasInner() {
     [t],
   );
 
+  const { state: dragOverState, handlers: dragOverHandlers } =
+    useCanvasDragOver({ onDrop: handleDrop });
+
   const handleAddProject = useCallback(async () => {
     await promptAndAddProjectToScene(t);
   }, [t]);
 
   const handleWheelCapture = useCallback(
     (event: React.WheelEvent<HTMLDivElement>) => {
-      if (!(event.ctrlKey || event.metaKey)) {
+      const isPinch = event.ctrlKey || event.metaKey;
+
+      // Pinch (Cmd/Ctrl + wheel, or trackpad pinch which Chromium
+      // synthesises as ctrlKey=true): always zoom canvas, regardless of
+      // cursor position. Terminal has no zoom concept.
+      if (isPinch) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const delta = normalizeWheelDelta(event);
+        if (Math.abs(delta) < 0.001) {
+          return;
+        }
+
+        const scaleFactor = Math.exp(-delta * WHEEL_ZOOM_SENSITIVITY);
+        const nextViewport = zoomAtClientPoint({
+          clientX: event.clientX,
+          clientY: event.clientY,
+          leftPanelCollapsed,
+          leftPanelWidth,
+          taskDrawerOpen,
+          nextScale: clampScale(viewport.scale * scaleFactor),
+          viewport,
+        });
+
+        useCanvasStore.getState().setViewport(nextViewport);
         return;
       }
 
-      // Don't zoom the canvas when the pinch/wheel originates inside a
-      // terminal tile (marked with the "nowheel" class).  Without this,
-      // two-finger pinch on a focused terminal still scales the canvas
-      // because the capture-phase handler fires before the event reaches
-      // the terminal's own scroll handling.
+      // Non-pinch wheel: this handler now owns ALL canvas pan, since
+      // React Flow's panOnScroll is disabled. The single exception is
+      // when the cursor is over the xterm rendering area of a *focused*
+      // terminal — that's the only condition under which the terminal
+      // is "active" and gets to consume wheel events as scrollback.
+      // Unfocused terminals are passive elements on the canvas, like
+      // images in Figma; wheel over them pans the canvas.
       const target = event.target;
-      if (target instanceof Element && target.closest(".nowheel")) {
-        return;
+      if (target instanceof Element) {
+        const xtermHost = target.closest(".tc-xterm-host");
+        const tile = xtermHost?.closest("[data-handoff-terminal-id]");
+        if (tile?.getAttribute("data-focused") === "true") {
+          return;
+        }
       }
 
       event.preventDefault();
       event.stopPropagation();
 
-      const delta = normalizeWheelDelta(event);
-      if (Math.abs(delta) < 0.001) {
-        return;
-      }
-
-      const scaleFactor = Math.exp(-delta * WHEEL_ZOOM_SENSITIVITY);
-      const nextViewport = zoomAtClientPoint({
-        clientX: event.clientX,
-        clientY: event.clientY,
-        leftPanelCollapsed,
-        leftPanelWidth,
-        nextScale: clampScale(viewport.scale * scaleFactor),
-        viewport,
+      // Read viewport fresh from the store, not from the closure.
+      // Wheel events fire 60+/s; closure-captured viewport stays stale
+      // until React re-renders, so multiple in-flight events would all
+      // base off the same old position and overwrite each other.
+      const current = useCanvasStore.getState().viewport;
+      // 0.5 matches React Flow's panOnScrollSpeed default. Keeps the
+      // pan speed consistent with what users were used to before this
+      // change, and is what handleMove's snap was tuned for.
+      const PAN_SPEED = 0.5;
+      useCanvasStore.getState().setViewport({
+        ...current,
+        x: Math.round(current.x - event.deltaX * PAN_SPEED),
+        y: Math.round(current.y - event.deltaY * PAN_SPEED),
       });
-
-      useCanvasStore.getState().setViewport(nextViewport);
     },
-    [leftPanelCollapsed, leftPanelWidth, viewport],
+    [leftPanelCollapsed, leftPanelWidth, taskDrawerOpen, viewport],
   );
+
+  const handleContainerMouseDown = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      if (isPanMode && event.button === 0) {
+        setIsPanning(true);
+      }
+      handleBoxSelectMouseDown(event);
+    },
+    [handleBoxSelectMouseDown, isPanMode],
+  );
+
+  useEffect(() => {
+    if (!isPanning) return;
+    const stop = () => setIsPanning(false);
+    window.addEventListener("mouseup", stop);
+    window.addEventListener("blur", stop);
+    return () => {
+      window.removeEventListener("mouseup", stop);
+      window.removeEventListener("blur", stop);
+    };
+  }, [isPanning]);
+
+  // isPanning takes precedence over isPanMode for the cursor: if the
+  // user holds Space, presses the mouse, then releases Space before
+  // mouseup, the gesture is still in flight and the cursor must keep
+  // saying "grabbing". Without this, the cursor snaps back to default
+  // mid-drag.
+  const cursorClass = isDrawing
+    ? "cursor-crosshair"
+    : isPanning
+      ? "cursor-grabbing"
+      : isPanMode
+        ? "cursor-grab"
+        : "";
+
+  // Cursors set on the outer div lose to the `cursor: text !important`
+  // rule that .tc-xterm-host / .xterm enforces inside terminal tiles.
+  // Toggle body classes that the matching CSS overrides target so the
+  // pan cursor wins everywhere on the canvas, not just over empty
+  // pane.
+  useEffect(() => {
+    const body = document.body;
+    body.classList.toggle("tc-canvas-pan-mode", isPanMode || isPanning);
+    body.classList.toggle("tc-canvas-pan-grabbing", isPanning);
+    return () => {
+      body.classList.remove("tc-canvas-pan-mode");
+      body.classList.remove("tc-canvas-pan-grabbing");
+    };
+  }, [isPanMode, isPanning]);
 
   return (
     <div
-      className={`fixed top-0 right-0 bottom-0 overflow-hidden canvas-bg ${isDrawing ? "cursor-crosshair" : ""}`}
-      style={{ left: leftOffset }}
-      onMouseDownCapture={handleBoxSelectMouseDown}
+      ref={canvasContainerRef}
+      className={`fixed top-0 right-0 bottom-0 overflow-hidden canvas-bg ${cursorClass}`}
+      data-activity-heatmap={activityHeatmapEnabled ? "true" : undefined}
+      style={{
+        left: leftOffset,
+        transition: sidebarDragging
+          ? undefined
+          : `left ${PANEL_TRANSITION_DURATION_MS}ms ${PANEL_TRANSITION_EASING_CSS}`,
+      }}
+      onMouseDownCapture={handleContainerMouseDown}
       onWheelCapture={handleWheelCapture}
-      onDragOver={handleDragOver}
-      onDrop={handleDrop}
+      onDragEnter={dragOverHandlers.onDragEnter}
+      onDragOver={dragOverHandlers.onDragOver}
+      onDragLeave={dragOverHandlers.onDragLeave}
+      onDrop={dragOverHandlers.onDrop}
     >
       <TerminalRuntimeLayer
-        nodes={nodes}
         projects={projects}
         viewport={viewport}
         rightPanelCollapsed={rightPanelCollapsed}
+        rightPanelWidth={rightPanelWidth}
         leftPanelCollapsed={leftPanelCollapsed}
         leftPanelWidth={leftPanelWidth}
+        taskDrawerOpen={taskDrawerOpen}
       />
       <ReactFlow
         className="tc-xyflow"
@@ -540,47 +728,98 @@ function XyFlowCanvasInner() {
         onMove={handleMove}
         onMoveEnd={handleMoveEnd}
         onPaneClick={handlePaneClick}
+        onPaneContextMenu={handlePaneContextMenu}
         onNodeClick={handleNodeClick}
         onNodeDragStart={handleNodeDragStart}
         onNodeDragStop={handleNodeDragStop}
         nodesConnectable={false}
+        nodesDraggable={!isPanMode}
         nodesFocusable={false}
         edgesFocusable={false}
         elementsSelectable={false}
         selectNodesOnDrag={false}
-        panOnDrag={[0, 1]}
-        panOnScroll
-        panOnScrollMode={PanOnScrollMode.Free}
+        // In Hand mode (or Space-held), left+middle both pan. In Move
+        // mode, only middle-button pans — the left button is reserved
+        // for marquee on empty canvas (handled by useBoxSelect) and
+        // node drag (handled by React Flow's nodesDraggable).
+        panOnDrag={isPanMode ? [0, 1] : [1]}
+        snapToGrid
+        snapGrid={SNAP_GRID}
         zoomOnScroll={false}
         zoomOnPinch={false}
         minZoom={0.1}
         maxZoom={2}
-        onlyRenderVisibleElements
+        // Runtime park/live policy already downshifts offscreen terminals to
+        // preview mode. Letting React Flow also cull offscreen nodes causes
+        // TerminalTile remount churn during viewport animation and focus
+        // cycling, which in turn destabilizes xterm/WebGL lifecycle.
         preventScrolling
+        proOptions={{ hideAttribution: true }}
       >
-        <Background gap={20} size={1} color="var(--border)" />
+        <Background gap={20} size={2} color="var(--border)" />
       </ReactFlow>
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.clientX}
+          y={contextMenu.clientY}
+          items={[
+            {
+              label: t.canvas_empty_action,
+              onClick: () => {
+                void handleAddProject();
+              },
+            },
+            { type: "separator" },
+            {
+              label: "New Shell",
+              onClick: () => handleContextMenuPick("shell"),
+            },
+            {
+              label: "New Claude",
+              onClick: () => handleContextMenuPick("claude"),
+            },
+            {
+              label: "New Codex",
+              onClick: () => handleContextMenuPick("codex"),
+            },
+            {
+              label: "New Gemini",
+              onClick: () => handleContextMenuPick("gemini"),
+            },
+            {
+              label: "New Lazygit",
+              onClick: () => handleContextMenuPick("lazygit"),
+            },
+          ]}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
+
+      <ClusterLinkLayer />
 
       <BoxSelectOverlay />
       <CanvasCardLayer />
       {drawingEnabled && <DrawingLayer />}
+      {petEnabled && <PetOverlay />}
+
+      <WorktreeLabelLayer />
+
+      <SpatialWaypointsLayer />
 
       <FamilyTreeOverlay />
 
+      <CanvasDragoverCue
+        active={dragOverState.isDragOver}
+        showChip={
+          dragOverState.isDragOver &&
+          dragOverState.isFolderDrop &&
+          projects.length > 0
+        }
+      />
+
       {projects.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <div className="text-center pointer-events-auto">
-            <div className="text-[var(--text-muted)] text-lg font-light mb-4">
-              {t.canvas_empty_title}
-            </div>
-            <button
-              onClick={handleAddProject}
-              className="px-6 py-3 bg-[var(--button-bg)] hover:bg-[var(--button-bg-hover)] text-[var(--button-text)] rounded-lg transition-colors"
-            >
-              {t.canvas_empty_action}
-            </button>
-          </div>
-        </div>
+        <CanvasEmptyState isDragOver={dragOverState.isDragOver} />
       )}
     </div>
   );
@@ -590,6 +829,7 @@ export function XyFlowCanvas() {
   return (
     <ReactFlowProvider>
       <XyFlowCanvasInner />
+      <FocusCaretOverlay />
     </ReactFlowProvider>
   );
 }

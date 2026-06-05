@@ -4,7 +4,6 @@ import { hasPrimaryModifier } from "../hooks/shortcutTarget.ts";
 export interface ShortcutMap {
   addProject: string;
   cycleFocusLevel: string;
-  compactFocusedProject: string;
   newTerminal: string;
   saveWorkspace: string;
   saveWorkspaceAs: string;
@@ -15,16 +14,22 @@ export interface ShortcutMap {
   closeFocused: string;
   toggleRightPanel: string;
   toggleStarFocused: string;
-  spanDefault: string;
-  spanWide: string;
-  spanTall: string;
-  spanLarge: string;
+  openTerminalFind: string;
+  globalSearch: string;
+  commandPalette: string;
+  toggleUsageOverlay: string;
+  toggleSessionsOverlay: string;
+  toggleActivityHeatmap: string;
+  toggleSnapshotHistory: string;
+  toggleHub: string;
+  nextCanvas: string;
+  prevCanvas: string;
+  openCanvasManager: string;
 }
 
 const LEGACY_DEFAULT_SHORTCUTS: ShortcutMap = {
   addProject: "mod+o",
   cycleFocusLevel: "mod+g",
-  compactFocusedProject: "mod+shift+g",
   newTerminal: "mod+t",
   saveWorkspace: "mod+s",
   saveWorkspaceAs: "mod+shift+s",
@@ -34,17 +39,23 @@ const LEGACY_DEFAULT_SHORTCUTS: ShortcutMap = {
   clearFocus: "mod+e",
   closeFocused: "mod+d",
   toggleRightPanel: "mod+/",
-  toggleStarFocused: "mod+f",
-  spanDefault: "mod+1",
-  spanWide: "mod+2",
-  spanTall: "mod+3",
-  spanLarge: "mod+4",
+  toggleStarFocused: "mod+shift+f",
+  openTerminalFind: "mod+f",
+  globalSearch: "mod+k",
+  commandPalette: "mod+p",
+  toggleUsageOverlay: "mod+shift+u",
+  toggleSessionsOverlay: "mod+shift+h",
+  toggleActivityHeatmap: "mod+shift+a",
+  toggleSnapshotHistory: "mod+shift+t",
+  toggleHub: "mod+shift+j",
+  nextCanvas: "mod+shift+]",
+  prevCanvas: "mod+shift+[",
+  openCanvasManager: "mod+shift+n",
 };
 
 const ALT_DEFAULT_SHORTCUTS: ShortcutMap = {
   addProject: "alt+o",
   cycleFocusLevel: "alt+g",
-  compactFocusedProject: "alt+shift+g",
   newTerminal: "alt+t",
   saveWorkspace: "alt+s",
   saveWorkspaceAs: "alt+shift+s",
@@ -54,11 +65,18 @@ const ALT_DEFAULT_SHORTCUTS: ShortcutMap = {
   clearFocus: "alt+e",
   closeFocused: "alt+d",
   toggleRightPanel: "alt+/",
-  toggleStarFocused: "alt+f",
-  spanDefault: "alt+1",
-  spanWide: "alt+2",
-  spanTall: "alt+3",
-  spanLarge: "alt+4",
+  toggleStarFocused: "alt+shift+f",
+  openTerminalFind: "alt+f",
+  globalSearch: "alt+k",
+  commandPalette: "alt+p",
+  toggleUsageOverlay: "alt+shift+u",
+  toggleSessionsOverlay: "alt+shift+h",
+  toggleActivityHeatmap: "alt+shift+a",
+  toggleSnapshotHistory: "alt+shift+t",
+  toggleHub: "alt+shift+j",
+  nextCanvas: "alt+shift+]",
+  prevCanvas: "alt+shift+[",
+  openCanvasManager: "alt+shift+n",
 };
 
 export const DEFAULT_SHORTCUTS: ShortcutMap = { ...LEGACY_DEFAULT_SHORTCUTS };
@@ -105,20 +123,54 @@ function isLegacyDefaultShortcutMap(shortcuts: ShortcutMap): boolean {
   ).every(([key, value]) => shortcuts[key] === value);
 }
 
+// Drop any legacy tile-size / span shortcut keys that may still live in
+// localStorage from older builds. The feature has been removed.
+const REMOVED_SHORTCUT_KEYS = [
+  "spanDefault",
+  "spanWide",
+  "spanTall",
+  "spanLarge",
+  "tileSizeDefault",
+  "tileSizeWide",
+  "tileSizeTall",
+  "tileSizeLarge",
+];
+
+function migrateLegacyShortcutKeys(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  const migrated: Record<string, unknown> = { ...raw };
+  for (const key of REMOVED_SHORTCUT_KEYS) {
+    delete migrated[key];
+  }
+  // Free Cmd/Alt+F for an upcoming in-terminal find feature: bump
+  // toggleStarFocused off the old default if the user never customized it.
+  if (migrated.toggleStarFocused === "mod+f") {
+    migrated.toggleStarFocused = "mod+shift+f";
+  } else if (migrated.toggleStarFocused === "alt+f") {
+    migrated.toggleStarFocused = "alt+shift+f";
+  }
+  return migrated;
+}
+
 function loadShortcuts(): ShortcutMap {
   const platform = getShortcutPlatform();
   const defaults = getDefaultShortcuts(platform);
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
+      const rawParsed = JSON.parse(saved) as Record<string, unknown>;
+      const migrated = migrateLegacyShortcutKeys(rawParsed);
       const parsed = {
         ...defaults,
-        ...JSON.parse(saved),
+        ...migrated,
       } as ShortcutMap;
       if (platform !== "darwin" && isLegacyDefaultShortcutMap(parsed)) {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(defaults));
         return defaults;
       }
+      // Persist the migrated form so subsequent reads don't replay it.
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
       return parsed;
     }
   } catch {
@@ -167,6 +219,24 @@ export function eventToShortcut(e: KeyboardEvent): string {
   return parts.join("+");
 }
 
+// e.code (physical key) for punctuation literals so chords like
+// `mod+shift+]` don't silently break — Shift+] yields `e.key === "}"`
+// on US/UK/most European layouts, which would never match the literal.
+// Falling back to e.code keeps these chords layout-stable.
+const PUNCT_KEY_TO_CODE: Record<string, string> = {
+  "]": "BracketRight",
+  "[": "BracketLeft",
+  "/": "Slash",
+  "\\": "Backslash",
+  ";": "Semicolon",
+  "'": "Quote",
+  ",": "Comma",
+  ".": "Period",
+  "`": "Backquote",
+  "-": "Minus",
+  "=": "Equal",
+};
+
 export function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
   const platform = getShortcutPlatform();
   if (hasUnsupportedPlatformModifier(e, platform)) return false;
@@ -184,7 +254,9 @@ export function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
   if (!needsMod && hasMod) return false;
   if (needsShift !== e.shiftKey) return false;
   if (needsAlt !== e.altKey) return false;
-  return e.key.toLowerCase() === key;
+  if (e.key.toLowerCase() === key) return true;
+  const code = PUNCT_KEY_TO_CODE[key];
+  return code !== undefined && e.code === code;
 }
 
 /**

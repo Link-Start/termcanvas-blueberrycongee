@@ -64,11 +64,23 @@ interface AgentRendererProps {
 
 let errorIdCounter = 0;
 
-export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectId, worktreeId, cwd, height, width }: AgentRendererProps) {
+export function AgentRenderer({
+  terminalId,
+  sessionId,
+  resumeSessionId,
+  projectId,
+  worktreeId,
+  cwd,
+  height,
+  width,
+}: AgentRendererProps) {
   const isDark = useThemeStore((s) => s.theme) === "dark";
   const [segments, setSegments] = useState<MessageSegment[]>([]);
   const [running, setRunning] = useState(false);
-  const [tokenUsage, setTokenUsage] = useState<{ input: number; output: number } | null>(null);
+  const [tokenUsage, setTokenUsage] = useState<{
+    input: number;
+    output: number;
+  } | null>(null);
   const [errors, setErrors] = useState<ErrorBanner[]>([]);
   const [statusInfo, setStatusInfo] = useState<StatusInfo>({});
   const [slashCommands, setSlashCommands] = useState<string[]>([]);
@@ -92,7 +104,9 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
         setRunning(false);
         setSegments((prev) =>
           prev.map((s) =>
-            s.kind === "thinking" && s.streaming ? { ...s, streaming: false } : s,
+            s.kind === "thinking" && s.streaming
+              ? { ...s, streaming: false }
+              : s,
           ),
         );
         break;
@@ -103,7 +117,10 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
           if (lastSegmentRef.current === "text" && prev.length > 0) {
             const last = prev[prev.length - 1];
             if (last.kind === "text") {
-              return [...prev.slice(0, -1), { ...last, text: last.text + event.text }];
+              return [
+                ...prev.slice(0, -1),
+                { ...last, text: last.text + event.text },
+              ];
             }
           }
           lastSegmentRef.current = "text";
@@ -116,11 +133,17 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
           if (lastSegmentRef.current === "thinking" && prev.length > 0) {
             const last = prev[prev.length - 1];
             if (last.kind === "thinking") {
-              return [...prev.slice(0, -1), { ...last, text: last.text + event.thinking }];
+              return [
+                ...prev.slice(0, -1),
+                { ...last, text: last.text + event.thinking },
+              ];
             }
           }
           lastSegmentRef.current = "thinking";
-          return [...prev, { kind: "thinking", text: event.thinking, streaming: true }];
+          return [
+            ...prev,
+            { kind: "thinking", text: event.thinking, streaming: true },
+          ];
         });
         break;
 
@@ -136,7 +159,10 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
       case "tool_start":
         setSegments((prev) => {
           for (let i = prev.length - 1; i >= 0; i--) {
-            if (prev[i].kind === "tool" && (prev[i] as ToolSegment).name === event.name) {
+            if (
+              prev[i].kind === "tool" &&
+              (prev[i] as ToolSegment).name === event.name
+            ) {
               const updated = [...prev];
               updated[i] = { ...(prev[i] as ToolSegment), input: event.input };
               return updated;
@@ -149,7 +175,10 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
       case "tool_end":
         setSegments((prev) => {
           for (let i = prev.length - 1; i >= 0; i--) {
-            if (prev[i].kind === "tool" && (prev[i] as ToolSegment).name === event.name) {
+            if (
+              prev[i].kind === "tool" &&
+              (prev[i] as ToolSegment).name === event.name
+            ) {
               const updated = [...prev];
               updated[i] = {
                 ...(prev[i] as ToolSegment),
@@ -186,7 +215,9 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
         }
         setSegments((prev) =>
           prev.map((s) =>
-            s.kind === "thinking" && s.streaming ? { ...s, streaming: false } : s,
+            s.kind === "thinking" && s.streaming
+              ? { ...s, streaming: false }
+              : s,
           ),
         );
         lastSegmentRef.current = null;
@@ -195,14 +226,19 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
       case "message_delta":
         setSegments((prev) =>
           prev.map((s) =>
-            s.kind === "thinking" && s.streaming ? { ...s, streaming: false } : s,
+            s.kind === "thinking" && s.streaming
+              ? { ...s, streaming: false }
+              : s,
           ),
         );
         lastSegmentRef.current = null;
         break;
 
       case "error":
-        setErrors((prev) => [...prev, { id: ++errorIdCounter, message: event.error.message }]);
+        setErrors((prev) => [
+          ...prev,
+          { id: ++errorIdCounter, message: event.error.message },
+        ]);
         setRunning(false);
         break;
 
@@ -239,7 +275,6 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
     }
   }, []);
 
-  // Ref-based handler to survive Strict Mode double-mount
   const handleEventRef = useRef(handleEvent);
   handleEventRef.current = handleEvent;
   const sessionIdRef = useRef(sessionId);
@@ -251,18 +286,21 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
 
     if (!startedRef.current) {
       startedRef.current = true;
-      window.termcanvas.agent.start(sessionId, {
-        type: "claude-code",
-        baseURL: "",
-        apiKey: "",
-        model: "",
-        cwd,
-        resumeSessionId,
-      }).then((result) => {
-        if (result?.slashCommands?.length) {
-          setSlashCommands(result.slashCommands);
-        }
-      }).catch(() => {});
+      window.termcanvas.agent
+        .start(sessionId, {
+          type: "claude-code",
+          baseURL: "",
+          apiKey: "",
+          model: "",
+          cwd,
+          resumeSessionId,
+        })
+        .then((result) => {
+          if (result?.slashCommands?.length) {
+            setSlashCommands(result.slashCommands);
+          }
+        })
+        .catch(() => {});
     }
 
     if (!subscribedRef.current) {
@@ -270,7 +308,11 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
       window.termcanvas.agent.onEvent(
         (evtSessionId: string, event: AgentStreamEvent) => {
           if (evtSessionId !== sessionIdRef.current) return;
-          if (event.type === "system_init" && "slash_commands" in event && Array.isArray(event.slash_commands)) {
+          if (
+            event.type === "system_init" &&
+            "slash_commands" in event &&
+            Array.isArray(event.slash_commands)
+          ) {
             setSlashCommands(event.slash_commands as string[]);
           }
           handleEventRef.current(event);
@@ -309,11 +351,7 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
 
   const handleSend = useCallback(
     (text: string) => {
-      if (!window.termcanvas?.agent) {
-        console.log("[AgentRenderer] send failed: agent API not available");
-        return;
-      }
-      console.log("[AgentRenderer] sending:", text.slice(0, 50), "sessionId:", sessionId, "cwd:", cwd);
+      if (!window.termcanvas?.agent) return;
       setSegments((prev) => [...prev, { kind: "user", text }]);
       lastSegmentRef.current = null;
       window.termcanvas.agent.send(sessionId, text, {
@@ -333,24 +371,23 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
     window.termcanvas.agent.abort(sessionId);
   }, [sessionId]);
 
-  const handleApprove = useCallback(
-    (sid: string, requestId: string) => {
-      window.termcanvas?.agent?.approve(sid, requestId);
-    },
-    [],
-  );
+  const handleApprove = useCallback((sid: string, requestId: string) => {
+    window.termcanvas?.agent?.approve(sid, requestId);
+  }, []);
 
-  const handleDeny = useCallback(
-    (sid: string, requestId: string) => {
-      window.termcanvas?.agent?.deny(sid, requestId);
-    },
-    [],
-  );
+  const handleDeny = useCallback((sid: string, requestId: string) => {
+    window.termcanvas?.agent?.deny(sid, requestId);
+  }, []);
 
   return (
     <div
-      className={`flex flex-col overflow-hidden ${isDark ? "bg-zinc-900 text-zinc-100" : "bg-white text-zinc-900"}`}
-      style={{ height, width }}
+      className="flex flex-col overflow-hidden"
+      style={{
+        height,
+        width,
+        background: "var(--bg)",
+        color: "var(--text-primary)",
+      }}
     >
       <AgentStatusBar
         generating={running}
@@ -366,62 +403,116 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
         className="flex-1 min-h-0 overflow-y-auto"
         onScroll={handleScroll}
       >
-        <div className="px-4 py-3 space-y-1">
+        <div className="mx-auto max-w-[720px] px-4 py-4">
           {segments.map((seg, i) => {
             switch (seg.kind) {
               case "user":
+                /* Right-aligned neutral bubble. --bubble-bg matches the
+                   replay-view convention (lifted neutral surface, NOT
+                   accent fill) so a turn full of prompts reads as quiet
+                   containers, not stacked accent highlights. */
                 return (
-                  <div key={i} className="flex justify-end my-2">
-                    <div className={`max-w-[80%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
-                      isDark ? "bg-zinc-700 text-zinc-100" : "bg-zinc-200 text-zinc-900"
-                    }`}>
+                  <div
+                    key={`seg-${i}`}
+                    className="my-2 flex justify-end tc-enter-fade-up-quick"
+                  >
+                    <div
+                      className="tc-body-sm rounded-xl px-3 py-2 whitespace-pre-wrap max-w-[78%]"
+                      style={{
+                        background: "var(--bubble-bg)",
+                        color: "var(--text-primary)",
+                      }}
+                    >
                       {seg.text}
                     </div>
                   </div>
                 );
               case "text":
-                return <MessageBubble key={i} text={seg.text} isDark={isDark} />;
+                /* Assistant prose: pl-5 indent, no chrome. The indent is
+                   the speaker mark; no avatar, no eyebrow, no badge. */
+                return (
+                  <div
+                    key={`seg-${i}`}
+                    className="pl-5 pr-1 py-1 tc-enter-fade-quick"
+                  >
+                    <MessageBubble text={seg.text} isDark={isDark} />
+                  </div>
+                );
               case "thinking":
-                return <ThinkingBlock key={i} text={seg.text} streaming={seg.streaming} isDark={isDark} />;
+                /* Subordinate to assistant prose — deeper indent (pl-9)
+                   matches the SessionReplayView ThinkingRow vocabulary. */
+                return (
+                  <div
+                    key={`seg-${i}`}
+                    className="pl-9 pr-1 tc-enter-fade-quick"
+                  >
+                    <ThinkingBlock
+                      text={seg.text}
+                      streaming={seg.streaming}
+                      isDark={isDark}
+                    />
+                  </div>
+                );
               case "tool":
                 return (
-                  <ToolCard
-                    key={seg.id}
-                    name={seg.name}
-                    input={seg.input}
-                    result={seg.result}
-                    isError={seg.isError}
-                    approval={seg.approval ? { requestId: seg.approval.requestId, sessionId } : undefined}
-                    onApprove={handleApprove}
-                    onDeny={handleDeny}
-                    isDark={isDark}
-                  />
+                  <div key={seg.id} className="pl-9 pr-1 tc-enter-fade-quick">
+                    <ToolCard
+                      name={seg.name}
+                      input={seg.input}
+                      result={seg.result}
+                      isError={seg.isError}
+                      approval={
+                        seg.approval
+                          ? { requestId: seg.approval.requestId, sessionId }
+                          : undefined
+                      }
+                      onApprove={handleApprove}
+                      onDeny={handleDeny}
+                      isDark={isDark}
+                    />
+                  </div>
                 );
             }
           })}
           {segments.length === 0 && !running && (
-            <div className={`flex items-center justify-center h-32 text-sm ${isDark ? "text-zinc-600" : "text-zinc-400"}`}>
+            <div
+              className="tc-label flex items-center justify-center h-32"
+              style={{ color: "var(--text-faint)" }}
+            >
               Send a message to start
             </div>
           )}
         </div>
       </div>
 
-      {/* Error banners */}
       {errors.length > 0 && (
-        <div className="shrink-0 px-3 space-y-1">
+        <div className="shrink-0 px-3 space-y-1 pb-1">
           {errors.map((err) => (
             <div
               key={err.id}
-              className="flex items-start gap-2 px-3 py-2 rounded-md bg-red-500/15 border border-red-500/30 text-red-400 text-xs"
+              className="flex items-start gap-2 px-3 py-2 rounded-md tc-label tc-enter-fade-up-quick"
+              style={{
+                background: "var(--red-soft)",
+                border:
+                  "1px solid color-mix(in srgb, var(--red) 30%, transparent)",
+                color: "var(--red)",
+              }}
             >
               <span className="flex-1 min-w-0 break-words">{err.message}</span>
               <button
-                className="shrink-0 hover:text-red-300 transition-colors duration-150"
+                className="shrink-0 opacity-100 hover:opacity-70 transition-opacity"
                 onClick={() => dismissError(err.id)}
                 aria-label="Dismiss error"
               >
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                >
                   <path d="M2 2l8 8M10 2l-8 8" />
                 </svg>
               </button>
@@ -433,11 +524,12 @@ export function AgentRenderer({ terminalId, sessionId, resumeSessionId, projectI
       {userScrolledUp && (
         <div className="relative shrink-0">
           <button
-            className={`absolute bottom-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs shadow-lg transition-colors duration-150 ${
-              isDark
-                ? "bg-zinc-700/80 text-zinc-300 hover:bg-zinc-600/90"
-                : "bg-zinc-200/80 text-zinc-700 hover:bg-zinc-300/90"
-            } backdrop-blur-sm`}
+            className="absolute bottom-2 left-1/2 -translate-x-1/2 px-3 h-7 rounded-full tc-label backdrop-blur-md tc-enter-fade-up-quick bg-[color-mix(in_srgb,var(--surface)_86%,transparent)] text-[var(--text-secondary)] hover:bg-[var(--surface)] hover:text-[var(--text-primary)] transition-[background-color,color]"
+            style={{
+              border: "1px solid var(--border)",
+              boxShadow:
+                "0 4px 14px color-mix(in srgb, var(--shadow-color) 28%, transparent)",
+            }}
             onClick={scrollToBottom}
           >
             {hasNewMessages ? "New messages" : "Scroll to bottom"}
